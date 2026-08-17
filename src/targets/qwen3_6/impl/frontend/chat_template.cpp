@@ -344,7 +344,9 @@ RenderedChat CompiledChatTemplate::render(const std::vector<ChatMessage>& messag
     }
 
     const long last_query_index = last_real_user_query(messages);
-    std::optional<std::size_t> turn_rewrite_byte_offset;
+    std::optional<std::size_t> stable_turn_byte_offset;
+    std::optional<std::size_t> rolling_tool_byte_offset;
+    bool has_completed_tool_history = false;
 
     int image_count = 0;
     int video_count = 0;
@@ -366,6 +368,7 @@ RenderedChat CompiledChatTemplate::render(const std::vector<ChatMessage>& messag
             continue;
         }
         if (message.role == "tool") {
+            if (static_cast<long>(i) > last_query_index) { has_completed_tool_history = true; }
             const bool opens_group  = i > 0 && messages[i - 1].role != "tool";
             const bool closes_group = i + 1 == messages.size() || messages[i + 1].role != "tool";
             if (opens_group) { rendered += "<|im_start|>user"; }
@@ -391,8 +394,8 @@ RenderedChat CompiledChatTemplate::render(const std::vector<ChatMessage>& messag
         const bool preserve_thinking = options.preserve_thinking.value_or(effort_template);
         const bool keep_thinking = preserve_thinking || (static_cast<long>(i) > last_query_index);
         rendered += "<|im_start|>assistant\n";
-        if (!turn_rewrite_byte_offset && static_cast<long>(i) > last_query_index) {
-            turn_rewrite_byte_offset = rendered.size();
+        if (!stable_turn_byte_offset && static_cast<long>(i) > last_query_index) {
+            stable_turn_byte_offset = rendered.size();
         }
         if (keep_thinking) {
             rendered += "<think>\n";
@@ -416,13 +419,19 @@ RenderedChat CompiledChatTemplate::render(const std::vector<ChatMessage>& messag
 
     if (options.add_generation_prompt) {
         rendered += "<|im_start|>assistant\n";
-        if (!turn_rewrite_byte_offset) { turn_rewrite_byte_offset = rendered.size(); }
+        rolling_tool_byte_offset = rendered.size();
+        if (!stable_turn_byte_offset) { stable_turn_byte_offset = rolling_tool_byte_offset; }
         if (options.enable_thinking) {
             rendered += "<think>\n";
         } else {
             rendered += "<think>\n\n</think>\n\n";
         }
     }
+    const std::optional<std::size_t> turn_rewrite_byte_offset =
+        options.prefix_checkpoint_policy == PrefixCheckpointPolicy::RollingTool &&
+                has_completed_tool_history && rolling_tool_byte_offset
+            ? rolling_tool_byte_offset
+            : stable_turn_byte_offset;
     return RenderedChat{.text                     = std::move(rendered),
                         .turn_rewrite_byte_offset = turn_rewrite_byte_offset};
 }

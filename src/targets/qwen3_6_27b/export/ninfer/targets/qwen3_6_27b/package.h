@@ -101,7 +101,9 @@ struct Package {
                                             WeightsProfile weights_profile);
     [[nodiscard]] static std::unique_ptr<LoadedModel>
     construct_loaded_model(LoadPlan&& plan, artifact::MaterializedArtifact&& materialized);
-    [[nodiscard]] static Frontend make_frontend(const LoadedModel& model);
+    [[nodiscard]] static Frontend make_frontend(
+        const LoadedModel& model,
+        PrefixCheckpointPolicy prefix_checkpoint_policy = PrefixCheckpointPolicy::RollingTool);
     [[nodiscard]] static SequencePlanner make_sequence_planner(DeviceContext& device,
                                                                const EngineOptions& options,
                                                                WeightsProfile weights_profile);

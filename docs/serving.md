@@ -479,6 +479,7 @@ are errors. Delete and cancel routes accept no query parameters.
 | `--vision` | enable media input and load Vision GPU allocations | off |
 | `--no-cuda-graph` | disable CUDA Graph decode | graphs on |
 | `--no-prefix-reuse` | disable compatible-prefix caching | prefix reuse on |
+| `--prefix-checkpoint-policy stable-turn\|rolling-tool` | choose a stable first-assistant rewrite checkpoint or advance it after completed tool history | `rolling-tool` |
 | `--no-thinking` | disable thinking by default | thinking on |
 | `--preserve-thinking` | preserve closed-turn assistant reasoning by default | off |
 | `--cors` | permissive browser CORS headers | off |
@@ -512,7 +513,7 @@ is also rejected if it resolves to the model artifact.
   --request-log-jsonl profiles/bench/run/server.requests.jsonl
 ```
 
-Every line is one `ninfer_serve_request_log` schema-v9 JSON object. All events carry
+Every line is one `ninfer_serve_request_log` schema-v10 JSON object. All events carry
 `timestamp_unix_ms` and a process-unique `server_instance_id`; request IDs are monotonic only within
 that server instance. Generation request records retain that numeric `request_id` for metrics and
 also carry `x_request_id`, matching the client-visible HTTP response header for log correlation.
@@ -602,9 +603,13 @@ reports the reused token count as `cache=`.
 The shared family runtime distinguishes `full_reset`, `append_frontier`, and
 `restore_turn_checkpoint`. A turn checkpoint includes the recurrent and selected
 speculative-backend continuation state required to recompute a rewritten suffix; matching KV
-tokens alone never authorize a partial hit. Stable `preserve_thinking=true` histories normally
-append, while stable `false` histories restore the previous open-turn checkpoint when a new user
-closes that turn. The JSONL completion record exposes the selected path as `prefix_reuse_path`.
+tokens alone never authorize a partial hit. The default `rolling-tool` policy replaces that
+checkpoint at the latest generation opener after completed tool-call results, so serial tool loops
+recompute only their newest suffix. `stable-turn` retains the first assistant opener after the last
+real user query, preserving the earlier rewrite anchor used when closed-turn thinking is removed.
+Both policies remain subject to exact prepared-prefix identity. The JSONL completion record exposes
+the selected path as `prefix_reuse_path` and server-start records expose
+`prefix_checkpoint_policy`.
 Changing reasoning effort changes the rendered prompt and therefore does not reuse a prefix whose
 effort instruction differs.
 

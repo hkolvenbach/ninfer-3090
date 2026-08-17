@@ -109,7 +109,7 @@ ConstructedTarget construct_registered(const EngineOptions& options, DeviceConte
         sequence_plan.kv_capacity() != capacity_resolution.resolved_tokens) {
         throw std::logic_error("resolved KV capacity does not match the finalized target plan");
     }
-    auto loaded   = std::make_unique<Loaded>(std::move(model));
+    auto loaded   = std::make_unique<Loaded>(std::move(model), options.prefix_checkpoint_policy);
     auto instance = std::make_unique<Instance>(std::move(loaded), capacity_resolution,
                                                std::move(sequence_plan), device);
     device.synchronize();
@@ -133,8 +133,10 @@ ConstructedTarget construct_registered(const EngineOptions& options, DeviceConte
 
 } // namespace
 
-LoadedQwen3_6_27B::LoadedQwen3_6_27B(std::unique_ptr<Qwen3_6_27B::LoadedModel> stable_model)
-    : model(std::move(stable_model)), frontend(Qwen3_6_27B::make_frontend(*model)) {}
+LoadedQwen3_6_27B::LoadedQwen3_6_27B(std::unique_ptr<Qwen3_6_27B::LoadedModel> stable_model,
+                                     PrefixCheckpointPolicy prefix_checkpoint_policy)
+    : model(std::move(stable_model)),
+      frontend(Qwen3_6_27B::make_frontend(*model, prefix_checkpoint_policy)) {}
 
 LoadedQwen3_6_27B::~LoadedQwen3_6_27B() = default;
 
@@ -150,8 +152,10 @@ Qwen3_6_27BInstance::Qwen3_6_27BInstance(std::unique_ptr<LoadedQwen3_6_27B> stab
 Qwen3_6_27BInstance::~Qwen3_6_27BInstance() = default;
 
 LoadedQwen3_6_35BA3B::LoadedQwen3_6_35BA3B(
-    std::unique_ptr<Qwen3_6_35BA3B::LoadedModel> stable_model)
-    : model(std::move(stable_model)), frontend(Qwen3_6_35BA3B::make_frontend(*model)) {}
+    std::unique_ptr<Qwen3_6_35BA3B::LoadedModel> stable_model,
+    PrefixCheckpointPolicy prefix_checkpoint_policy)
+    : model(std::move(stable_model)),
+      frontend(Qwen3_6_35BA3B::make_frontend(*model, prefix_checkpoint_policy)) {}
 
 LoadedQwen3_6_35BA3B::~LoadedQwen3_6_35BA3B() = default;
 

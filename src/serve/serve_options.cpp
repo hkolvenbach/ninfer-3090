@@ -1,4 +1,5 @@
 #include "serve/serve_options.h"
+#include "product/prefix_checkpoint_options.h"
 #include "product/speculative_options.h"
 
 #include <cerrno>
@@ -73,9 +74,11 @@ std::string serve_usage_text(const char* argv0) {
            "[--prefill-chunk N] [--log-stats-interval-ms N] [--device N] "
            "[--max-request-mib N] [--request-log-jsonl FILE] "
            "[--response-store-max-records N] [--response-store-max-mib N] "
-           "[--kv-dtype bf16|int8|rk8v4|rk4v4|rk4v4-e8|rk2v4-e8] [--spec mtp|dflash --draft-tokens N] "
+           "[--kv-dtype bf16|int8|rk8v4|rk4v4|rk4v4-e8|rk2v4-e8] [--spec mtp|dflash --draft-tokens "
+           "N] "
            "[--default-max-tokens N] "
            "[--vision] [--no-cuda-graph] [--no-prefix-reuse] "
+           "[--prefix-checkpoint-policy stable-turn|rolling-tool] "
            "[--lm-head-draft] [--no-thinking] [--preserve-thinking] [--cors] "
            "[--temperature F] [--top-p F] [--top-k N] [--min-p F] [--presence-penalty F] "
            "[--frequency-penalty F] [--seed N] [--greedy]\n"
@@ -94,6 +97,7 @@ std::string serve_usage_text(const char* argv0) {
            std::to_string(kDefaultKvCapacityHeadroomBytes / (1024ULL * 1024ULL)) +
            " MiB of sizing headroom\n"
            "       --no-prefix-reuse disables compatible-prefix caching (enabled by default)\n"
+           "       --prefix-checkpoint-policy defaults to rolling-tool\n"
            "       --preserve-thinking retains closed-turn assistant reasoning in later prompts\n"
            "       sampler defaults come from the loaded model and resolved thinking mode; "
            "server flags and request fields override individual values.\n"
@@ -205,6 +209,9 @@ ServeOptions parse_serve_options(int argc, char** argv) {
             options.use_cuda_graph = false;
         } else if (arg == "--no-prefix-reuse") {
             options.allow_prefix_reuse = false;
+        } else if (arg == "--prefix-checkpoint-policy") {
+            options.prefix_checkpoint_policy = product::parse_prefix_checkpoint_policy(
+                require_value("--prefix-checkpoint-policy"));
         } else if (arg == "--lm-head-draft") {
             options.speculative.proposal_head = ProposalHead::Optimized;
         } else if (arg == "--no-thinking") {

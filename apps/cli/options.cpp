@@ -1,4 +1,5 @@
 #include "options.h"
+#include "product/prefix_checkpoint_options.h"
 #include "product/speculative_options.h"
 
 #include <cerrno>
@@ -81,14 +82,15 @@ std::string usage_text(const char* argv0) {
            " <model.ninfer> (--prompt <text>|--messages <messages.json>)\n"
            "[--max-context N] [--kv-capacity N|auto] [--prefill-chunk N] [--max-new N]\n"
            "[--device N]\n"
-           "[--kv-dtype bf16|int8|rk8v4|rk4v4|rk4v4-e8|rk2v4-e8] [--spec mtp|dflash --draft-tokens N]\n"
+           "[--kv-dtype bf16|int8|rk8v4|rk4v4|rk4v4-e8|rk2v4-e8] [--spec mtp|dflash --draft-tokens "
+           "N]\n"
            "       [--lm-head-draft]\n"
            "       [--temperature F] [--top-p F] [--top-k N] [--min-p F]\n"
            "       [--presence-penalty F] [--frequency-penalty F] [--seed N] [--greedy]\n"
            "       [--stop-token-id N]... [--stop <text>]... [--reasoning-stop <text>]...\n"
            "       [--raw-output] [--print-token-ids] [--no-thinking]\n"
            "       [--reasoning-effort low|medium|xhigh] [--vision]\n"
-           "       [--no-cuda-graph]\n"
+           "       [--no-cuda-graph] [--prefix-checkpoint-policy stable-turn|rolling-tool]\n"
            "\n"
            "Streams answer content to stdout and reasoning plus diagnostics to stderr.\n"
            "Structured message content accepts text, image/image_url, and video/video_url parts;\n"
@@ -97,6 +99,7 @@ std::string usage_text(const char* argv0) {
            "--kv-capacity auto leaves " +
            std::to_string(kDefaultKvCapacityHeadroomBytes / (1024ULL * 1024ULL)) +
            " MiB of sizing headroom.\n"
+           "--prefix-checkpoint-policy defaults to rolling-tool.\n"
            "Sampling defaults come from the loaded model and thinking mode; flags override "
            "individual fields.\n";
 }
@@ -153,6 +156,8 @@ Options parse_options(int argc, char** argv) {
             options.enable_vision = true;
         } else if (arg == "--no-cuda-graph") {
             options.use_cuda_graph = false;
+        } else if (arg == "--prefix-checkpoint-policy") {
+            options.prefix_checkpoint_policy = product::parse_prefix_checkpoint_policy(value(arg));
         } else if (arg == "--stop-token-id") {
             const std::uint32_t token = parse_u32(value(arg), "stop-token-id", true);
             if (token > static_cast<std::uint32_t>(std::numeric_limits<TokenId>::max())) {

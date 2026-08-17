@@ -116,7 +116,13 @@ def require(condition: bool, message: str) -> None:
         raise TestFailure(message)
 
 
-def exercise(base_url: str, fixture: dict[str, Any], log_path: Path, backend: str) -> dict[str, Any]:
+def exercise(
+    base_url: str,
+    fixture: dict[str, Any],
+    log_path: Path,
+    backend: str,
+    checkpoint_policy: str,
+) -> dict[str, Any]:
     models = request_json(base_url, "GET", "/v1/models")
     entries = models.get("data")
     require(isinstance(entries, list) and len(entries) == 1, "server did not expose one model")
@@ -188,8 +194,8 @@ def exercise(base_url: str, fixture: dict[str, Any], log_path: Path, backend: st
     chat_done = protocol_events(events, "request_done", "openai_chat_completions")
     require(len(chat_done) == 7, f"expected 7 Chat request_done events, found {len(chat_done)}")
     paths = [item.get("result", {}).get("prefix_reuse_path") for item in chat_done]
-    require(
-        paths == [
+    if checkpoint_policy == "stable-turn":
+        expected_paths = [
             "full_reset",
             "restore_turn_checkpoint",
             "restore_turn_checkpoint",
@@ -197,16 +203,26 @@ def exercise(base_url: str, fixture: dict[str, Any], log_path: Path, backend: st
             "full_reset",
             "restore_turn_checkpoint",
             "full_reset",
-        ],
-        f"unexpected Chat reuse paths: {paths}",
-    )
+        ]
+        require(paths == expected_paths, f"unexpected Chat reuse paths: {paths}")
+    else:
+        require(
+            paths[:3]
+            == ["full_reset", "restore_turn_checkpoint", "restore_turn_checkpoint"],
+            f"rolling tool loop did not use its checkpoints: {paths}",
+        )
     first_restore = chat_done[1]["result"].get("prefix_cache_hit_tokens")
     second_restore = chat_done[2]["result"].get("prefix_cache_hit_tokens")
     require(
         isinstance(first_restore, int)
         and first_restore > 0
-        and second_restore == first_restore,
-        "tool-loop requests did not restore the same turn checkpoint",
+        and isinstance(second_restore, int)
+        and (
+            second_restore == first_restore
+            if checkpoint_policy == "stable-turn"
+            else second_restore > first_restore
+        ),
+        "tool-loop checkpoint did not follow the configured policy",
     )
     for index in (1, 2):
         speculative = chat_done[index].get("speculative", {})
@@ -243,6 +259,7 @@ def exercise(base_url: str, fixture: dict[str, Any], log_path: Path, backend: st
         "model": model,
         "turn_checkpoint_frontier": first_restore,
         "chat_reuse_paths": paths,
+        "prefix_checkpoint_policy": checkpoint_policy,
         "closed_turn_prompt_tokens": {
             "stripped": stripped_prompt_tokens,
             "preserved": preserved_prompt_tokens,
@@ -255,6 +272,11 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--artifact", type=Path, required=True)
     parser.add_argument("--backend", choices=("mtp", "dflash"), required=True)
+    parser.add_argument(
+        "--prefix-checkpoint-policy",
+        choices=("stable-turn", "rolling-tool"),
+        default="rolling-tool",
+    )
     parser.add_argument("--server-bin", type=Path, default=Path("build/apps/ninfer-serve"))
     parser.add_argument(
         "--fixture",
@@ -309,6 +331,8 @@ def main() -> None:
             "--draft-tokens",
             "3",
             "--lm-head-draft",
+            "--prefix-checkpoint-policy",
+            args.prefix_checkpoint_policy,
             "--greedy",
         ]
         with server_log.open("w", encoding="utf-8") as output:
@@ -320,7 +344,13 @@ def main() -> None:
             )
             try:
                 wait_for_server(base_url, process, args.startup_timeout)
-                result = exercise(base_url, fixture, request_log, args.backend)
+                result = exercise(
+                    base_url,
+                    fixture,
+                    request_log,
+                    args.backend,
+                    args.prefix_checkpoint_policy,
+                )
                 print(json.dumps(result, ensure_ascii=False, indent=2))
             except Exception as error:
                 output.flush()

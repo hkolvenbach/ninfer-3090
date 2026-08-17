@@ -1,4 +1,5 @@
 #include "serve/request_log.h"
+#include "product/prefix_checkpoint_options.h"
 #include "product/speculative_options.h"
 #include "serve/console_log.h"
 
@@ -413,6 +414,8 @@ std::string format_server_start_json(
           {"vision", options.enable_vision},
           {"cuda_graph", options.use_cuda_graph},
           {"prefix_reuse", options.allow_prefix_reuse},
+          {"prefix_checkpoint_policy",
+           product::prefix_checkpoint_policy_name(options.prefix_checkpoint_policy)},
           {"speculative_backend", product::speculative_backend_name(options.speculative.backend)},
           {"speculative_draft_window", options.speculative.draft_tokens},
           {"proposal_head", proposal_head_name(options.speculative.proposal_head)}};

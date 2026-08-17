@@ -171,7 +171,8 @@ this pinned SDK drops unencrypted reasoning while rebuilding response messages.
 
 The thinking-preservation fixture starts and stops its own server, submits a fixed two-step tool
 history, compares restored and cold greedy output, compares stripped and preserved closed-turn
-prompt lengths, and verifies request-log reuse paths and Responses inheritance:
+prompt lengths, and verifies rolling checkpoint growth and Responses inheritance. Pass
+`--prefix-checkpoint-policy stable-turn` to retain and test the original fixed rewrite anchor:
 
 ```bash
 python3 tools/smoke/serve_thinking_preservation.py \

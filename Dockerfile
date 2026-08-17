@@ -68,4 +68,4 @@ WORKDIR /workspace
 EXPOSE 8080
 STOPSIGNAL SIGTERM
 
-CMD ["ninfer-serve", "/opt/ninfer/models/qwen3_8_27b.ninfer", "--model-id", "qwen3.8-27b", "--host", "0.0.0.0", "--port", "8080", "--max-context", "262144", "--kv-capacity", "262144", "--max-concurrency", "1", "--max-pending-requests", "16", "--prefill-chunk", "1024", "--kv-dtype", "rk4v4-e8", "--spec", "mtp", "--draft-tokens", "3", "--lm-head-draft", "--preserve-thinking"]
+CMD ["ninfer-serve", "/opt/ninfer/models/qwen3_8_27b.ninfer", "--model-id", "qwen3.8-27b", "--host", "0.0.0.0", "--port", "8080", "--max-context", "262144", "--kv-capacity", "262144", "--max-concurrency", "1", "--max-pending-requests", "16", "--prefill-chunk", "1024", "--kv-dtype", "rk4v4-e8", "--spec", "mtp", "--draft-tokens", "3", "--lm-head-draft", "--prefix-checkpoint-policy", "rolling-tool", "--preserve-thinking"]

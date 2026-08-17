@@ -39,6 +39,7 @@ struct ServeOptions {
     int device                             = 0;
     KvCacheStorage kv_cache                = KvCacheStorage::BFloat16;
     SpeculativeOptions speculative;
+    PrefixCheckpointPolicy prefix_checkpoint_policy = PrefixCheckpointPolicy::RollingTool;
     bool enable_vision      = false;
     bool use_cuda_graph     = true;
     bool allow_prefix_reuse = true;

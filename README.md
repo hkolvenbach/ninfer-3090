@@ -135,6 +135,7 @@ ninfer-serve /opt/ninfer/models/qwen3_8_27b.ninfer \
   --max-concurrency 1 --max-pending-requests 16 \
   --prefill-chunk 1024 --kv-dtype rk4v4-e8 \
   --spec mtp --draft-tokens 3 --lm-head-draft \
+  --prefix-checkpoint-policy rolling-tool \
   --preserve-thinking
 ```
 

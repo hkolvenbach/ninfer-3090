@@ -127,9 +127,12 @@ private:
     std::shared_ptr<const Impl> impl_;
 
     friend class FrontendTestAccess;
-    friend Frontend make_frontend(const FrontendResources& resources, bool vision_enabled);
+    friend Frontend make_frontend(const FrontendResources& resources, bool vision_enabled,
+                                  PrefixCheckpointPolicy prefix_checkpoint_policy);
 };
 
-[[nodiscard]] Frontend make_frontend(const FrontendResources& resources, bool vision_enabled);
+[[nodiscard]] Frontend make_frontend(
+    const FrontendResources& resources, bool vision_enabled,
+    PrefixCheckpointPolicy prefix_checkpoint_policy = PrefixCheckpointPolicy::RollingTool);
 
 } // namespace ninfer::targets::qwen3_6

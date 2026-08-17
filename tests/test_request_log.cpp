@@ -143,6 +143,8 @@ int main() {
         check(server.at("engine").at("proposal_head") == "optimized", "proposal head missing");
     failures +=
         check(server.at("engine").at("prefix_reuse") == false, "prefix-reuse state missing");
+    failures += check(server.at("engine").at("prefix_checkpoint_policy") == "rolling-tool",
+                      "prefix checkpoint policy missing");
     failures += check(server.at("server").at("default_preserve_thinking") == true,
                       "server preserve-thinking default missing");
     failures +=

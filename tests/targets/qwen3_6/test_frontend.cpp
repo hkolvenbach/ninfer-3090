@@ -464,18 +464,37 @@ int test_turn_rewrite_trace() {
     const std::vector<fi::ChatMessage> tool_loop{chat_message("user", "question"), first,
                                                  chat_message("tool", "result one"), second,
                                                  chat_message("tool", "result two")};
-    const fi::RenderedChat open    = render_chat(tool_loop);
-    const std::size_t first_header = open.text.find(assistant_header);
+    fi::ChatRenderOptions stable;
+    stable.prefix_checkpoint_policy = ninfer::PrefixCheckpointPolicy::StableTurn;
+    const fi::RenderedChat open     = render_chat(tool_loop, stable);
+    const std::size_t first_header  = open.text.find(assistant_header);
     int failures =
         check(first_header != std::string::npos && open.turn_rewrite_byte_offset &&
                   *open.turn_rewrite_byte_offset == first_header + assistant_header.size(),
               "tool loop did not retain its first assistant rewrite boundary");
 
     fi::ChatRenderOptions preserve;
-    preserve.preserve_thinking       = true;
-    const fi::RenderedChat preserved = render_chat(tool_loop, preserve);
+    preserve.preserve_thinking        = true;
+    preserve.prefix_checkpoint_policy = ninfer::PrefixCheckpointPolicy::StableTurn;
+    const fi::RenderedChat preserved  = render_chat(tool_loop, preserve);
     failures += check(preserved.turn_rewrite_byte_offset == open.turn_rewrite_byte_offset,
                       "preserve_thinking changed the turn rewrite boundary");
+
+    fi::ChatRenderOptions rolling;
+    rolling.prefix_checkpoint_policy = ninfer::PrefixCheckpointPolicy::RollingTool;
+    const fi::RenderedChat rolled    = render_chat(tool_loop, rolling);
+    const std::size_t rolling_header = rolled.text.rfind(assistant_header);
+    failures +=
+        check(rolling_header != std::string::npos && rolled.turn_rewrite_byte_offset &&
+                  *rolled.turn_rewrite_byte_offset == rolling_header + assistant_header.size() &&
+                  *rolled.turn_rewrite_byte_offset > *open.turn_rewrite_byte_offset,
+              "rolling tool checkpoint did not advance to the generation opener");
+
+    const fi::RenderedChat first_roll = render_chat(
+        {chat_message("user", "question"), first, chat_message("tool", "result one")}, rolling);
+    failures += check(first_roll.turn_rewrite_byte_offset &&
+                          *first_roll.turn_rewrite_byte_offset < *rolled.turn_rewrite_byte_offset,
+                      "rolling tool checkpoint did not advance with completed tool history");
 
     std::vector<fi::ChatMessage> next_turn = tool_loop;
     next_turn.push_back(chat_message("user", "next question"));

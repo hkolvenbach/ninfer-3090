@@ -143,6 +143,7 @@ measured recommendation rather than a semantic limit.
 | `--lm-head-draft` | optimized proposal head | off |
 | `--vision` | enable image/video input and load Vision GPU allocations | off |
 | `--no-cuda-graph` | disable CUDA Graph decode | graphs on |
+| `--prefix-checkpoint-policy stable-turn\|rolling-tool` | choose the stable turn-rewrite anchor or rolling completed-tool frontier | `rolling-tool` |
 | `--no-thinking` | disable thinking in prompt rendering | thinking on |
 | `--reasoning-effort low\|medium\|xhigh` | select an effort exposed by the loaded chat template | template default |
 | `--greedy` | exact argmax decoding | off |

@@ -71,6 +71,11 @@ struct LoadProgress {
     std::function<void(std::string_view phase, std::uint64_t done, std::uint64_t total)> callback;
 };
 
+enum class PrefixCheckpointPolicy : std::uint8_t {
+    StableTurn,
+    RollingTool,
+};
+
 struct EngineOptions {
     std::filesystem::path artifact_path;
     int device                         = 0;
@@ -82,6 +87,7 @@ struct EngineOptions {
     std::uint32_t prefill_chunk        = 1024;
     KvCacheStorage kv_cache            = KvCacheStorage::BFloat16;
     SpeculativeOptions speculative;
+    PrefixCheckpointPolicy prefix_checkpoint_policy = PrefixCheckpointPolicy::RollingTool;
     bool enable_vision  = false;
     bool use_cuda_graph = true;
     LoadProgress load_progress;

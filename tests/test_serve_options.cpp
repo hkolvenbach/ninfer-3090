@@ -31,6 +31,9 @@ int main() {
     const ServeOptions defaults = parse({"ninfer-serve", "model.ninfer"});
     failures += check(defaults.allow_prefix_reuse, "prefix reuse is not enabled by default");
     failures +=
+        check(defaults.prefix_checkpoint_policy == ninfer::PrefixCheckpointPolicy::RollingTool,
+              "rolling tool checkpoints are not enabled by default");
+    failures +=
         check(!defaults.preserve_thinking, "thinking history is unexpectedly preserved by default");
     failures += check(!defaults.enable_vision, "Vision is not disabled by default");
     failures += check(defaults.request_log_jsonl.empty(),
@@ -110,15 +113,19 @@ int main() {
     } catch (const std::invalid_argument&) { implicit_backend_rejected = true; }
     failures += check(implicit_backend_rejected, "--draft-tokens selected a backend implicitly");
 
-    const ServeOptions configured = parse(
-        {"ninfer-serve", "model.ninfer", "--no-prefix-reuse", "--vision", "--max-concurrency", "4",
-         "--max-pending-requests", "12", "--pending-timeout-ms", "2500", "--max-context", "4096",
-         "--kv-capacity", "8192", "--log-stats-interval-ms", "0", "--preserve-thinking"});
+    const ServeOptions configured =
+        parse({"ninfer-serve", "model.ninfer", "--no-prefix-reuse", "--vision", "--max-concurrency",
+               "4", "--max-pending-requests", "12", "--pending-timeout-ms", "2500", "--max-context",
+               "4096", "--kv-capacity", "8192", "--log-stats-interval-ms", "0",
+               "--preserve-thinking", "--prefix-checkpoint-policy", "stable-turn"});
     failures += check(!configured.allow_prefix_reuse,
                       "--no-prefix-reuse did not disable server prefix reuse");
     failures += check(configured.enable_vision, "--vision did not enable Vision");
     failures +=
         check(configured.preserve_thinking, "--preserve-thinking did not reach serving options");
+    failures +=
+        check(configured.prefix_checkpoint_policy == ninfer::PrefixCheckpointPolicy::StableTurn,
+              "stable turn checkpoint policy did not reach serving options");
     failures +=
         check(configured.max_concurrency == 4, "--max-concurrency did not reach serving options");
     failures += check(configured.max_context == 4096 &&
@@ -179,6 +186,9 @@ int main() {
     failures +=
         check(serve_usage_text("ninfer-serve").find("--no-prefix-reuse") != std::string::npos,
               "serve help omits --no-prefix-reuse");
+    failures += check(serve_usage_text("ninfer-serve").find("--prefix-checkpoint-policy") !=
+                          std::string::npos,
+                      "serve help omits --prefix-checkpoint-policy");
     failures +=
         check(serve_usage_text("ninfer-serve").find("--preserve-thinking") != std::string::npos,
               "serve help omits --preserve-thinking");
@@ -195,6 +205,13 @@ int main() {
     failures +=
         check(serve_usage_text("ninfer-serve").find("identity.model_id") != std::string::npos,
               "serve help omits the artifact-derived model id default");
+
+    bool invalid_checkpoint_policy_rejected = false;
+    try {
+        (void)parse({"ninfer-serve", "model.ninfer", "--prefix-checkpoint-policy", "latest"});
+    } catch (const std::invalid_argument&) { invalid_checkpoint_policy_rejected = true; }
+    failures +=
+        check(invalid_checkpoint_policy_rejected, "invalid prefix checkpoint policy was accepted");
 
     const ServeOptions inherited =
         parse({"ninfer-serve", "model.ninfer", "--max-context", "16384"});
