@@ -31,3 +31,7 @@ models
 *.qus
 *.safetensors
 *.sqlite
+
+# Admit only the supported Docker image artifact for local-first model acquisition.
+!models/
+!models/qwen3_8_27b.ninfer
