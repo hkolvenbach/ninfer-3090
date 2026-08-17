@@ -24,12 +24,15 @@ COPY include/ include/
 COPY src/ src/
 COPY third_party/ third_party/
 
-RUN cmake -S . -B /build -G Ninja \
+RUN --mount=type=cache,id=ninfer-sm89-cuda13.2-release,target=/build,sharing=locked \
+    cmake -S . -B /build -G Ninja \
         -DCMAKE_BUILD_TYPE=Release \
         -DNINFER_BUILD_APPS=ON \
         -DBUILD_TESTING=OFF \
         -DNINFER_BUILD_BENCHMARKS=OFF \
-    && cmake --build /build --parallel --target ninfer ninfer-serve
+    && cmake --build /build --parallel --target ninfer ninfer-serve \
+    && install -D /build/apps/ninfer /opt/ninfer/bin/ninfer \
+    && install -D /build/apps/ninfer-serve /opt/ninfer/bin/ninfer-serve
 
 FROM nvidia/cuda:13.2.0-cudnn-runtime-ubuntu24.04
 
@@ -61,8 +64,8 @@ RUN --mount=type=bind,source=.,target=/context,readonly \
          /opt/ninfer/models/qwen3_8_27b.ninfer \
        | sha256sum --check
 
-COPY --from=build /build/apps/ninfer /usr/local/bin/ninfer
-COPY --from=build /build/apps/ninfer-serve /usr/local/bin/ninfer-serve
+COPY --from=build /opt/ninfer/bin/ninfer /usr/local/bin/ninfer
+COPY --from=build /opt/ninfer/bin/ninfer-serve /usr/local/bin/ninfer-serve
 
 WORKDIR /workspace
 EXPOSE 8080
