@@ -3,9 +3,11 @@
 
 #include "ops/common/math.h"
 #include "ops/kernel/gqa_attention_decode.cuh"
-#include "ops/kernel/gqa_attention_decode_bf16.cuh"
-#include "ops/kernel/gqa_attention_decode_i8.cuh"
-#include "core/device.h" // CUDA_CHECK
+#if defined(NINFER_GQA_DECODE_TOKEN)
+#    include "ops/kernel/gqa_attention_decode_bf16.cuh"
+#    include "ops/kernel/gqa_attention_decode_i8.cuh"
+#    include "core/device.h" // CUDA_CHECK
+#endif
 #include "ninfer/ops/gqa_attention.h"
 
 #include <cstdint>
@@ -13,6 +15,10 @@
 
 namespace ninfer::ops::detail {
 namespace {
+
+#if defined(NINFER_GQA_DECODE_TOKEN) && (NINFER_GQA_DECODE_TOKEN < 1 || NINFER_GQA_DECODE_TOKEN > 6)
+#    error "NINFER_GQA_DECODE_TOKEN must be in [1, 6]"
+#endif
 
 // Supplies an upper bound for the device-side active-split policy over one explicit execution
 // envelope. Eager calls normally pass an exact window; graph calls pass their target-private
@@ -82,6 +88,7 @@ std::int32_t gqa_small_t_launch_capacity(GqaExecutionEnvelope envelope, std::int
     return capacity;
 }
 
+#if defined(NINFER_GQA_DECODE_TOKEN)
 template <typename Geometry, int TokenTile, int WarpsPerCta, bool MultiBatch, bool Masked,
           typename CacheInput>
 void launch_tc_partial_bf16(const Tensor& q, CacheInput input, const Tensor& pos, float scale,
@@ -111,8 +118,8 @@ void launch_tc_partial_bf16(const Tensor& q, CacheInput input, const Tensor& pos
     CUDA_CHECK(cudaGetLastError());
 }
 
-template <typename Geometry, int TokenTile, bool PackedV, bool RotateK, bool RotateV,
-          bool PackedK, bool E8Lattice, bool E8Root, bool MultiBatch, bool Masked, typename CacheInput>
+template <typename Geometry, int TokenTile, bool PackedV, bool RotateK, bool RotateV, bool PackedK,
+          bool E8Lattice, bool E8Root, bool MultiBatch, bool Masked, typename CacheInput>
 void launch_tc_partial_i8(const Tensor& q, CacheInput input, const Tensor& pos, float scale,
                           PagedKVBatchLayerView cache, const GqaSmallTInvocation& invocation,
                           std::int32_t logical_capacity, std::int32_t implementation_window,
@@ -125,36 +132,38 @@ void launch_tc_partial_i8(const Tensor& q, CacheInput input, const Tensor& pos, 
     Tensor& cache_v_scale = cache.v_scale_pages;
     const auto launch =
         [&]<int WarpsPerCta, int MinBlocksPerSm, int KeyBlock, bool DynamicArena>() {
-        constexpr std::size_t kDynamicBytes =
-            DynamicArena ? static_cast<std::size_t>(4 * KeyBlock * kGqaHeadDim) : 0ULL;
-        if constexpr (DynamicArena) {
-            static const cudaError_t attr = cudaFuncSetAttribute(
-                gqa_attention_decode_i8_tiled_kernel<Geometry, TokenTile, WarpsPerCta,
-                                                     MinBlocksPerSm, KeyBlock, DynamicArena,
-                                                     PackedV, RotateK, RotateV, PackedK,
-                                                     E8Lattice, E8Root, MultiBatch, Masked, CacheInput>,
-                cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(kDynamicBytes));
-            CUDA_CHECK(attr);
-        }
-        gqa_attention_decode_i8_tiled_kernel<Geometry, TokenTile, WarpsPerCta, MinBlocksPerSm,
-                                             KeyBlock, DynamicArena, PackedV, RotateK, RotateV,
-                                             PackedK, E8Lattice, E8Root, MultiBatch, Masked, CacheInput>
-            <<<grid, WarpsPerCta * 32, kDynamicBytes, stream>>>(
-                static_cast<const __nv_bfloat16*>(q.data), input,
-                static_cast<const std::int32_t*>(pos.data), static_cast<std::int8_t*>(cache_k.data),
-                static_cast<std::uint8_t*>(cache_v.data), static_cast<__half*>(cache_k_scale.data),
-                static_cast<__half*>(cache_v_scale.data),
-                static_cast<const std::int32_t*>(cache.block_tables.data),
-                invocation.valid_columns == nullptr
-                    ? nullptr
-                    : static_cast<const std::int32_t*>(invocation.valid_columns->data),
-                invocation.table_rows == nullptr
-                    ? nullptr
-                    : static_cast<const std::int32_t*>(invocation.table_rows->data),
-                cache.block_tables.ne[0], invocation.full_width, invocation.column_begin,
-                logical_capacity, scale, static_cast<__nv_bfloat16*>(partial_acc.data),
-                static_cast<float*>(partial_m.data), static_cast<float*>(partial_l.data));
-    };
+            constexpr std::size_t kDynamicBytes =
+                DynamicArena ? static_cast<std::size_t>(4 * KeyBlock * kGqaHeadDim) : 0ULL;
+            if constexpr (DynamicArena) {
+                static const cudaError_t attr = cudaFuncSetAttribute(
+                    gqa_attention_decode_i8_tiled_kernel<
+                        Geometry, TokenTile, WarpsPerCta, MinBlocksPerSm, KeyBlock, DynamicArena,
+                        PackedV, RotateK, RotateV, PackedK, E8Lattice, E8Root, MultiBatch, Masked,
+                        CacheInput>,
+                    cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(kDynamicBytes));
+                CUDA_CHECK(attr);
+            }
+            gqa_attention_decode_i8_tiled_kernel<
+                Geometry, TokenTile, WarpsPerCta, MinBlocksPerSm, KeyBlock, DynamicArena, PackedV,
+                RotateK, RotateV, PackedK, E8Lattice, E8Root, MultiBatch, Masked, CacheInput>
+                <<<grid, WarpsPerCta * 32, kDynamicBytes, stream>>>(
+                    static_cast<const __nv_bfloat16*>(q.data), input,
+                    static_cast<const std::int32_t*>(pos.data),
+                    static_cast<std::int8_t*>(cache_k.data),
+                    static_cast<std::uint8_t*>(cache_v.data),
+                    static_cast<__half*>(cache_k_scale.data),
+                    static_cast<__half*>(cache_v_scale.data),
+                    static_cast<const std::int32_t*>(cache.block_tables.data),
+                    invocation.valid_columns == nullptr
+                        ? nullptr
+                        : static_cast<const std::int32_t*>(invocation.valid_columns->data),
+                    invocation.table_rows == nullptr
+                        ? nullptr
+                        : static_cast<const std::int32_t*>(invocation.table_rows->data),
+                    cache.block_tables.ne[0], invocation.full_width, invocation.column_begin,
+                    logical_capacity, scale, static_cast<__nv_bfloat16*>(partial_acc.data),
+                    static_cast<float*>(partial_m.data), static_cast<float*>(partial_l.data));
+        };
     if constexpr (TokenTile == 6) {
         // Small grids need more warps per CTA. From 2K to 8K, Bc=64 halves key
         // loop iterations; dynamic smem avoids penalizing the long-context path.
@@ -222,9 +231,11 @@ PagedKVBatchLayerView single_row_batch_view(const PagedKVLayerView& cache) {
         .e8_root       = cache.e8_root,
     };
 }
+#endif
 
 } // namespace
 
+#if !defined(NINFER_GQA_DECODE_TOKEN)
 bool gqa_attention_uses_small_t(std::int32_t tokens) { return tokens >= 1 && tokens <= 6; }
 
 std::int32_t gqa_attention_split_capacity(std::int32_t q_heads, std::int32_t tokens,
@@ -241,15 +252,17 @@ std::int32_t gqa_attention_split_capacity(std::int32_t q_heads, std::int32_t tok
     }
     throw std::invalid_argument("gqa_attention split capacity: unsupported Q-head count");
 }
+#endif
 
-template <typename Geometry, typename CacheInput>
+#if defined(NINFER_GQA_DECODE_TOKEN)
+template <int TokenTile, typename Geometry, typename CacheInput>
 void gqa_attention_small_t_launch_for(const Tensor& q, CacheInput input, const Tensor& pos,
                                       float scale, PagedKVBatchLayerView cache,
                                       const GqaSmallTInvocation& invocation,
-                                      GqaExecutionEnvelope envelope,
-                                      Tensor& partial_acc, Tensor& partial_m, Tensor& partial_l,
-                                      Tensor& out,
+                                      GqaExecutionEnvelope envelope, Tensor& partial_acc,
+                                      Tensor& partial_m, Tensor& partial_l, Tensor& out,
                                       cudaStream_t stream) {
+    static_assert(TokenTile == NINFER_GQA_DECODE_TOKEN);
     const auto logical_capacity      = static_cast<std::int32_t>(envelope.max_visible_keys);
     const auto implementation_window = static_cast<std::int32_t>(envelope.max_visible_keys);
     const auto splits =
@@ -257,79 +270,67 @@ void gqa_attention_small_t_launch_for(const Tensor& q, CacheInput input, const T
 
     // BF16 keeps its row-tile warp count; INT8 selects its producer/consumer
     // geometry inside launch_tc_partial_i8.
-#define NINFER_GQA_SMALL_T_DISPATCH(TOKENS, WARPS)                                                 \
-    do {                                                                                           \
-        const auto launch_profile = [&]<bool MultiBatch, bool Masked>() {                          \
-            if (cache.dtype == DType::I8) {                                                        \
-                if (cache.e8_root) {                                                               \
-                    launch_tc_partial_i8<Geometry, (TOKENS), true, true, true, false, false, true,  \
-                                         MultiBatch, Masked>(                                      \
-                        q, input, pos, scale, cache, invocation, logical_capacity,                 \
-                        implementation_window, splits, partial_acc, partial_m, partial_l, stream); \
-                } else if (cache.e8_lattice) {                                                     \
-                    launch_tc_partial_i8<Geometry, (TOKENS), true, true, true, true, true, false,  \
-                                         MultiBatch, Masked>(                                      \
-                        q, input, pos, scale, cache, invocation, logical_capacity,                 \
-                        implementation_window, splits, partial_acc, partial_m, partial_l, stream); \
-                } else if (cache.packed_k) {                                                       \
-                    launch_tc_partial_i8<Geometry, (TOKENS), true, true, true, true, false, false, \
-                                         MultiBatch, Masked>(                                      \
-                        q, input, pos, scale, cache, invocation, logical_capacity,                 \
-                        implementation_window, splits, partial_acc, partial_m, partial_l, stream); \
-                } else if (cache.packed_v) {                                                       \
-                    launch_tc_partial_i8<Geometry, (TOKENS), true, true, true, false, false, false,\
-                                         MultiBatch, Masked>(                                      \
-                        q, input, pos, scale, cache, invocation, logical_capacity,                 \
-                        implementation_window, splits, partial_acc, partial_m, partial_l, stream); \
+#    define NINFER_GQA_SMALL_T_DISPATCH(TOKENS, WARPS)                                             \
+        do {                                                                                       \
+            const auto launch_profile = [&]<bool MultiBatch, bool Masked>() {                      \
+                if (cache.dtype == DType::I8) {                                                    \
+                    if (cache.e8_root) {                                                           \
+                        launch_tc_partial_i8<Geometry, (TOKENS), true, true, true, false, false,   \
+                                             true, MultiBatch, Masked>(                            \
+                            q, input, pos, scale, cache, invocation, logical_capacity,             \
+                            implementation_window, splits, partial_acc, partial_m, partial_l,      \
+                            stream);                                                               \
+                    } else if (cache.e8_lattice) {                                                 \
+                        launch_tc_partial_i8<Geometry, (TOKENS), true, true, true, true, true,     \
+                                             false, MultiBatch, Masked>(                           \
+                            q, input, pos, scale, cache, invocation, logical_capacity,             \
+                            implementation_window, splits, partial_acc, partial_m, partial_l,      \
+                            stream);                                                               \
+                    } else if (cache.packed_k) {                                                   \
+                        launch_tc_partial_i8<Geometry, (TOKENS), true, true, true, true, false,    \
+                                             false, MultiBatch, Masked>(                           \
+                            q, input, pos, scale, cache, invocation, logical_capacity,             \
+                            implementation_window, splits, partial_acc, partial_m, partial_l,      \
+                            stream);                                                               \
+                    } else if (cache.packed_v) {                                                   \
+                        launch_tc_partial_i8<Geometry, (TOKENS), true, true, true, false, false,   \
+                                             false, MultiBatch, Masked>(                           \
+                            q, input, pos, scale, cache, invocation, logical_capacity,             \
+                            implementation_window, splits, partial_acc, partial_m, partial_l,      \
+                            stream);                                                               \
+                    } else {                                                                       \
+                        launch_tc_partial_i8<Geometry, (TOKENS), false, false, false, false,       \
+                                             false, false, MultiBatch, Masked>(                    \
+                            q, input, pos, scale, cache, invocation, logical_capacity,             \
+                            implementation_window, splits, partial_acc, partial_m, partial_l,      \
+                            stream);                                                               \
+                    }                                                                              \
                 } else {                                                                           \
-                    launch_tc_partial_i8<Geometry, (TOKENS), false, false, false, false, false,    \
-                                         false, MultiBatch, Masked>(                               \
-                        q, input, pos, scale, cache, invocation, logical_capacity,                 \
-                        implementation_window, splits, partial_acc, partial_m, partial_l, stream); \
+                    launch_tc_partial_bf16<Geometry, (TOKENS), (WARPS), MultiBatch, Masked>(       \
+                        q, input, pos, scale, cache, invocation, logical_capacity, splits,         \
+                        partial_acc, partial_m, partial_l, stream);                                \
                 }                                                                                  \
+            };                                                                                     \
+            const bool masked = invocation.valid_columns != nullptr;                               \
+            if (invocation.batch_size == 1) {                                                      \
+                if (masked) {                                                                      \
+                    launch_profile.template operator()<false, true>();                             \
+                } else {                                                                           \
+                    launch_profile.template operator()<false, false>();                            \
+                }                                                                                  \
+            } else if (masked) {                                                                   \
+                launch_profile.template operator()<true, true>();                                  \
             } else {                                                                               \
-                launch_tc_partial_bf16<Geometry, (TOKENS), (WARPS), MultiBatch, Masked>(           \
-                    q, input, pos, scale, cache, invocation, logical_capacity, splits,             \
-                    partial_acc, partial_m, partial_l, stream);                                    \
+                launch_profile.template operator()<true, false>();                                 \
             }                                                                                      \
-        };                                                                                         \
-        const bool masked = invocation.valid_columns != nullptr;                                   \
-        if (invocation.batch_size == 1) {                                                          \
-            if (masked) {                                                                          \
-                launch_profile.template operator()<false, true>();                                 \
-            } else {                                                                               \
-                launch_profile.template operator()<false, false>();                                \
-            }                                                                                      \
-        } else if (masked) {                                                                       \
-            launch_profile.template operator()<true, true>();                                      \
-        } else {                                                                                   \
-            launch_profile.template operator()<true, false>();                                     \
-        }                                                                                          \
-    } while (0)
+        } while (0)
 
-    switch (invocation.width) {
-    case 1:
-        NINFER_GQA_SMALL_T_DISPATCH(1, 2);
-        break;
-    case 2:
-        NINFER_GQA_SMALL_T_DISPATCH(2, 4);
-        break;
-    case 3:
-        NINFER_GQA_SMALL_T_DISPATCH(3, 4);
-        break;
-    case 4:
-        NINFER_GQA_SMALL_T_DISPATCH(4, 4);
-        break;
-    case 5:
-        NINFER_GQA_SMALL_T_DISPATCH(5, 4);
-        break;
-    case 6:
-        NINFER_GQA_SMALL_T_DISPATCH(6, 4);
-        break;
-    default:
-        throw std::invalid_argument("gqa_attention_small_t_launch: unsupported T");
-    }
-#undef NINFER_GQA_SMALL_T_DISPATCH
+#    if NINFER_GQA_DECODE_TOKEN == 1
+    NINFER_GQA_SMALL_T_DISPATCH(1, 2);
+#    else
+    NINFER_GQA_SMALL_T_DISPATCH(NINFER_GQA_DECODE_TOKEN, 4);
+#    endif
+#    undef NINFER_GQA_SMALL_T_DISPATCH
 
     constexpr int kReduceBlock = 256;
     constexpr int kDChunk      = 64;
@@ -377,8 +378,8 @@ void gqa_attention_small_t_launch_for(const Tensor& q, CacheInput input, const T
     }
     CUDA_CHECK(cudaGetLastError());
     if (cache.rotate_v) {
-        const int units = invocation.batch_size * invocation.width * Geometry::QHeads *
-                          kGqaKvQuantGroups;
+        const int units =
+            invocation.batch_size * invocation.width * Geometry::QHeads * kGqaKvQuantGroups;
         gqa_kv_inverse_rotate_output_kernel<Geometry::QHeads><<<units, 32, 0, stream>>>(
             static_cast<__nv_bfloat16*>(out.data), invocation.width, invocation.full_width,
             invocation.column_begin,
@@ -389,13 +390,15 @@ void gqa_attention_small_t_launch_for(const Tensor& q, CacheInput input, const T
     }
 }
 
-void gqa_attention_small_t_launch(const Tensor& q, const Tensor& k, const Tensor& v,
-                                  const Tensor& pos, const Tensor& valid_columns,
-                                  const Tensor& table_rows, float scale,
-                                  PagedKVBatchLayerView cache, GqaExecutionEnvelope envelope,
-                                  std::int32_t column_begin, std::int32_t width,
-                                  Tensor& partial_acc, Tensor& partial_m, Tensor& partial_l,
-                                  Tensor& out, cudaStream_t stream) {
+#    define NINFER_JOIN_IMPL(left, right) left##right
+#    define NINFER_JOIN(left, right)      NINFER_JOIN_IMPL(left, right)
+#    define NINFER_TOKEN_FN(name)         NINFER_JOIN(name, NINFER_GQA_DECODE_TOKEN)
+
+void NINFER_TOKEN_FN(gqa_attention_small_t_launch_)(
+    const Tensor& q, const Tensor& k, const Tensor& v, const Tensor& pos,
+    const Tensor& valid_columns, const Tensor& table_rows, float scale, PagedKVBatchLayerView cache,
+    GqaExecutionEnvelope envelope, std::int32_t column_begin, std::int32_t width,
+    Tensor& partial_acc, Tensor& partial_m, Tensor& partial_l, Tensor& out, cudaStream_t stream) {
     const GqaAppendInput input{static_cast<const __nv_bfloat16*>(k.data),
                                static_cast<const __nv_bfloat16*>(v.data)};
     const GqaSmallTInvocation invocation{
@@ -407,21 +410,20 @@ void gqa_attention_small_t_launch(const Tensor& q, const Tensor& k, const Tensor
         .batch_size    = q.ne[3],
     };
     if (q.ne[1] == Gqa27Geometry::QHeads) {
-        gqa_attention_small_t_launch_for<Gqa27Geometry>(q, input, pos, scale, cache, invocation,
-                                                        envelope, partial_acc, partial_m, partial_l,
-                                                        out, stream);
+        gqa_attention_small_t_launch_for<NINFER_GQA_DECODE_TOKEN, Gqa27Geometry>(
+            q, input, pos, scale, cache, invocation, envelope, partial_acc, partial_m, partial_l,
+            out, stream);
         return;
     }
-    gqa_attention_small_t_launch_for<Gqa35Geometry>(q, input, pos, scale, cache, invocation,
-                                                    envelope, partial_acc, partial_m, partial_l,
-                                                    out, stream);
+    gqa_attention_small_t_launch_for<NINFER_GQA_DECODE_TOKEN, Gqa35Geometry>(
+        q, input, pos, scale, cache, invocation, envelope, partial_acc, partial_m, partial_l, out,
+        stream);
 }
 
-void gqa_attention_cached_small_t_launch(const Tensor& q, const Tensor& pos, float scale,
-                                         const PagedKVLayerView& cache,
-                                         GqaExecutionEnvelope envelope, Tensor& partial_acc,
-                                         Tensor& partial_m, Tensor& partial_l, Tensor& out,
-                                         cudaStream_t stream) {
+void NINFER_TOKEN_FN(gqa_attention_cached_small_t_launch_)(
+    const Tensor& q, const Tensor& pos, float scale, const PagedKVLayerView& cache,
+    GqaExecutionEnvelope envelope, Tensor& partial_acc, Tensor& partial_m, Tensor& partial_l,
+    Tensor& out, cudaStream_t stream) {
     const GqaCachedInput input{};
     const GqaSmallTInvocation invocation{
         .valid_columns = nullptr,
@@ -433,14 +435,88 @@ void gqa_attention_cached_small_t_launch(const Tensor& q, const Tensor& pos, flo
     };
     const PagedKVBatchLayerView batch_cache = single_row_batch_view(cache);
     if (q.ne[1] == Gqa27Geometry::QHeads) {
-        gqa_attention_small_t_launch_for<Gqa27Geometry>(q, input, pos, scale, batch_cache,
-                                                        invocation, envelope, partial_acc,
-                                                        partial_m, partial_l, out, stream);
+        gqa_attention_small_t_launch_for<NINFER_GQA_DECODE_TOKEN, Gqa27Geometry>(
+            q, input, pos, scale, batch_cache, invocation, envelope, partial_acc, partial_m,
+            partial_l, out, stream);
         return;
     }
-    gqa_attention_small_t_launch_for<Gqa35Geometry>(q, input, pos, scale, batch_cache, invocation,
-                                                    envelope, partial_acc, partial_m, partial_l,
-                                                    out, stream);
+    gqa_attention_small_t_launch_for<NINFER_GQA_DECODE_TOKEN, Gqa35Geometry>(
+        q, input, pos, scale, batch_cache, invocation, envelope, partial_acc, partial_m, partial_l,
+        out, stream);
 }
+
+#    undef NINFER_TOKEN_FN
+#    undef NINFER_JOIN
+#    undef NINFER_JOIN_IMPL
+#endif
+
+#if !defined(NINFER_GQA_DECODE_TOKEN)
+#    define NINFER_DECLARE_TOKEN_LAUNCH(TOKEN)                                                     \
+        void gqa_attention_small_t_launch_##TOKEN(                                                 \
+            const Tensor& q, const Tensor& k, const Tensor& v, const Tensor& pos,                  \
+            const Tensor& valid_columns, const Tensor& table_rows, float scale,                    \
+            PagedKVBatchLayerView cache, GqaExecutionEnvelope envelope, std::int32_t column_begin, \
+            std::int32_t width, Tensor& partial_acc, Tensor& partial_m, Tensor& partial_l,         \
+            Tensor& out, cudaStream_t stream);                                                     \
+        void gqa_attention_cached_small_t_launch_##TOKEN(                                          \
+            const Tensor& q, const Tensor& pos, float scale, const PagedKVLayerView& cache,        \
+            GqaExecutionEnvelope envelope, Tensor& partial_acc, Tensor& partial_m,                 \
+            Tensor& partial_l, Tensor& out, cudaStream_t stream)
+
+NINFER_DECLARE_TOKEN_LAUNCH(1);
+NINFER_DECLARE_TOKEN_LAUNCH(2);
+NINFER_DECLARE_TOKEN_LAUNCH(3);
+NINFER_DECLARE_TOKEN_LAUNCH(4);
+NINFER_DECLARE_TOKEN_LAUNCH(5);
+NINFER_DECLARE_TOKEN_LAUNCH(6);
+#    undef NINFER_DECLARE_TOKEN_LAUNCH
+
+void gqa_attention_small_t_launch(const Tensor& q, const Tensor& k, const Tensor& v,
+                                  const Tensor& pos, const Tensor& valid_columns,
+                                  const Tensor& table_rows, float scale,
+                                  PagedKVBatchLayerView cache, GqaExecutionEnvelope envelope,
+                                  std::int32_t column_begin, std::int32_t width,
+                                  Tensor& partial_acc, Tensor& partial_m, Tensor& partial_l,
+                                  Tensor& out, cudaStream_t stream) {
+#    define NINFER_CALL_TOKEN_LAUNCH(TOKEN)                                                        \
+    case TOKEN:                                                                                    \
+        return gqa_attention_small_t_launch_##TOKEN(                                               \
+            q, k, v, pos, valid_columns, table_rows, scale, cache, envelope, column_begin, width,  \
+            partial_acc, partial_m, partial_l, out, stream)
+    switch (width) {
+        NINFER_CALL_TOKEN_LAUNCH(1);
+        NINFER_CALL_TOKEN_LAUNCH(2);
+        NINFER_CALL_TOKEN_LAUNCH(3);
+        NINFER_CALL_TOKEN_LAUNCH(4);
+        NINFER_CALL_TOKEN_LAUNCH(5);
+        NINFER_CALL_TOKEN_LAUNCH(6);
+    default:
+        throw std::invalid_argument("gqa_attention_small_t_launch: unsupported T");
+    }
+#    undef NINFER_CALL_TOKEN_LAUNCH
+}
+
+void gqa_attention_cached_small_t_launch(const Tensor& q, const Tensor& pos, float scale,
+                                         const PagedKVLayerView& cache,
+                                         GqaExecutionEnvelope envelope, Tensor& partial_acc,
+                                         Tensor& partial_m, Tensor& partial_l, Tensor& out,
+                                         cudaStream_t stream) {
+#    define NINFER_CALL_CACHED_TOKEN_LAUNCH(TOKEN)                                                 \
+    case TOKEN:                                                                                    \
+        return gqa_attention_cached_small_t_launch_##TOKEN(                                        \
+            q, pos, scale, cache, envelope, partial_acc, partial_m, partial_l, out, stream)
+    switch (q.ne[2]) {
+        NINFER_CALL_CACHED_TOKEN_LAUNCH(1);
+        NINFER_CALL_CACHED_TOKEN_LAUNCH(2);
+        NINFER_CALL_CACHED_TOKEN_LAUNCH(3);
+        NINFER_CALL_CACHED_TOKEN_LAUNCH(4);
+        NINFER_CALL_CACHED_TOKEN_LAUNCH(5);
+        NINFER_CALL_CACHED_TOKEN_LAUNCH(6);
+    default:
+        throw std::invalid_argument("gqa_attention_cached_small_t_launch: unsupported T");
+    }
+#    undef NINFER_CALL_CACHED_TOKEN_LAUNCH
+}
+#endif
 
 } // namespace ninfer::ops::detail

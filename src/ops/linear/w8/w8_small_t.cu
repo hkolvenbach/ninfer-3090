@@ -34,91 +34,143 @@ constexpr auto make_launchers(std::index_sequence<Offsets...>) {
         &launch_exact<Geometry, First + static_cast<int>(Offsets)>...};
 }
 
+#if NINFER_W8_SMALL_T_PROFILE == 1
 constexpr auto kVocabularyLaunchers =
     make_launchers<W8VocabularyProjectionGeometry, kW8VocabularyFirstSmallT>(
         std::make_index_sequence<kW8VocabularyLastSmallT - kW8VocabularyFirstSmallT + 1>{});
+#elif NINFER_W8_SMALL_T_PROFILE == 2
 constexpr auto kMtpInputLaunchers =
     make_launchers<W8MtpInputProjectionGeometry, kW8MtpInputFirstSmallT>(
         std::make_index_sequence<kW8MtpInputLastSmallT - kW8MtpInputFirstSmallT + 1>{});
+#elif NINFER_W8_SMALL_T_PROFILE == 3
 constexpr auto kMtpAttentionLaunchers =
     make_launchers<W8MtpAttentionProjectionGeometry, kW8MtpAttentionFirstSmallT>(
         std::make_index_sequence<kW8MtpAttentionLastSmallT - kW8MtpAttentionFirstSmallT + 1>{});
+#elif NINFER_W8_SMALL_T_PROFILE == 4
 constexpr auto kMtpAttentionOutputLaunchers =
     make_launchers<W8MtpAttentionOutputGeometry, kW8MtpAttentionOutputFirstSmallT>(
         std::make_index_sequence<kW8MtpAttentionOutputLastSmallT -
                                  kW8MtpAttentionOutputFirstSmallT + 1>{});
+#elif NINFER_W8_SMALL_T_PROFILE == 5
 constexpr auto kMtpGateUpLaunchers =
     make_launchers<W8MtpGateUpProjectionGeometry, kW8MtpGateUpFirstSmallT>(
         std::make_index_sequence<kW8MtpGateUpLastSmallT - kW8MtpGateUpFirstSmallT + 1>{});
+#elif NINFER_W8_SMALL_T_PROFILE == 6
 constexpr auto kMtpDownLaunchers =
     make_launchers<W8MtpDownProjectionGeometry, kW8MtpDownFirstSmallT>(
         std::make_index_sequence<kW8MtpDownLastSmallT - kW8MtpDownFirstSmallT + 1>{});
+#elif NINFER_W8_SMALL_T_PROFILE == 7
 constexpr auto k35bMtpProjectionLaunchers = make_launchers<W835bMtpProjectionGeometry,
                                                            kW835bMtpProjectionFirstSmallT>(
     std::make_index_sequence<kW835bMtpProjectionLastSmallT - kW835bMtpProjectionFirstSmallT + 1>{});
+#endif
 
 } // namespace
+
+#if NINFER_W8_SMALL_T_PROFILE == 1
+void launch_w8_small_t_profile_1(const Tensor& x, const Weight& weight, Tensor& out,
+                                 cudaStream_t stream) {
+    kVocabularyLaunchers[static_cast<std::size_t>(x.ne[1] - kW8VocabularyFirstSmallT)](x, weight,
+                                                                                       out, stream);
+}
+#elif NINFER_W8_SMALL_T_PROFILE == 2
+void launch_w8_small_t_profile_2(const Tensor& x, const Weight& weight, Tensor& out,
+                                 cudaStream_t stream) {
+    kMtpInputLaunchers[static_cast<std::size_t>(x.ne[1] - kW8MtpInputFirstSmallT)](x, weight, out,
+                                                                                   stream);
+}
+#elif NINFER_W8_SMALL_T_PROFILE == 3
+void launch_w8_small_t_profile_3(const Tensor& x, const Weight& weight, Tensor& out,
+                                 cudaStream_t stream) {
+    kMtpAttentionLaunchers[static_cast<std::size_t>(x.ne[1] - kW8MtpAttentionFirstSmallT)](
+        x, weight, out, stream);
+}
+#elif NINFER_W8_SMALL_T_PROFILE == 4
+void launch_w8_small_t_profile_4(const Tensor& x, const Weight& weight, Tensor& out,
+                                 cudaStream_t stream) {
+    kMtpAttentionOutputLaunchers[static_cast<std::size_t>(
+        x.ne[1] - kW8MtpAttentionOutputFirstSmallT)](x, weight, out, stream);
+}
+#elif NINFER_W8_SMALL_T_PROFILE == 5
+void launch_w8_small_t_profile_5(const Tensor& x, const Weight& weight, Tensor& out,
+                                 cudaStream_t stream) {
+    kMtpGateUpLaunchers[static_cast<std::size_t>(x.ne[1] - kW8MtpGateUpFirstSmallT)](x, weight, out,
+                                                                                     stream);
+}
+#elif NINFER_W8_SMALL_T_PROFILE == 6
+void launch_w8_small_t_profile_6(const Tensor& x, const Weight& weight, Tensor& out,
+                                 cudaStream_t stream) {
+    kMtpDownLaunchers[static_cast<std::size_t>(x.ne[1] - kW8MtpDownFirstSmallT)](x, weight, out,
+                                                                                 stream);
+}
+#elif NINFER_W8_SMALL_T_PROFILE == 7
+void launch_w8_small_t_profile_7(const Tensor& x, const Weight& weight, Tensor& out,
+                                 cudaStream_t stream) {
+    k35bMtpProjectionLaunchers[static_cast<std::size_t>(x.ne[1] - kW835bMtpProjectionFirstSmallT)](
+        x, weight, out, stream);
+}
+#else
+
+void launch_w8_small_t_profile_1(const Tensor&, const Weight&, Tensor&, cudaStream_t);
+void launch_w8_small_t_profile_2(const Tensor&, const Weight&, Tensor&, cudaStream_t);
+void launch_w8_small_t_profile_3(const Tensor&, const Weight&, Tensor&, cudaStream_t);
+void launch_w8_small_t_profile_4(const Tensor&, const Weight&, Tensor&, cudaStream_t);
+void launch_w8_small_t_profile_5(const Tensor&, const Weight&, Tensor&, cudaStream_t);
+void launch_w8_small_t_profile_6(const Tensor&, const Weight&, Tensor&, cudaStream_t);
+void launch_w8_small_t_profile_7(const Tensor&, const Weight&, Tensor&, cudaStream_t);
 
 void launch_w8_small_t(const Tensor& x, const Weight& weight, Tensor& out, cudaStream_t stream) {
     if (weight.n == W8VocabularyProjectionGeometry::kOutputRows &&
         weight.k == W8VocabularyProjectionGeometry::kInputRows &&
         weight.padded_shape[1] == W8VocabularyProjectionGeometry::kInputRows &&
         x.ne[1] >= kW8VocabularyFirstSmallT && x.ne[1] <= kW8VocabularyLastSmallT) {
-        const std::size_t index = static_cast<std::size_t>(x.ne[1] - kW8VocabularyFirstSmallT);
-        kVocabularyLaunchers[index](x, weight, out, stream);
+        launch_w8_small_t_profile_1(x, weight, out, stream);
         return;
     }
     if (weight.n == W8MtpInputProjectionGeometry::kOutputRows &&
         weight.k == W8MtpInputProjectionGeometry::kInputRows &&
         weight.padded_shape[1] == W8MtpInputProjectionGeometry::kInputRows &&
         x.ne[1] >= kW8MtpInputFirstSmallT && x.ne[1] <= kW8MtpInputLastSmallT) {
-        const std::size_t index = static_cast<std::size_t>(x.ne[1] - kW8MtpInputFirstSmallT);
-        kMtpInputLaunchers[index](x, weight, out, stream);
+        launch_w8_small_t_profile_2(x, weight, out, stream);
         return;
     }
     if (weight.n == W8MtpAttentionProjectionGeometry::kOutputRows &&
         weight.k == W8MtpAttentionProjectionGeometry::kInputRows &&
         weight.padded_shape[1] == W8MtpAttentionProjectionGeometry::kInputRows &&
         x.ne[1] >= kW8MtpAttentionFirstSmallT && x.ne[1] <= kW8MtpAttentionLastSmallT) {
-        const std::size_t index = static_cast<std::size_t>(x.ne[1] - kW8MtpAttentionFirstSmallT);
-        kMtpAttentionLaunchers[index](x, weight, out, stream);
+        launch_w8_small_t_profile_3(x, weight, out, stream);
         return;
     }
     if (weight.n == W8MtpAttentionOutputGeometry::kOutputRows &&
         weight.k == W8MtpAttentionOutputGeometry::kInputRows &&
         weight.padded_shape[1] == W8MtpAttentionOutputGeometry::kInputRows &&
         x.ne[1] >= kW8MtpAttentionOutputFirstSmallT && x.ne[1] <= kW8MtpAttentionOutputLastSmallT) {
-        const std::size_t index =
-            static_cast<std::size_t>(x.ne[1] - kW8MtpAttentionOutputFirstSmallT);
-        kMtpAttentionOutputLaunchers[index](x, weight, out, stream);
+        launch_w8_small_t_profile_4(x, weight, out, stream);
         return;
     }
     if (weight.n == W8MtpGateUpProjectionGeometry::kOutputRows &&
         weight.k == W8MtpGateUpProjectionGeometry::kInputRows &&
         weight.padded_shape[1] == W8MtpGateUpProjectionGeometry::kInputRows &&
         x.ne[1] >= kW8MtpGateUpFirstSmallT && x.ne[1] <= kW8MtpGateUpLastSmallT) {
-        const std::size_t index = static_cast<std::size_t>(x.ne[1] - kW8MtpGateUpFirstSmallT);
-        kMtpGateUpLaunchers[index](x, weight, out, stream);
+        launch_w8_small_t_profile_5(x, weight, out, stream);
         return;
     }
     if (weight.n == W8MtpDownProjectionGeometry::kOutputRows &&
         weight.k == W8MtpDownProjectionGeometry::kInputRows &&
         weight.padded_shape[1] == W8MtpDownProjectionGeometry::kInputRows &&
         x.ne[1] >= kW8MtpDownFirstSmallT && x.ne[1] <= kW8MtpDownLastSmallT) {
-        const std::size_t index = static_cast<std::size_t>(x.ne[1] - kW8MtpDownFirstSmallT);
-        kMtpDownLaunchers[index](x, weight, out, stream);
+        launch_w8_small_t_profile_6(x, weight, out, stream);
         return;
     }
     if (weight.n == W835bMtpProjectionGeometry::kOutputRows &&
         weight.k == W835bMtpProjectionGeometry::kInputRows &&
         weight.padded_shape[1] == W835bMtpProjectionGeometry::kInputRows &&
         x.ne[1] >= kW835bMtpProjectionFirstSmallT && x.ne[1] <= kW835bMtpProjectionLastSmallT) {
-        const std::size_t index =
-            static_cast<std::size_t>(x.ne[1] - kW835bMtpProjectionFirstSmallT);
-        k35bMtpProjectionLaunchers[index](x, weight, out, stream);
+        launch_w8_small_t_profile_7(x, weight, out, stream);
         return;
     }
     throw std::invalid_argument("W8 Linear small-T: unsupported exact problem");
 }
+#endif
 
 } // namespace ninfer::ops::detail

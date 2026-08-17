@@ -38,7 +38,7 @@ if(NOT CMAKE_BUILD_TYPE)
 endif()
 
 if(CMAKE_GENERATOR MATCHES "Ninja")
-  set_property(GLOBAL PROPERTY JOB_POOLS cuda_link=1)
+  set_property(GLOBAL PROPERTY JOB_POOLS cuda_link=1 heavy_cuda_compile=4)
   set(CMAKE_JOB_POOL_LINK cuda_link)
 endif()
 

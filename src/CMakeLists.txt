@@ -247,8 +247,48 @@ if(CMAKE_CUDA_ARCHITECTURES STREQUAL "86" OR CMAKE_CUDA_ARCHITECTURES STREQUAL "
   target_sources(ninfer_ops PRIVATE ops/nvfp4_sm86_stubs.cpp)
   target_compile_definitions(ninfer_ops PUBLIC NINFER_SM86=1)
 endif()
+# Compile each token width independently. Combining T=1..6 generates nearly
+# 300 MiB of PTX and makes one ptxas process consume several GiB for minutes.
+foreach(token RANGE 1 6)
+  add_library(ninfer_gqa_decode_t${token} STATIC
+    ops/launcher/gqa_attention_decode.cu)
+  ninfer_internal_includes(ninfer_gqa_decode_t${token})
+  set_target_properties(ninfer_gqa_decode_t${token} PROPERTIES
+    CUDA_SEPARABLE_COMPILATION OFF
+    CUDA_RESOLVE_DEVICE_SYMBOLS OFF
+    JOB_POOL_COMPILE heavy_cuda_compile)
+  target_compile_definitions(ninfer_gqa_decode_t${token} PRIVATE
+    NINFER_GQA_DECODE_TOKEN=${token}
+    NINFER_SM86=1)
+  target_compile_options(ninfer_gqa_decode_t${token} PRIVATE
+    $<$<COMPILE_LANGUAGE:CUDA>:-lineinfo>)
+  target_link_libraries(ninfer_ops PRIVATE ninfer_gqa_decode_t${token})
+endforeach()
+# W8 small-T covers seven independent exact model geometries. Keep each
+# instantiation family in its own object so ptxas does not process them as one
+# multi-minute module.
+foreach(profile RANGE 1 7)
+  add_library(ninfer_w8_small_t_p${profile} STATIC
+    ops/linear/w8/w8_small_t.cu)
+  ninfer_internal_includes(ninfer_w8_small_t_p${profile})
+  set_target_properties(ninfer_w8_small_t_p${profile} PROPERTIES
+    CUDA_SEPARABLE_COMPILATION OFF
+    CUDA_RESOLVE_DEVICE_SYMBOLS OFF
+    JOB_POOL_COMPILE heavy_cuda_compile)
+  target_compile_definitions(ninfer_w8_small_t_p${profile} PRIVATE
+    NINFER_W8_SMALL_T_PROFILE=${profile}
+    NINFER_SM86=1)
+  target_compile_options(ninfer_w8_small_t_p${profile} PRIVATE
+    $<$<COMPILE_LANGUAGE:CUDA>:-lineinfo>)
+  target_link_libraries(ninfer_ops PRIVATE ninfer_w8_small_t_p${profile})
+endforeach()
 ninfer_internal_includes(ninfer_ops)
 ninfer_cuda_archive(ninfer_ops)
+# Ops kernels and device helpers are translation-unit local; RDC adds a giant
+# unnecessary nvcc -dlink step that exceeds practical temporary-space limits.
+set_target_properties(ninfer_ops PROPERTIES
+  CUDA_SEPARABLE_COMPILATION OFF
+  CUDA_RESOLVE_DEVICE_SYMBOLS OFF)
 target_link_libraries(ninfer_ops PUBLIC ninfer_core)
 if(TARGET ninfer_nvfp4_tma)
   target_link_libraries(ninfer_ops PRIVATE ninfer_nvfp4_tma)
