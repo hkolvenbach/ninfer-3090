@@ -320,6 +320,8 @@ if(NINFER_BUILD_SERVE)
     serve/responses_schema.cpp
     serve/anthropic_schema.cpp
     serve/response_store.cpp
+    serve/responses_state.cpp
+    serve/responses_transport.cpp
     serve/tool_call_parser.cpp
     serve/translate.cpp
     serve/console_log.cpp

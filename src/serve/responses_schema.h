@@ -29,6 +29,8 @@ struct ResponsesRequest {
 
     std::optional<std::string> instructions;
     std::optional<std::string> previous_response_id;
+    std::optional<std::string> prompt_cache_key;
+    std::optional<std::string> reasoning_summary;
     nlohmann::json metadata    = nlohmann::json::object();
     nlohmann::json tools       = nlohmann::json::array();
     nlohmann::json tool_choice = "auto";

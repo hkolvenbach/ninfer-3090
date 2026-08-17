@@ -31,6 +31,8 @@ benchmark-report, and external protocol behavior. Repository verification princi
 - `test_openai_schema.cpp`, `test_responses_schema.cpp`, `test_response_store.cpp`,
   `test_anthropic_schema.cpp`, and `test_tool_call_parser.cpp` — current protocol translation,
   Responses Item/state/SSE behavior, and incremental tool-call behavior;
+- `ai-sdk-openai/` — pinned Node black-box and captured-wire contracts for AI SDK 6 with
+  `@ai-sdk/openai` 3.0.84;
 - `test_ninfer_bench_support.cpp` — product benchmark CLI, timing boundary, and schema-v9 reports;
 - `test_bench_matrix.py` — schema-v9 report consumption by the Python matrix summarizer;
 - `test_serve_corpus.py` — serving request-log schema compatibility at the measurement consumer;
@@ -135,7 +137,7 @@ Run the serving contract manually after starting a resident server in another te
 
 ```bash
 ./build/apps/ninfer-serve out/qwen3_6_27b.ninfer \
-  --host 127.0.0.1 --port 18080
+  --host 127.0.0.1 --port 18080 --vision
 ```
 
 ```bash
@@ -146,6 +148,26 @@ python3 -m tools.smoke.serve_contract \
 This smoke check is intentionally not a CTest: it needs the real artifact, a supported GPU, and a
 server process that remains alive while the client exercises OpenAI Responses/Chat, Anthropic,
 state, streaming, and multimodal requests.
+When the server is intentionally launched without `--vision`, pass `--vision-disabled` to verify
+the explicit `vision_disabled` capability response instead.
+
+The AI SDK harness has deterministic no-server wire fixtures and opt-in live checks. Install its
+exact lockfile and run it with either the server origin or `/v1` API URL:
+
+```bash
+cd tests/ai-sdk-openai
+npm ci
+npm test
+
+NINFER_BASE_URL=http://127.0.0.1:18080 \
+NINFER_MODEL=qwen3.6-27b npm test
+```
+
+Without both environment variables, only the live tests are reported as skipped. The harness only
+acts as a client and never starts or stops the resident server. Its Responses coverage verifies
+public `summary_text` reasoning under `store:false` and the SDK's ignored
+`reasoning.encrypted_content` include hint; native schema tests verify public summary replay because
+this pinned SDK drops unencrypted reasoning while rebuilding response messages.
 
 The thinking-preservation fixture starts and stops its own server, submits a fixed two-step tool
 history, compares restored and cold greedy output, compares stripped and preserved closed-turn

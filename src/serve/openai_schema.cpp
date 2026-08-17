@@ -5,9 +5,11 @@
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
+#include <initializer_list>
 #include <limits>
 #include <random>
 #include <string>
+#include <string_view>
 
 namespace ninfer::serve {
 namespace {
@@ -27,6 +29,66 @@ using Json = nlohmann::json;
 const Json& require_object(const Json& body) {
     if (!body.is_object()) { bad_request("request body must be a JSON object"); }
     return body;
+}
+
+void reject_unknown_fields(const Json& obj, std::initializer_list<std::string_view> allowed,
+                           std::string_view path = {}) {
+    for (auto it = obj.begin(); it != obj.end(); ++it) {
+        bool known = false;
+        for (const std::string_view key : allowed) {
+            if (it.key() == key) {
+                known = true;
+                break;
+            }
+        }
+        if (!known) {
+            const std::string param = path.empty() ? it.key() : std::string(path) + "." + it.key();
+            bad_request("unknown parameter: " + param, param, "unknown_parameter");
+        }
+    }
+}
+
+void reject_unknown_top_level(const Json& body) {
+    // Keep standard client metadata/routing fields in the compatibility surface even when they do
+    // not alter local inference. Truly unknown fields must never look successfully supported.
+    reject_unknown_fields(body, {"audio",
+                                 "chat_template_kwargs",
+                                 "enable_thinking",
+                                 "frequency_penalty",
+                                 "function_call",
+                                 "functions",
+                                 "logit_bias",
+                                 "logprobs",
+                                 "max_completion_tokens",
+                                 "max_tokens",
+                                 "messages",
+                                 "metadata",
+                                 "modalities",
+                                 "model",
+                                 "n",
+                                 "parallel_tool_calls",
+                                 "prediction",
+                                 "presence_penalty",
+                                 "preserve_thinking",
+                                 "prompt_cache_key",
+                                 "reasoning_effort",
+                                 "response_format",
+                                 "safety_identifier",
+                                 "seed",
+                                 "service_tier",
+                                 "stop",
+                                 "store",
+                                 "stream",
+                                 "stream_options",
+                                 "temperature",
+                                 "tool_choice",
+                                 "tools",
+                                 "top_k",
+                                 "top_logprobs",
+                                 "top_p",
+                                 "user",
+                                 "verbosity",
+                                 "web_search_options"});
 }
 
 bool get_bool(const Json& obj, const char* key, bool fallback) {
@@ -90,13 +152,6 @@ std::string require_function_name(const Json& obj, const char* param) {
     return name;
 }
 
-bool has_tool_named(const GenerationRequest& req, const std::string& name) {
-    for (const ToolDefinition& tool : req.tools) {
-        if (tool.name == name) { return true; }
-    }
-    return false;
-}
-
 ninfer::product::media_acquire::Source parse_media_url(const Json& part, const char* field) {
     if (!part.contains(field)) {
         bad_request(std::string(field) + " content part must contain " + field, "messages");
@@ -105,7 +160,11 @@ ninfer::product::media_acquire::Source parse_media_url(const Json& part, const c
     std::string url;
     if (value.is_string()) {
         url = value.get<std::string>();
-    } else if (value.is_object() && value.contains("url") && value.at("url").is_string()) {
+    } else if (value.is_object()) {
+        reject_unknown_fields(value, {"url", "detail"}, std::string("messages.content.") + field);
+        if (!value.contains("url") || !value.at("url").is_string()) {
+            bad_request(std::string(field) + " must contain a string url", "messages");
+        }
         url = value.at("url").get<std::string>();
     } else {
         bad_request(std::string(field) + " must be a URL string or object containing url",
@@ -143,18 +202,22 @@ void parse_content_parts(const Json& content, ChatTurn& turn, std::size_t index)
         ContentPart out;
         out.type_raw = type;
         if (type == "text") {
+            reject_unknown_fields(part, {"type", "text"}, "messages.content");
             if (!part.contains("text") || !part.at("text").is_string()) {
                 bad_request("text content part must contain a string 'text'", "messages");
             }
             out.kind = ContentKind::Text;
             out.text = part.at("text").get<std::string>();
         } else if (type == "image_url") {
+            reject_unknown_fields(part, {"type", "image_url"}, "messages.content");
             out.kind   = ContentKind::Image;
             out.source = parse_media_url(part, "image_url");
         } else if (type == "video_url") {
+            reject_unknown_fields(part, {"type", "video_url"}, "messages.content");
             out.kind   = ContentKind::Video;
             out.source = parse_media_url(part, "video_url");
         } else if (type == "input_audio") {
+            reject_unknown_fields(part, {"type", "input_audio"}, "messages.content");
             out.kind = ContentKind::InputAudio;
         } else {
             out.kind = ContentKind::Unsupported;
@@ -179,6 +242,7 @@ std::vector<ToolCall> parse_assistant_tool_calls(const Json& item, std::size_t i
     for (std::size_t i = 0; i < tool_calls.size(); ++i) {
         const Json& call = tool_calls.at(i);
         if (!call.is_object()) { bad_request("tool_calls entries must be objects", "messages"); }
+        reject_unknown_fields(call, {"id", "type", "function", "index"}, "messages.tool_calls");
         if (!call.contains("id") || !call.at("id").is_string() ||
             call.at("id").get<std::string>().empty()) {
             bad_request("tool_calls entries must contain a string id", "messages");
@@ -192,6 +256,7 @@ std::vector<ToolCall> parse_assistant_tool_calls(const Json& item, std::size_t i
             bad_request("tool_calls entries must contain a function object", "messages");
         }
         const Json& fn = call.at("function");
+        reject_unknown_fields(fn, {"name", "arguments"}, "messages.tool_calls.function");
         ToolCall out;
         out.id   = call.at("id").get<std::string>();
         out.name = require_function_name(fn, "messages");
@@ -219,6 +284,10 @@ void parse_messages(const Json& body, GenerationRequest& out) {
         if (!item.is_object()) {
             bad_request("message " + std::to_string(i) + " must be an object", "messages");
         }
+        reject_unknown_fields(item,
+                              {"role", "content", "name", "tool_calls", "tool_call_id",
+                               "function_call", "reasoning_content", "refusal", "audio"},
+                              "messages");
         if (!item.contains("role") || !item.at("role").is_string()) {
             bad_request("message " + std::to_string(i) + " must have a string role", "messages");
         }
@@ -295,6 +364,7 @@ void parse_tools(const Json& body, GenerationRequest& out) {
     for (std::size_t i = 0; i < tools.size(); ++i) {
         const Json& item = tools.at(i);
         if (!item.is_object()) { bad_request("tools entries must be objects", "tools"); }
+        reject_unknown_fields(item, {"type", "function"}, "tools");
         if (!item.contains("type") || !item.at("type").is_string()) {
             bad_request("tools entries must contain a string type", "tools");
         }
@@ -306,6 +376,8 @@ void parse_tools(const Json& body, GenerationRequest& out) {
         }
         Json normalized = item;
         Json& fn        = normalized["function"];
+        reject_unknown_fields(fn, {"name", "description", "parameters", "strict"},
+                              "tools.function");
         ToolDefinition tool;
         tool.name = require_function_name(fn, "tools");
         if (fn.contains("description") && !fn.at("description").is_null()) {
@@ -325,10 +397,15 @@ void parse_tools(const Json& body, GenerationRequest& out) {
             if (!fn.at("strict").is_boolean()) {
                 bad_request("function strict must be a boolean", "tools");
             }
-            tool.strict = fn.at("strict").get<bool>();
-        } else {
-            fn["strict"] = false;
+            if (fn.at("strict").get<bool>()) {
+                bad_request("strict function schema enforcement is not supported", "tools",
+                            "strict_tools_not_supported");
+            }
         }
+        // The prompt receives the same non-strict guarantee the API accepted; null and omission
+        // are canonicalized rather than preserving ambiguous wire metadata.
+        fn["strict"]         = false;
+        tool.strict          = false;
         tool.definition_json = normalized.dump();
         out.tools.push_back(std::move(tool));
     }
@@ -344,12 +421,14 @@ void parse_tool_choice(const Json& body, GenerationRequest& out) {
         } else if (value == "auto") {
             out.tool_choice.mode = ToolChoiceMode::Auto;
         } else if (value == "required") {
-            out.tool_choice.mode = ToolChoiceMode::Required;
+            bad_request("tool_choice 'required' is not supported", "tool_choice",
+                        "tool_choice_not_supported");
         } else {
             bad_request("tool_choice must be 'none', 'auto', 'required', or a function choice",
                         "tool_choice");
         }
     } else if (choice.is_object()) {
+        reject_unknown_fields(choice, {"type", "function"}, "tool_choice");
         if (!choice.contains("type") || !choice.at("type").is_string() ||
             choice.at("type").get<std::string>() != "function") {
             bad_request("only function tool_choice objects are supported", "tool_choice",
@@ -358,18 +437,12 @@ void parse_tool_choice(const Json& body, GenerationRequest& out) {
         if (!choice.contains("function") || !choice.at("function").is_object()) {
             bad_request("function tool_choice must contain a function object", "tool_choice");
         }
-        out.tool_choice.mode = ToolChoiceMode::Named;
-        out.tool_choice.name = require_function_name(choice.at("function"), "tool_choice");
+        reject_unknown_fields(choice.at("function"), {"name"}, "tool_choice.function");
+        (void)require_function_name(choice.at("function"), "tool_choice");
+        bad_request("named tool_choice is not supported", "tool_choice",
+                    "tool_choice_not_supported");
     } else {
         bad_request("tool_choice must be a string or object", "tool_choice");
-    }
-    if (out.tool_choice.mode != ToolChoiceMode::None && out.tools.empty()) {
-        bad_request("tool_choice requires tools", "tool_choice");
-    }
-    if (out.tool_choice.mode == ToolChoiceMode::Named &&
-        !has_tool_named(out, out.tool_choice.name)) {
-        bad_request("tool_choice references unknown function: " + out.tool_choice.name,
-                    "tool_choice");
     }
 }
 
@@ -403,15 +476,11 @@ void parse_sampling(const Json& body, GenerationRequest& out) {
     if (body.contains("logit_bias") && !body.at("logit_bias").is_null()) {
         const Json& bias = body.at("logit_bias");
         if (!bias.is_object()) { bad_request("logit_bias must be an object", "logit_bias"); }
-        for (auto it = bias.begin(); it != bias.end(); ++it) {
-            if (!it.value().is_number()) {
-                bad_request("logit_bias values must be numbers", "logit_bias");
-            }
-            try {
-                s.logit_bias.emplace(std::stoi(it.key()), it.value().get<double>());
-            } catch (const std::exception&) {
-                bad_request("logit_bias keys must be integer token ids", "logit_bias");
-            }
+        // Empty maps are emitted by some clients as a default. A nonempty map would promise a
+        // sampler effect the engine cannot currently provide, so reject it instead of ignoring it.
+        if (!bias.empty()) {
+            bad_request("nonempty logit_bias is not supported", "logit_bias",
+                        "logit_bias_not_supported");
         }
     }
     if (const std::optional<int> n = get_int(body, "n")) {
@@ -437,7 +506,8 @@ void reject_unsupported_features(const Json& body) {
         }
     }
     if (body.contains("response_format") && !body.at("response_format").is_null()) {
-        const Json& fmt  = body.at("response_format");
+        const Json& fmt = body.at("response_format");
+        if (fmt.is_object()) { reject_unknown_fields(fmt, {"type"}, "response_format"); }
         std::string type = fmt.is_object() && fmt.contains("type") && fmt.at("type").is_string()
                                ? fmt.at("type").get<std::string>()
                                : std::string();
@@ -447,6 +517,86 @@ void reject_unsupported_features(const Json& body) {
             error.param   = "response_format";
             error.code    = "response_format_not_supported";
             throw ApiException(std::move(error));
+        }
+    }
+
+    if (body.contains("logprobs") && !body.at("logprobs").is_null()) {
+        if (!body.at("logprobs").is_boolean()) {
+            bad_request("logprobs must be a boolean", "logprobs");
+        }
+        if (body.at("logprobs").get<bool>()) {
+            bad_request("logprobs are not supported", "logprobs", "logprobs_not_supported");
+        }
+    }
+    if (body.contains("top_logprobs") && !body.at("top_logprobs").is_null()) {
+        const std::optional<int> value = get_int(body, "top_logprobs");
+        if (!value || *value != 0) {
+            bad_request("top_logprobs are not supported", "top_logprobs", "logprobs_not_supported");
+        }
+    }
+    if (body.contains("parallel_tool_calls") && !body.at("parallel_tool_calls").is_null()) {
+        if (!body.at("parallel_tool_calls").is_boolean()) {
+            bad_request("parallel_tool_calls must be a boolean", "parallel_tool_calls");
+        }
+        if (!body.at("parallel_tool_calls").get<bool>()) {
+            bad_request("parallel_tool_calls=false cannot be enforced", "parallel_tool_calls",
+                        "parallel_tool_calls_not_supported");
+        }
+    }
+    if (body.contains("modalities") && !body.at("modalities").is_null()) {
+        const Json& modalities = body.at("modalities");
+        if (!modalities.is_array() || modalities.size() != 1 || !modalities.at(0).is_string() ||
+            modalities.at(0).get<std::string>() != "text") {
+            bad_request("modalities only supports ['text']", "modalities",
+                        "modality_not_supported");
+        }
+    }
+    for (const char* key : {"audio", "prediction", "web_search_options"}) {
+        if (body.contains(key) && !body.at(key).is_null()) {
+            bad_request(std::string(key) + " is not supported", key, "parameter_not_supported");
+        }
+    }
+    if (body.contains("store") && !body.at("store").is_null()) {
+        if (!body.at("store").is_boolean()) { bad_request("store must be a boolean", "store"); }
+        if (body.at("store").get<bool>()) {
+            bad_request("store=true is not supported", "store", "store_not_supported");
+        }
+    }
+
+    if (body.contains("service_tier") && !body.at("service_tier").is_null()) {
+        if (!body.at("service_tier").is_string()) {
+            bad_request("service_tier must be a string", "service_tier");
+        }
+        const std::string tier = body.at("service_tier").get<std::string>();
+        if (tier != "auto" && tier != "default") {
+            bad_request("only service_tier 'auto' or 'default' is supported", "service_tier",
+                        "service_tier_not_supported");
+        }
+        // Local serving has one service tier; these default spellings are harmless SDK metadata.
+    }
+    if (body.contains("metadata") && !body.at("metadata").is_null()) {
+        const Json& metadata = body.at("metadata");
+        if (!metadata.is_object()) { bad_request("metadata must be an object", "metadata"); }
+        if (metadata.size() > 16) {
+            bad_request("metadata supports at most 16 entries", "metadata");
+        }
+        for (auto it = metadata.begin(); it != metadata.end(); ++it) {
+            if (it.key().size() > 64 || !it.value().is_string() ||
+                it.value().get_ref<const std::string&>().size() > 512) {
+                bad_request("metadata keys must be at most 64 characters and string values at "
+                            "most 512 characters",
+                            "metadata");
+            }
+        }
+        // Metadata is accepted for client correlation only and deliberately does not affect output.
+    }
+    if (body.contains("user") && !body.at("user").is_null()) {
+        if (!body.at("user").is_string()) { bad_request("user must be a string", "user"); }
+        // User identifiers are compatibility metadata; this local server has no attribution layer.
+    }
+    for (const char* key : {"prompt_cache_key", "safety_identifier", "verbosity"}) {
+        if (body.contains(key) && !body.at(key).is_null()) {
+            bad_request(std::string(key) + " is not supported", key, "parameter_not_supported");
         }
     }
 }
@@ -528,6 +678,7 @@ void parse_openai_reasoning_effort(const Json& body, GenerationRequest& out) {
 
 GenerationRequest parse_chat_completion_request(const Json& body, const RequestLimits& limits) {
     require_object(body);
+    reject_unknown_top_level(body);
     reject_unsupported_features(body);
 
     GenerationRequest out;
@@ -544,7 +695,11 @@ GenerationRequest parse_chat_completion_request(const Json& body, const RequestL
     parse_sampling(body, out);
 
     out.stream = get_bool(body, "stream", false);
-    if (body.contains("stream_options") && body.at("stream_options").is_object()) {
+    if (body.contains("stream_options") && !body.at("stream_options").is_null()) {
+        if (!body.at("stream_options").is_object()) {
+            bad_request("stream_options must be an object", "stream_options");
+        }
+        reject_unknown_fields(body.at("stream_options"), {"include_usage"}, "stream_options");
         out.include_usage = get_bool(body.at("stream_options"), "include_usage", false);
     }
     if (body.contains("enable_thinking") && !body.at("enable_thinking").is_null()) {

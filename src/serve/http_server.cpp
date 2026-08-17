@@ -4,6 +4,7 @@
 #include "serve/console_log.h"
 #include "serve/openai_schema.h"
 #include "serve/request_log.h"
+#include "serve/responses_schema.h"
 #include "serve/translate.h"
 
 #include <nlohmann/json.hpp>
@@ -49,24 +50,42 @@ void set_owned_content(httplib::Response& response, std::string body,
     response.hold_resource(std::move(lifetime));
 }
 
+ApiError public_internal_error() {
+    ApiError error;
+    error.status  = 500;
+    error.type    = "internal_error";
+    error.message = "Internal server error.";
+    return error;
+}
+
+ApiError public_error(ApiError error) {
+    return error.status == 500 ? public_internal_error() : std::move(error);
+}
+
 void write_error(httplib::Response& res, const ApiError& error) {
-    res.status = error.status;
-    res.set_content(make_error_body(error), "application/json");
+    const ApiError rendered = public_error(error);
+    res.status              = rendered.status;
+    if (rendered.status == 429 || rendered.status == 503) { res.set_header("Retry-After", "1"); }
+    res.set_content(make_error_body(rendered), "application/json");
 }
 
 // Anthropic-shaped error body ({"type":"error","error":{...}}), used by the
 // /v1/messages endpoints so Claude clients see the error format they expect.
 void write_messages_error(httplib::Response& res, const ApiError& error) {
-    res.status = error.status;
-    res.set_content(make_messages_error_body(error), "application/json");
+    const ApiError rendered = public_error(error);
+    res.status              = rendered.status;
+    if (rendered.status == 429 || rendered.status == 503) { res.set_header("Retry-After", "1"); }
+    res.set_content(make_messages_error_body(rendered), "application/json");
 }
 
-void write_exception(httplib::Response& res, const std::exception& ex) {
-    ApiError error;
-    error.status  = 500;
-    error.type    = "internal_error";
-    error.message = ex.what();
-    write_error(res, error);
+void write_exception(httplib::Response& res) { write_error(res, public_internal_error()); }
+
+void ensure_request_id(httplib::Response& response) {
+    if (!response.has_header("x-request-id")) {
+        static const std::string process_prefix = new_response_item_id("req");
+        static std::atomic<std::uint64_t> sequence{0};
+        response.set_header("x-request-id", process_prefix + "_" + std::to_string(++sequence));
+    }
 }
 
 std::string sse_error_event(const ApiError& error) {
@@ -189,6 +208,7 @@ void HttpServer::stop_stats_reporter() {
 
 void HttpServer::register_routes() {
     server_.set_error_handler([](const httplib::Request& req, httplib::Response& res) {
+        ensure_request_id(res);
         // httplib invokes this for EVERY status >= 400, including 413s that
         // route handlers already answered with a specific error body (e.g.
         // media_budget_exceeded). Only synthesize the generic payload-limit
@@ -208,8 +228,14 @@ void HttpServer::register_routes() {
     if (options_.enable_cors) {
         server_.set_default_headers(
             {{"Access-Control-Allow-Origin", "*"},
-             {"Access-Control-Allow-Headers", "Authorization, Content-Type"},
-             {"Access-Control-Allow-Methods", "GET, POST, DELETE, OPTIONS"}});
+             {"Access-Control-Allow-Headers",
+              "Authorization, Content-Type, OpenAI-Organization, OpenAI-Project, X-API-Key, "
+              "Anthropic-Version, Anthropic-Beta, X-Stainless-Arch, X-Stainless-Lang, "
+              "X-Stainless-OS, X-Stainless-Package-Version, X-Stainless-Retry-Count, "
+              "X-Stainless-Runtime, X-Stainless-Runtime-Version"},
+             {"Access-Control-Allow-Methods", "GET, HEAD, POST, PUT, PATCH, DELETE, OPTIONS"},
+             {"Access-Control-Expose-Headers", "x-request-id, Retry-After"},
+             {"Access-Control-Max-Age", "86400"}});
         // CORS preflight: browsers send OPTIONS with no credentials before the real
         // request; answer it without auth so the actual GET/POST can carry the key.
         server_.Options(R"(.*)",
@@ -217,6 +243,7 @@ void HttpServer::register_routes() {
     }
 
     server_.set_pre_routing_handler([this](const httplib::Request& req, httplib::Response& res) {
+        ensure_request_id(res);
         if (options_.api_key.empty() || req.path == "/health" || req.method == "OPTIONS") {
             return httplib::Server::HandlerResponse::Unhandled;
         }
@@ -242,19 +269,27 @@ void HttpServer::register_routes() {
         }
         return httplib::Server::HandlerResponse::Unhandled;
     });
+    server_.set_post_routing_handler(
+        [](const httplib::Request&, httplib::Response& res) { ensure_request_id(res); });
 
     server_.set_exception_handler(
         [](const httplib::Request&, httplib::Response& res, std::exception_ptr ep) {
+            ensure_request_id(res);
             try {
                 std::rethrow_exception(ep);
             } catch (const ApiException& e) {
+                if (e.error().status == 500) {
+                    write_console_log(ConsoleLogLevel::Error,
+                                      "unhandled HTTP API exception: " + e.error().message);
+                }
                 write_error(res, e.error());
-            } catch (const std::exception& e) { write_exception(res, e); } catch (...) {
-                ApiError error;
-                error.status  = 500;
-                error.type    = "internal_error";
-                error.message = "unknown error";
-                write_error(res, error);
+            } catch (const std::exception& e) {
+                write_console_log(ConsoleLogLevel::Error,
+                                  "unhandled HTTP exception: " + std::string(e.what()));
+                write_exception(res);
+            } catch (...) {
+                write_console_log(ConsoleLogLevel::Error, "unhandled non-standard HTTP exception");
+                write_exception(res);
             }
         });
 
@@ -275,21 +310,20 @@ void HttpServer::register_routes() {
     // session a busy slot is already reporting, and per-slot attribution is
     // unknowable without an engine slot table.
     server_.Get("/slots", [this](const httplib::Request&, httplib::Response& res) {
-        const auto active = metrics_.active_snapshot();
-        const auto last   = metrics_.last_completed();
-        const bool speculative =
-            options_.speculative.backend != ninfer::SpeculativeBackend::None;
-        nlohmann::json slots = nlohmann::json::array();
+        const auto active      = metrics_.active_snapshot();
+        const auto last        = metrics_.last_completed();
+        const bool speculative = options_.speculative.backend != ninfer::SpeculativeBackend::None;
+        nlohmann::json slots   = nlohmann::json::array();
         for (std::uint32_t i = 0; i < options_.max_concurrency; ++i) {
             const bool busy    = i < active.size();
             const bool retains = active.empty() && i == 0;
-            slots.push_back({{"id", i},
-                             {"is_processing", busy},
-                             {"n_ctx", options_.max_context},
-                             {"n_prompt_tokens",
-                              busy ? active[i].second : (retains ? last.prompt_tokens : 0)},
-                             {"n_prompt_tokens_cache", retains ? last.cached_tokens : 0},
-                             {"speculative", speculative}});
+            slots.push_back(
+                {{"id", i},
+                 {"is_processing", busy},
+                 {"n_ctx", options_.max_context},
+                 {"n_prompt_tokens", busy ? active[i].second : (retains ? last.prompt_tokens : 0)},
+                 {"n_prompt_tokens_cache", retains ? last.cached_tokens : 0},
+                 {"speculative", speculative}});
         }
         res.set_content(slots.dump(), "application/json");
     });
@@ -397,8 +431,11 @@ void HttpServer::handle_chat_completions(const httplib::Request& req, httplib::R
     const std::string model    = request.model;
 
     const std::uint64_t req_id = ++request_seq_;
-    const RequestLogContext log_context =
-        make_request_log_context(req_id, "openai_chat_completions", request, prepared);
+    // Pre-routing creates the client-visible ID before any generation handler runs. Capturing that
+    // exact response header joins operator logs to the client while req_id remains metrics
+    // identity.
+    const RequestLogContext log_context = make_request_log_context(
+        req_id, res.get_header_value("x-request-id"), "openai_chat_completions", request, prepared);
     log_request_start(log_context);
 
     if (!request.stream) {
@@ -505,18 +542,14 @@ void HttpServer::handle_chat_completions(const httplib::Request& req, httplib::R
             } catch (const ApiException& e) {
                 log_request_error(log_context, e.error().message);
                 try {
-                    write_stream_item(sink, *stream, sse_error_event(e.error()));
+                    write_stream_item(sink, *stream, sse_error_event(public_error(e.error())));
                     sink.done();
                     return true;
                 } catch (const ClientDisconnected&) { return false; }
             } catch (const std::exception& e) {
                 log_request_error(log_context, e.what());
-                ApiError error;
-                error.status  = 500;
-                error.type    = "internal_error";
-                error.message = e.what();
                 try {
-                    write_stream_item(sink, *stream, sse_error_event(error));
+                    write_stream_item(sink, *stream, sse_error_event(public_internal_error()));
                     sink.done();
                     return true;
                 } catch (const ClientDisconnected&) { return false; }
@@ -546,11 +579,9 @@ void HttpServer::handle_count_tokens(const httplib::Request& req, httplib::Respo
     } catch (const ApiException& e) {
         write_messages_error(res, e.error());
     } catch (const std::exception& e) {
-        ApiError error;
-        error.status  = 500;
-        error.type    = "internal_error";
-        error.message = e.what();
-        write_messages_error(res, error);
+        write_console_log(ConsoleLogLevel::Error,
+                          "count_tokens exception: " + std::string(e.what()));
+        write_messages_error(res, public_internal_error());
     }
 }
 
@@ -580,11 +611,9 @@ void HttpServer::handle_messages(const httplib::Request& req, httplib::Response&
         write_messages_error(res, e.error());
         return;
     } catch (const std::exception& e) {
-        ApiError error;
-        error.status  = 500;
-        error.type    = "internal_error";
-        error.message = e.what();
-        write_messages_error(res, error);
+        write_console_log(ConsoleLogLevel::Error,
+                          "messages preparation exception: " + std::string(e.what()));
+        write_messages_error(res, public_internal_error());
         return;
     }
 
@@ -592,9 +621,9 @@ void HttpServer::handle_messages(const httplib::Request& req, httplib::Response&
     const std::string model = request.model; // echo the requested model
     const int input_tokens  = prepared.prompt_tokens;
 
-    const std::uint64_t req_id = ++request_seq_;
-    const RequestLogContext log_context =
-        make_request_log_context(req_id, "anthropic_messages", request, prepared);
+    const std::uint64_t req_id          = ++request_seq_;
+    const RequestLogContext log_context = make_request_log_context(
+        req_id, res.get_header_value("x-request-id"), "anthropic_messages", request, prepared);
     log_request_start(log_context);
 
     if (!request.stream) {
@@ -615,11 +644,7 @@ void HttpServer::handle_messages(const httplib::Request& req, httplib::Response&
             write_messages_error(res, e.error());
         } catch (const std::exception& e) {
             log_request_error(log_context, e.what());
-            ApiError error;
-            error.status  = 500;
-            error.type    = "internal_error";
-            error.message = e.what();
-            write_messages_error(res, error);
+            write_messages_error(res, public_internal_error());
         }
         return;
     }
@@ -729,18 +754,16 @@ void HttpServer::handle_messages(const httplib::Request& req, httplib::Response&
             } catch (const ApiException& e) {
                 log_request_error(log_context, e.error().message);
                 try {
-                    write_stream_item(sink, *stream, messages_sse_error_event(e.error()));
+                    write_stream_item(sink, *stream,
+                                      messages_sse_error_event(public_error(e.error())));
                     sink.done();
                     return true;
                 } catch (const ClientDisconnected&) { return false; }
             } catch (const std::exception& e) {
                 log_request_error(log_context, e.what());
-                ApiError error;
-                error.status  = 500;
-                error.type    = "internal_error";
-                error.message = e.what();
                 try {
-                    write_stream_item(sink, *stream, messages_sse_error_event(error));
+                    write_stream_item(sink, *stream,
+                                      messages_sse_error_event(public_internal_error()));
                     sink.done();
                     return true;
                 } catch (const ClientDisconnected&) { return false; }

@@ -13,9 +13,9 @@
 #include <vector>
 
 #ifdef _WIN32
-#include <process.h>
+#    include <process.h>
 #else
-#include <unistd.h>
+#    include <unistd.h>
 #endif
 
 namespace {
@@ -193,10 +193,12 @@ int main() {
     prepared.sampling.seed                     = 7632647173703958409ULL;
 
     const RequestLogContext context =
-        make_request_log_context(7, "openai_chat_completions", request, prepared);
+        make_request_log_context(7, "req_public_abc", "openai_chat_completions", request, prepared);
     const Json started = Json::parse(format_request_start_json("serve-test", 2000, context));
     failures +=
         check(started.at("request").at("request_id") == 7, "request id missing from start record");
+    failures += check(started.at("request").at("x_request_id") == "req_public_abc",
+                      "client-visible request id missing from start record");
     failures += check(started.at("request").at("requested_output_tokens") == 4096,
                       "request output budget missing");
     failures += check(started.at("request").at("enable_thinking") == false,
@@ -228,6 +230,8 @@ int main() {
     outcome.metrics.speculative_accepted_per_position = {290, 240, 190};
 
     const Json done = Json::parse(format_request_done_json("serve-test", 3000, context, outcome));
+    failures += check(done.at("request").at("x_request_id") == "req_public_abc",
+                      "client-visible request id missing from done record");
     failures +=
         check(done.at("result").at("finish_reason") == "output_limit", "finish reason missing");
     failures += check(done.at("result").at("prompt_tokens") == 401, "prompt tokens missing");
@@ -253,6 +257,8 @@ int main() {
     const Json error =
         Json::parse(format_request_error_json("serve-test", 4000, context, "generation failed"));
     failures += check(error.at("event") == "request_error", "request error event mismatch");
+    failures += check(error.at("request").at("x_request_id") == "req_public_abc",
+                      "client-visible request id missing from error record");
     failures += check(error.at("error").at("message") == "generation failed",
                       "request error message missing");
 
@@ -266,6 +272,13 @@ int main() {
                       "human request log omits prefix reuse path");
     failures += check(format_request_start(context).find("submitted") != std::string::npos,
                       "human request log mislabels a submitted request");
+    failures += check(
+        format_request_start(context).find("x_request_id=req_public_abc") != std::string::npos &&
+            format_request_done(context, outcome).find("x_request_id=req_public_abc") !=
+                std::string::npos &&
+            format_request_error(context, "failed").find("x_request_id=req_public_abc") !=
+                std::string::npos,
+        "human generation logs omit the client-visible request id");
 
     ThroughputReport throughput;
     throughput.interval_seconds                = 2.0;
@@ -297,15 +310,14 @@ int main() {
                           console_prefix.ends_with("] [info] ninfer-serve: "),
                       "console log prefix mismatch");
 
-    const std::filesystem::path log_path =
-        std::filesystem::temp_directory_path() /
-        ("ninfer-request-log-test-" +
+    const std::filesystem::path log_path = std::filesystem::temp_directory_path() /
+                                           ("ninfer-request-log-test-" +
 #ifdef _WIN32
-         std::to_string(static_cast<long long>(::_getpid())) +
+                                            std::to_string(static_cast<long long>(::_getpid())) +
 #else
-         std::to_string(static_cast<long long>(::getpid())) +
+                                            std::to_string(static_cast<long long>(::getpid())) +
 #endif
-         ".jsonl");
+                                            ".jsonl");
     std::filesystem::remove(log_path);
     {
         JsonlRequestLog writer(log_path.string());

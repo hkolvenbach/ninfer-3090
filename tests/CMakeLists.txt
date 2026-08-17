@@ -148,6 +148,12 @@ ninfer_add_test(ninfer_serve_metrics_test
 ninfer_add_test(ninfer_response_store_test
   SOURCES test_response_store.cpp
   LIBRARIES ninfer_serve)
+ninfer_add_test(ninfer_responses_state_test
+  SOURCES test_responses_state.cpp
+  LIBRARIES ninfer_serve)
+ninfer_add_test(ninfer_responses_transport_test
+  SOURCES test_responses_transport.cpp
+  LIBRARIES ninfer_serve)
 ninfer_add_test(ninfer_anthropic_schema_test
   SOURCES test_anthropic_schema.cpp
   LIBRARIES ninfer_serve)

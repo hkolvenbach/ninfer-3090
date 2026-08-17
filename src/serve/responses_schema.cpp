@@ -10,6 +10,7 @@
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
+#include <initializer_list>
 #include <limits>
 #include <iterator>
 #include <random>
@@ -37,6 +38,32 @@ using Json = nlohmann::json;
 const Json& require_object(const Json& body) {
     if (!body.is_object()) { bad_request("request body must be a JSON object"); }
     return body;
+}
+
+void reject_unknown_non_null_fields(const Json& object,
+                                    std::initializer_list<std::string_view> allowed,
+                                    std::string_view path) {
+    for (auto it = object.begin(); it != object.end(); ++it) {
+        bool known = false;
+        for (const std::string_view key : allowed) {
+            if (it.key() == key) {
+                known = true;
+                break;
+            }
+        }
+        // Null extension fields carry no behavior and are common in generated SDK payloads.
+        if (!known && !it.value().is_null()) {
+            const std::string param = std::string(path) + "." + it.key();
+            bad_request("unknown parameter: " + param, param, "unknown_parameter");
+        }
+    }
+}
+
+void require_empty_array_noop(const Json& object, const char* key, std::string_view path) {
+    if (!object.contains(key) || object.at(key).is_null()) { return; }
+    if (!object.at(key).is_array() || !object.at(key).empty()) {
+        bad_request(std::string(path) + "." + key + " must be an empty array", "input");
+    }
 }
 
 bool optional_bool(const Json& object, const char* key, bool fallback) {
@@ -154,6 +181,8 @@ struct ParsedMessage {
 };
 
 ParsedMessage parse_message_item(const Json& item, std::size_t index) {
+    reject_unknown_non_null_fields(item, {"id", "type", "role", "content", "status", "phase"},
+                                   "input.message");
     if (!item.contains("role") || !item.at("role").is_string()) {
         bad_request("input message " + std::to_string(index) + " must contain a string role",
                     "input");
@@ -198,14 +227,26 @@ ParsedMessage parse_message_item(const Json& item, std::size_t index) {
             }
             const std::string type = value.at("type").get<std::string>();
             if (type == "input_text" || type == "output_text") {
+                reject_unknown_non_null_fields(value, {"type", "text", "annotations", "logprobs"},
+                                               "input.message.content");
                 if (!value.contains("text") || !value.at("text").is_string()) {
                     bad_request(type + " must contain a string text", "input");
                 }
                 if (type == "output_text" && role != "assistant") {
                     bad_request("output_text is only valid on assistant messages", "input");
                 }
+                if (type == "input_text" &&
+                    ((value.contains("annotations") && !value.at("annotations").is_null()) ||
+                     (value.contains("logprobs") && !value.at("logprobs").is_null()))) {
+                    bad_request("annotations and logprobs are only valid on output_text", "input");
+                }
+                // Empty output metadata arrays are emitted on replay by common AI SDK clients.
+                require_empty_array_noop(value, "annotations", "input.message.content");
+                require_empty_array_noop(value, "logprobs", "input.message.content");
                 append_text(value.at("text").get<std::string>(), type);
             } else if (type == "input_image") {
+                reject_unknown_non_null_fields(value, {"type", "image_url", "file_id", "detail"},
+                                               "input.message.content");
                 if (role != "user") {
                     bad_request("input_image is only supported on user messages", "input");
                 }
@@ -218,6 +259,8 @@ ParsedMessage parse_message_item(const Json& item, std::size_t index) {
                                        {"image_url", value.at("image_url")},
                                        {"detail", "auto"}});
             } else if (type == "input_video") {
+                reject_unknown_non_null_fields(value, {"type", "video_url"},
+                                               "input.message.content");
                 if (role != "user") {
                     bad_request("input_video is only supported on user messages", "input");
                 }
@@ -252,41 +295,63 @@ ParsedMessage parse_message_item(const Json& item, std::size_t index) {
 }
 
 std::string parse_reasoning_item(const Json& item, Json& canonical) {
+    reject_unknown_non_null_fields(item, {"id", "type", "summary", "content", "encrypted_content"},
+                                   "input.reasoning");
     if (item.contains("encrypted_content") && !item.at("encrypted_content").is_null()) {
-        bad_request("encrypted reasoning content is not supported", "input",
+        bad_request("reasoning encrypted_content is not supported", "input",
                     "encrypted_reasoning_not_supported");
     }
+    std::string summary_text;
+    Json summary = Json::array();
     if (item.contains("summary") && !item.at("summary").is_null()) {
         if (!item.at("summary").is_array()) {
             bad_request("reasoning summary must be an array", "input");
         }
-        if (!item.at("summary").empty()) {
-            bad_request("reasoning summaries are not supported; replay raw reasoning_text", "input",
-                        "reasoning_summary_not_supported");
+        for (const Json& part : item.at("summary")) {
+            if (part.is_object()) {
+                reject_unknown_non_null_fields(part, {"type", "text"}, "input.reasoning.summary");
+            }
+            if (!part.is_object() || !part.contains("type") || !part.at("type").is_string() ||
+                part.at("type").get<std::string>() != "summary_text" || !part.contains("text") ||
+                !part.at("text").is_string()) {
+                bad_request("reasoning summary only supports summary_text parts", "input");
+            }
+            summary_text += part.at("text").get<std::string>();
+            summary.push_back(Json{{"type", "summary_text"}, {"text", part.at("text")}});
         }
-    }
-    if (!item.contains("content") || !item.at("content").is_array()) {
-        bad_request("reasoning Item must contain a content array", "input");
     }
     std::string text;
     Json content = Json::array();
-    for (const Json& part : item.at("content")) {
-        if (!part.is_object() || !part.contains("type") || !part.at("type").is_string() ||
-            part.at("type").get<std::string>() != "reasoning_text" || !part.contains("text") ||
-            !part.at("text").is_string()) {
-            bad_request("reasoning content only supports reasoning_text parts", "input");
+    if (item.contains("content") && !item.at("content").is_null()) {
+        if (!item.at("content").is_array()) {
+            bad_request("reasoning content must be an array", "input");
         }
-        text += part.at("text").get<std::string>();
-        content.push_back(Json{{"type", "reasoning_text"}, {"text", part.at("text")}});
+        for (const Json& part : item.at("content")) {
+            if (part.is_object()) {
+                reject_unknown_non_null_fields(part, {"type", "text"}, "input.reasoning.content");
+            }
+            if (!part.is_object() || !part.contains("type") || !part.at("type").is_string() ||
+                part.at("type").get<std::string>() != "reasoning_text" || !part.contains("text") ||
+                !part.at("text").is_string()) {
+                bad_request("reasoning content only supports reasoning_text parts", "input");
+            }
+            text += part.at("text").get<std::string>();
+            content.push_back(Json{{"type", "reasoning_text"}, {"text", part.at("text")}});
+        }
     }
+    // Public summary_text is the canonical stateless replay representation.
+    if (!summary_text.empty()) { text = summary_text; }
+    if (text.empty()) { bad_request("reasoning Item must contain reasoning text", "input"); }
     canonical = {{"id", item_id(item, "rs", "input")},
                  {"type", "reasoning"},
-                 {"summary", Json::array()},
-                 {"content", std::move(content)}};
+                 {"summary", std::move(summary)}};
+    if (!content.empty()) { canonical["content"] = std::move(content); }
     return text;
 }
 
 ToolCall parse_function_call_item(const Json& item, Json& canonical) {
+    reject_unknown_non_null_fields(item, {"id", "type", "call_id", "name", "arguments", "status"},
+                                   "input.function_call");
     ToolCall call;
     if (!item.contains("call_id") || !item.at("call_id").is_string() ||
         item.at("call_id").get<std::string>().empty()) {
@@ -316,12 +381,14 @@ ToolCall parse_function_call_item(const Json& item, Json& canonical) {
 }
 
 ChatTurn parse_function_call_output_item(const Json& item, Json& canonical) {
+    reject_unknown_non_null_fields(item, {"id", "type", "call_id", "output", "status"},
+                                   "input.function_call_output");
     if (!item.contains("call_id") || !item.at("call_id").is_string() ||
         item.at("call_id").get<std::string>().empty()) {
         bad_request("function_call_output must contain a non-empty call_id", "input");
     }
-    if (!item.contains("output") || !item.at("output").is_string()) {
-        bad_request("function_call_output output must be a string", "input");
+    if (!item.contains("output")) {
+        bad_request("function_call_output must contain output", "input");
     }
     if (item.contains("status") && !item.at("status").is_null() &&
         (!item.at("status").is_string() || item.at("status").get<std::string>() != "completed")) {
@@ -330,16 +397,62 @@ ChatTurn parse_function_call_output_item(const Json& item, Json& canonical) {
     ChatTurn turn;
     turn.role         = "tool";
     turn.tool_call_id = item.at("call_id").get<std::string>();
-    ContentPart content;
-    content.kind     = ContentKind::Text;
-    content.type_raw = "input_text";
-    content.text     = item.at("output").get<std::string>();
-    turn.content.push_back(std::move(content));
+    Json canonical_output;
+    if (item.at("output").is_string()) {
+        ContentPart content;
+        content.kind     = ContentKind::Text;
+        content.type_raw = "input_text";
+        content.text     = item.at("output").get<std::string>();
+        turn.content.push_back(std::move(content));
+        canonical_output = item.at("output");
+    } else if (item.at("output").is_array()) {
+        if (item.at("output").empty()) {
+            bad_request("function_call_output output array must not be empty", "input");
+        }
+        canonical_output = Json::array();
+        for (const Json& value : item.at("output")) {
+            if (!value.is_object() || !value.contains("type") || !value.at("type").is_string()) {
+                bad_request("function_call_output parts must contain a string type", "input");
+            }
+            const std::string type = value.at("type").get<std::string>();
+            if (type == "input_text") {
+                reject_unknown_non_null_fields(value, {"type", "text"},
+                                               "input.function_call_output.output");
+                if (!value.contains("text") || !value.at("text").is_string()) {
+                    bad_request("input_text must contain a string text", "input");
+                }
+                ContentPart content;
+                content.kind     = ContentKind::Text;
+                content.type_raw = type;
+                content.text     = value.at("text").get<std::string>();
+                turn.content.push_back(std::move(content));
+                canonical_output.push_back(Json{{"type", type}, {"text", value.at("text")}});
+            } else if (type == "input_image") {
+                reject_unknown_non_null_fields(value, {"type", "image_url", "file_id", "detail"},
+                                               "input.function_call_output.output");
+                ContentPart content;
+                content.kind     = ContentKind::Image;
+                content.type_raw = type;
+                content.source   = parse_image_source(value);
+                turn.content.push_back(std::move(content));
+                canonical_output.push_back(
+                    Json{{"type", type}, {"image_url", value.at("image_url")}, {"detail", "auto"}});
+            } else if (type == "input_file") {
+                bad_request("input_file is not supported in function_call_output", "input",
+                            "file_inputs_not_supported");
+            } else {
+                bad_request("function_call_output only supports input_text and input_image",
+                            "input", "modality_not_supported");
+            }
+        }
+    } else {
+        bad_request("function_call_output output must be a string or non-empty array", "input");
+    }
     canonical = {{"id", item_id(item, "fco", "input")},
                  {"type", "function_call_output"},
                  {"status", "completed"},
                  {"call_id", turn.tool_call_id},
-                 {"output", item.at("output")}};
+                 {"output", std::move(canonical_output)}};
     return turn;
 }
 
@@ -447,6 +560,8 @@ void parse_tools(const Json& body, ResponsesRequest& out) {
         if (item.at("type").get<std::string>() != "function") {
             bad_request("only function tools are supported", "tools", "tool_type_not_supported");
         }
+        reject_unknown_non_null_fields(
+            item, {"type", "name", "description", "parameters", "strict"}, "tools");
         ToolDefinition tool;
         tool.name = require_function_name(item, "tools");
         if (!names.insert(tool.name).second) {
@@ -523,10 +638,18 @@ void parse_reasoning(const Json& body, ResponsesRequest& out) {
     const Json& reasoning = body.at("reasoning");
     if (!reasoning.is_object()) { bad_request("reasoning must be an object", "reasoning"); }
     for (auto it = reasoning.begin(); it != reasoning.end(); ++it) {
-        if (it.key() != "effort" && !it.value().is_null()) {
+        if (it.key() != "effort" && it.key() != "summary" && !it.value().is_null()) {
             bad_request("reasoning." + it.key() + " is not supported", "reasoning",
                         "reasoning_option_not_supported");
         }
+    }
+    if (reasoning.contains("summary") && !reasoning.at("summary").is_null()) {
+        if (!reasoning.at("summary").is_string() ||
+            (reasoning.at("summary").get<std::string>() != "auto" &&
+             reasoning.at("summary").get<std::string>() != "detailed")) {
+            bad_request("reasoning.summary must be 'auto' or 'detailed'", "reasoning");
+        }
+        out.reasoning_summary = reasoning.at("summary").get<std::string>();
     }
     if (!reasoning.contains("effort") || reasoning.at("effort").is_null()) { return; }
     if (!reasoning.at("effort").is_string()) {
@@ -604,12 +727,16 @@ void reject_unknown_top_level(const Json& body) {
 }
 
 void reject_server_managed_features(const Json& body) {
-    for (const char* key : {"context_management", "conversation", "max_tool_calls", "moderation",
-                            "prompt", "prompt_cache_key", "prompt_cache_options",
-                            "prompt_cache_retention", "safety_identifier", "user"}) {
+    for (const char* key :
+         {"context_management", "conversation", "max_tool_calls", "moderation", "prompt",
+          "prompt_cache_options", "prompt_cache_retention", "safety_identifier", "user"}) {
         if (body.contains(key) && !body.at(key).is_null()) {
             bad_request(std::string(key) + " is not supported", key, "parameter_not_supported");
         }
+    }
+    if (body.contains("prompt_cache_key") && !body.at("prompt_cache_key").is_null() &&
+        !body.at("prompt_cache_key").is_string()) {
+        bad_request("prompt_cache_key must be a string", "prompt_cache_key");
     }
     if (body.contains("background") && !body.at("background").is_null()) {
         if (!body.at("background").is_boolean()) {
@@ -618,13 +745,6 @@ void reject_server_managed_features(const Json& body) {
         if (body.at("background").get<bool>()) {
             bad_request("background responses are not supported", "background",
                         "background_not_supported");
-        }
-    }
-    if (body.contains("include") && !body.at("include").is_null()) {
-        if (!body.at("include").is_array()) { bad_request("include must be an array", "include"); }
-        if (!body.at("include").empty()) {
-            bad_request("additional response fields are not supported", "include",
-                        "include_not_supported");
         }
     }
     if (body.contains("parallel_tool_calls") && !body.at("parallel_tool_calls").is_null()) {
@@ -728,6 +848,21 @@ ResponsesRequest parse_request_impl(const Json& body, const RequestLimits& limit
     out.store             = optional_bool(body, "store", true);
     out.stream            = optional_bool(body, "stream", false);
     out.generation.stream = out.stream;
+    if (body.contains("prompt_cache_key") && !body.at("prompt_cache_key").is_null()) {
+        out.prompt_cache_key = body.at("prompt_cache_key").get<std::string>();
+    }
+    if (body.contains("include") && !body.at("include").is_null()) {
+        if (!body.at("include").is_array()) { bad_request("include must be an array", "include"); }
+        if (body.at("include").empty()) {
+            // An empty include list requests no optional fields.
+        } else if (body.at("include").size() != 1 || !body.at("include").at(0).is_string() ||
+                   body.at("include").at(0).get<std::string>() != "reasoning.encrypted_content") {
+            bad_request("include only supports reasoning.encrypted_content", "include",
+                        "include_not_supported");
+        }
+        // AI SDK requests this field for store:false replay. NInfer always returns public
+        // summary_text instead, so the recognized hint intentionally has no effect.
+    }
     validate_metadata(body, out);
     parse_tools(body, out);
     parse_tool_choice(body, out);
@@ -803,7 +938,7 @@ Json response_common(const std::string& id, std::int64_t created_at,
         {"effort", request.generation.reasoning_effort
                        ? Json(requested_reasoning_effort_name(*request.generation.reasoning_effort))
                        : Json(nullptr)},
-        {"summary", nullptr}};
+        {"summary", request.reasoning_summary ? Json(*request.reasoning_summary) : Json("auto")}};
     return Json{
         {"id", id},
         {"object", "response"},
@@ -817,6 +952,8 @@ Json response_common(const std::string& id, std::int64_t created_at,
         {"parallel_tool_calls", true},
         {"previous_response_id",
          request.previous_response_id ? Json(*request.previous_response_id) : Json(nullptr)},
+        {"prompt_cache_key",
+         request.prompt_cache_key ? Json(*request.prompt_cache_key) : Json(nullptr)},
         {"reasoning", reasoning},
         {"service_tier", "default"},
         {"store", request.store},
@@ -836,18 +973,14 @@ BuiltResponse build_response(const std::string& id, std::int64_t created_at,
     const std::string status      = response_status(outcome.finish_reason);
     const std::string item_status = status == "completed" ? "completed" : "incomplete";
 
+    // Generated reasoning is always public through the native summary_text representation.
     if (!outcome.reasoning.empty()) {
         if (ids.reasoning.empty()) { ids.reasoning = new_response_item_id("rs"); }
-        const char* reasoning_status = (!outcome.text.empty() || !outcome.tool_calls.empty())
-                                           ? "completed"
-                                           : item_status.c_str();
-        built.output_items.push_back(
-            Json{{"id", ids.reasoning},
-                 {"type", "reasoning"},
-                 {"status", reasoning_status},
-                 {"summary", Json::array()},
-                 {"content",
-                  Json::array({Json{{"type", "reasoning_text"}, {"text", outcome.reasoning}}})}});
+        Json item = {{"id", ids.reasoning},
+                     {"type", "reasoning"},
+                     {"summary",
+                      Json::array({Json{{"type", "summary_text"}, {"text", outcome.reasoning}}})}};
+        built.output_items.push_back(std::move(item));
     }
 
     if (!outcome.text.empty() || outcome.tool_calls.empty()) {
@@ -891,7 +1024,7 @@ BuiltResponse build_response(const std::string& id, std::int64_t created_at,
 
     Json response            = response_common(id, created_at, request, runtime);
     response["status"]       = status;
-    response["completed_at"] = completion_time_now();
+    response["completed_at"] = status == "completed" ? Json(completion_time_now()) : Json(nullptr);
     response["error"]        = nullptr;
     response["output"]       = built.output_items;
     response["incomplete_details"] =
@@ -899,12 +1032,12 @@ BuiltResponse build_response(const std::string& id, std::int64_t created_at,
     const int observed_cached = std::max(runtime.cached_input_tokens,
                                          static_cast<int>(outcome.metrics.prefix_cache_hit_tokens));
     const int cached_tokens   = std::clamp(observed_cached, 0, outcome.prompt_tokens);
-    response["usage"] =
-        Json{{"input_tokens", outcome.prompt_tokens},
-             {"input_tokens_details", Json{{"cached_tokens", cached_tokens}}},
-             {"output_tokens", outcome.completion_tokens},
-             {"output_tokens_details", Json{{"reasoning_tokens", outcome.reasoning_tokens}}},
-             {"total_tokens", outcome.prompt_tokens + outcome.completion_tokens}};
+    response["usage"]         = Json{
+                {"input_tokens", outcome.prompt_tokens},
+                {"input_tokens_details", Json{{"cached_tokens", cached_tokens}, {"cache_write_tokens", 0}}},
+                {"output_tokens", outcome.completion_tokens},
+                {"output_tokens_details", Json{{"reasoning_tokens", outcome.reasoning_tokens}}},
+                {"total_tokens", outcome.prompt_tokens + outcome.completion_tokens}};
     built.body = std::move(response);
     return built;
 }
@@ -1006,41 +1139,40 @@ public:
         reasoning_started = true;
         ids.reasoning     = new_response_item_id("rs");
         reasoning_index   = next_output_index++;
-        const Json item   = {{"id", ids.reasoning},
-                             {"type", "reasoning"},
-                             {"status", "in_progress"},
-                             {"summary", Json::array()},
-                             {"content", Json::array()}};
-        const Json part   = {{"type", "reasoning_text"}, {"text", ""}};
-        return {sse(event("response.output_item.added",
-                          Json{{"output_index", reasoning_index}, {"item", item}})),
-                sse(event("response.content_part.added", Json{{"item_id", ids.reasoning},
-                                                              {"output_index", reasoning_index},
-                                                              {"content_index", 0},
-                                                              {"part", part}}))};
+        const Json item   = {
+            {"id", ids.reasoning}, {"type", "reasoning"}, {"summary", Json::array()}};
+        std::vector<std::string> events = {
+            sse(event("response.output_item.added",
+                      Json{{"output_index", reasoning_index}, {"item", item}}))};
+        events.push_back(sse(
+            event("response.reasoning_summary_part.added", Json{{"item_id", ids.reasoning},
+                                                                {"output_index", reasoning_index},
+                                                                {"summary_index", 0}})));
+        return events;
     }
 
-    std::vector<std::string> close_reasoning(const std::string& final_text,
-                                             const char* item_status = "completed") {
+    std::vector<std::string> close_reasoning(const std::string& final_text) {
         if (!reasoning_started || reasoning_done) { return {}; }
         reasoning_done  = true;
         reasoning_text  = final_text;
-        const Json part = {{"type", "reasoning_text"}, {"text", reasoning_text}};
-        const Json item = {{"id", ids.reasoning},
-                           {"type", "reasoning"},
-                           {"status", item_status},
-                           {"summary", Json::array()},
-                           {"content", Json::array({part})}};
-        return {sse(event("response.reasoning_text.done", Json{{"item_id", ids.reasoning},
+        const Json item = {
+            {"id", ids.reasoning}, {"type", "reasoning"}, {"summary", Json::array()}};
+        Json done_item = item;
+        std::vector<std::string> events;
+        done_item["summary"].push_back(Json{{"type", "summary_text"}, {"text", reasoning_text}});
+        events.push_back(sse(
+            event("response.reasoning_summary_text.done", Json{{"item_id", ids.reasoning},
                                                                {"output_index", reasoning_index},
-                                                               {"content_index", 0},
-                                                               {"text", reasoning_text}})),
-                sse(event("response.content_part.done", Json{{"item_id", ids.reasoning},
-                                                             {"output_index", reasoning_index},
-                                                             {"content_index", 0},
-                                                             {"part", part}})),
-                sse(event("response.output_item.done",
-                          Json{{"output_index", reasoning_index}, {"item", item}}))};
+                                                               {"summary_index", 0},
+                                                               {"text", reasoning_text}})));
+        events.push_back(sse(
+            event("response.reasoning_summary_part.done", Json{{"item_id", ids.reasoning},
+                                                               {"output_index", reasoning_index},
+                                                               {"summary_index", 0}})));
+        events.push_back(
+            sse(event("response.output_item.done",
+                      Json{{"output_index", reasoning_index}, {"item", std::move(done_item)}})));
+        return events;
     }
 
     std::vector<std::string> ensure_message() {
@@ -1130,13 +1262,13 @@ std::vector<std::string> ResponsesEventStream::reasoning_delta(const std::string
         throw std::logic_error("invalid reasoning delta event state");
     }
     if (text.empty()) { return {}; }
-    std::vector<std::string> events = impl_->ensure_reasoning();
     impl_->reasoning_text += text;
-    events.push_back(sse(
-        impl_->event("response.reasoning_text.delta", Json{{"item_id", impl_->ids.reasoning},
-                                                           {"output_index", impl_->reasoning_index},
-                                                           {"content_index", 0},
-                                                           {"delta", text}})));
+    std::vector<std::string> events = impl_->ensure_reasoning();
+    events.push_back(sse(impl_->event("response.reasoning_summary_text.delta",
+                                      Json{{"item_id", impl_->ids.reasoning},
+                                           {"output_index", impl_->reasoning_index},
+                                           {"summary_index", 0},
+                                           {"delta", text}})));
     return events;
 }
 
@@ -1145,8 +1277,9 @@ std::vector<std::string> ResponsesEventStream::content_delta(const std::string& 
         throw std::logic_error("invalid content delta event state");
     }
     if (text.empty()) { return {}; }
-    std::vector<std::string> events = impl_->close_reasoning(impl_->reasoning_text);
-    std::vector<std::string> added  = impl_->ensure_message();
+    std::vector<std::string> events;
+    events                         = impl_->close_reasoning(impl_->reasoning_text);
+    std::vector<std::string> added = impl_->ensure_message();
     events.insert(events.end(), std::make_move_iterator(added.begin()),
                   std::make_move_iterator(added.end()));
     impl_->content_text += text;
@@ -1177,14 +1310,12 @@ ResponsesStreamFinish ResponsesEventStream::finish(const GenerationOutcome& outc
         append(impl_->ensure_reasoning());
         impl_->reasoning_text = outcome.reasoning;
         finished.events_before_terminal.push_back(sse(impl_->event(
-            "response.reasoning_text.delta", Json{{"item_id", impl_->ids.reasoning},
-                                                  {"output_index", impl_->reasoning_index},
-                                                  {"content_index", 0},
-                                                  {"delta", outcome.reasoning}})));
+            "response.reasoning_summary_text.delta", Json{{"item_id", impl_->ids.reasoning},
+                                                          {"output_index", impl_->reasoning_index},
+                                                          {"summary_index", 0},
+                                                          {"delta", outcome.reasoning}})));
     }
-    const char* reasoning_status =
-        (!outcome.text.empty() || !outcome.tool_calls.empty()) ? "completed" : item_status;
-    append(impl_->close_reasoning(outcome.reasoning, reasoning_status));
+    append(impl_->close_reasoning(outcome.reasoning));
 
     const bool needs_message = !outcome.text.empty() || outcome.tool_calls.empty();
     if (needs_message) {
@@ -1248,11 +1379,19 @@ std::string ResponsesEventStream::terminal(const BuiltResponse& response) {
     }
     impl_->terminal_emitted  = true;
     const std::string status = response.body.at("status").get<std::string>();
-    const std::string type   = status == "completed"    ? "response.completed"
-                               : status == "incomplete" ? "response.incomplete"
-                               : status == "cancelled"  ? "response.cancelled"
-                                                        : "response.failed";
-    return sse(impl_->event(type, Json{{"response", response.body}}));
+    Json terminal_response   = response.body;
+    if (status == "cancelled") {
+        // AI SDKs recognize cancellation through response.failed. A cancelled generation is a
+        // transport outcome rather than a persistable OpenAI response status.
+        terminal_response["status"]       = "failed";
+        terminal_response["completed_at"] = nullptr;
+        terminal_response["error"] =
+            Json{{"code", "request_cancelled"}, {"message", "Request was cancelled."}};
+    }
+    const std::string type = status == "completed"    ? "response.completed"
+                             : status == "incomplete" ? "response.incomplete"
+                                                      : "response.failed";
+    return sse(impl_->event(type, Json{{"response", std::move(terminal_response)}}));
 }
 
 std::string ResponsesEventStream::failed(const ApiError& error) {
@@ -1263,7 +1402,7 @@ std::string ResponsesEventStream::failed(const ApiError& error) {
     Json response =
         in_progress_response(impl_->id, impl_->created_at, impl_->request, impl_->runtime);
     response["status"]       = "failed";
-    response["completed_at"] = completion_time_now();
+    response["completed_at"] = nullptr;
     response["error"]        = Json{{"code", error.code.empty() ? Json(nullptr) : Json(error.code)},
                                     {"message", error.message}};
     return sse(impl_->event("response.failed", Json{{"response", response}}));

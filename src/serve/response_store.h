@@ -44,6 +44,10 @@ public:
     // get() refreshes LRU recency. Returned immutable records remain valid if
     // another request evicts or deletes their public store entry.
     std::shared_ptr<const StoredResponse> get(const std::string& id);
+    // The batch is all-or-nothing: a missing ID returns false without changing
+    // recency or partially populating items.
+    bool get_items(const std::vector<std::string>& ids, std::vector<nlohmann::json>& items,
+                   std::string* missing_id = nullptr);
     void put(StoredResponse response);
     bool erase(const std::string& id);
 
@@ -56,6 +60,11 @@ private:
         std::list<std::string>::iterator lru;
     };
 
+    struct ItemLocator {
+        std::string response_id;
+        std::size_t output_index = 0;
+    };
+
     [[nodiscard]] std::size_t recompute_bytes_locked() const;
     void erase_locked(const std::string& id);
 
@@ -63,6 +72,9 @@ private:
     std::size_t max_bytes_   = 0;
     mutable std::mutex mutex_;
     std::unordered_map<std::string, Entry> records_;
+    // Locators include the array offset so lookup returns the indexed Item,
+    // rather than another output object that happens to compare similarly.
+    std::unordered_map<std::string, ItemLocator> item_records_;
     std::list<std::string> lru_;
     std::size_t current_bytes_ = 0;
 };

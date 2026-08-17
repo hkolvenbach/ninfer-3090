@@ -24,6 +24,9 @@ __pycache__/
 venv/
 *.egg-info/
 
+# Node test tooling
+node_modules/
+
 # Weight artifacts (large; produced by offline tooling)
 *.qus
 *.bin
@@ -47,6 +50,7 @@ tools/freq_corpus/fixtures/*
 profiles/
 .chatgpt/
 benchmark_results/
+benchmark-results/
 
 # Local release products. Keep the publishing guide, upload archives as GitHub Release assets.
 dist/*

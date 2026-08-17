@@ -15,7 +15,6 @@
 #include <stdexcept>
 #include <string>
 #include <string_view>
-#include <unordered_map>
 #include <vector>
 
 namespace ninfer::serve {
@@ -102,9 +101,6 @@ struct ChatTurn {
                                    // template)
 };
 
-// OpenAI sampling fields carried by the protocol adapter. `logit_bias` remains
-// parsed for wire compatibility; the current public engine sampler has no bias
-// input, so it does not affect generation.
 struct SamplingParams {
     std::optional<double> temperature;
     std::optional<double> top_p;
@@ -112,7 +108,6 @@ struct SamplingParams {
     std::optional<double> presence_penalty;
     std::optional<double> frequency_penalty;
     std::optional<std::uint64_t> seed;
-    std::unordered_map<int, double> logit_bias;
     int n = 1;
 };
 

@@ -82,10 +82,11 @@ int test_basic_request() {
                                       {"input", "hello"},
                                       {"instructions", "be concise"},
                                       {"previous_response_id", "resp_previous"},
+                                      {"prompt_cache_key", "session_123"},
                                       {"max_output_tokens", 64},
                                       {"temperature", 0.3},
                                       {"top_p", 0.8},
-                                      {"reasoning", Json{{"effort", "medium"}}},
+                                      {"reasoning", Json{{"effort", "medium"}, {"summary", "detailed"}}},
                                       {"metadata", Json{{"trace", "abc"}}}};
     const ResponsesRequest request = parse_responses_request(body, limits());
     int failures                   = 0;
@@ -106,6 +107,9 @@ int test_basic_request() {
                       "max_output_tokens reaches generation request");
     failures += check(request.generation.reasoning_effort == RequestedReasoningEffort::Medium,
                       "medium reasoning effort was not parsed");
+    failures +=
+        check(request.reasoning_summary == "detailed" && request.prompt_cache_key == "session_123",
+              "reasoning summary and prompt cache key retained");
     failures += check(request.store && !request.stream, "Responses defaults applied");
     ResponsesRequest composed = request;
     ChatTurn previous;
@@ -230,32 +234,34 @@ int test_typed_items_and_tools() {
     const Json body     = {
         {"model", "qwen3.6-27b"},
         {"input",
-             Json::array({Json{{"id", "rs_old"},
-                               {"type", "reasoning"},
-                               {"summary", Json::array()},
-                               {"content", Json::array({Json{{"type", "reasoning_text"},
-                                                             {"text", "need tools"}}})}},
-                          Json{{"id", "fc_old_1"},
-                               {"type", "function_call"},
-                               {"call_id", "call_1"},
-                               {"name", "weather"},
-                               {"arguments", R"({"city":"Paris"})"}},
-                          Json{{"id", "fc_old_2"},
-                               {"type", "function_call"},
-                               {"call_id", "call_2"},
-                               {"name", "weather"},
-                               {"arguments", R"({"city":"Rome"})"}},
-                          Json{{"id", "fco_old"},
-                               {"type", "function_call_output"},
-                               {"call_id", "call_1"},
-                               {"output", R"({"temp":20})"}},
-                          Json{{"type", "message"},
-                               {"role", "user"},
-                               {"content",
-                                Json::array({Json{{"type", "input_image"},
-                                                  {"image_url", "data:image/png;base64,AA=="},
-                                                  {"detail", "auto"}},
-                                             Json{{"type", "input_text"}, {"text", "describe"}}})}}})},
+             Json::array(
+             {Json{{"id", "rs_old"},
+                       {"type", "reasoning"},
+                       {"summary",
+                        Json::array({Json{{"type", "summary_text"}, {"text", "need tools"}}})}},
+                  Json{{"id", "fc_old_1"},
+                       {"type", "function_call"},
+                       {"call_id", "call_1"},
+                       {"name", "weather"},
+                       {"arguments", R"({"city":"Paris"})"}},
+                  Json{{"id", "fc_old_2"},
+                       {"type", "function_call"},
+                       {"call_id", "call_2"},
+                       {"name", "weather"},
+                       {"arguments", R"({"city":"Rome"})"}},
+                  Json{{"id", "fco_old"},
+                       {"type", "function_call_output"},
+                       {"call_id", "call_1"},
+                       {"output", Json::array({Json{{"type", "input_text"}, {"text", R"({"temp":20})"}},
+                                               Json{{"type", "input_image"},
+                                                    {"image_url", "data:image/png;base64,AA=="}}})}},
+                  Json{{"type", "message"},
+                       {"role", "user"},
+                       {"content",
+                        Json::array({Json{{"type", "input_image"},
+                                          {"image_url", "data:image/png;base64,AA=="},
+                                          {"detail", "auto"}},
+                                     Json{{"type", "input_text"}, {"text", "describe"}}})}}})},
         {"tools", Json::array({function})},
         {"tool_choice", "auto"},
         {"parallel_tool_calls", true},
@@ -269,8 +275,15 @@ int test_typed_items_and_tools() {
                           request.input_turns[0].tool_calls.size() == 2,
                       "reasoning and adjacent function calls grouped into one assistant turn");
     failures += check(request.input_turns[1].role == "tool" &&
-                          request.input_turns[1].tool_call_id == "call_1",
-                      "function output translated to tool turn");
+                          request.input_turns[1].tool_call_id == "call_1" &&
+                          request.input_turns[1].content.size() == 2 &&
+                          request.input_turns[1].content[0].kind == ContentKind::Text &&
+                          request.input_turns[1].content[1].kind == ContentKind::Image,
+                      "rich function output preserved in tool turn order");
+    failures += check(request.input_items[3].at("output").is_array() &&
+                          request.input_items[3].at("output")[0].at("type") == "input_text" &&
+                          request.input_items[3].at("output")[1].at("detail") == "auto",
+                      "rich function output canonicalized without reordering");
     failures += check(request.input_turns[2].content[0].kind == ContentKind::Image,
                       "input image translated to media part");
     failures += check(request.generation.tools.size() == 1 &&
@@ -313,6 +326,21 @@ int test_explicit_rejections() {
                           "background_not_supported",
                       "background rejected");
 
+    Json invalid_cache_key                = base;
+    invalid_cache_key["prompt_cache_key"] = 42;
+    failures +=
+        check(throws_api([&] { (void)parse_responses_request(invalid_cache_key, limits()); }),
+              "non-string prompt cache key rejected");
+
+    Json file_output     = base;
+    file_output["input"] = Json::array(
+        {Json{{"type", "function_call_output"},
+              {"call_id", "call_1"},
+              {"output", Json::array({Json{{"type", "input_file"}, {"file_id", "file_1"}}})}}});
+    failures += check(api_code([&] { (void)parse_responses_request(file_output, limits()); }) ==
+                          "file_inputs_not_supported",
+                      "files in function output rejected explicitly");
+
     Json unknown       = base;
     unknown["made_up"] = 1;
     failures += check(api_code([&] { (void)parse_responses_request(unknown, limits()); }) ==
@@ -324,6 +352,57 @@ int test_explicit_rejections() {
     failures += check(api_code([&] { (void)parse_responses_request(too_small, limits()); }) ==
                           "invalid_value",
                       "OpenAI minimum max_output_tokens enforced");
+
+    const auto rejects_nested = [&](Json input, const std::string& message) {
+        Json body     = base;
+        body["input"] = Json::array({std::move(input)});
+        failures += check(api_code([&] { (void)parse_responses_request(body, limits()); }) ==
+                              "unknown_parameter",
+                          message);
+    };
+    rejects_nested(Json{{"type", "message"},
+                        {"role", "user"},
+                        {"content", Json::array({Json{{"type", "input_text"},
+                                                      {"text", "hello"},
+                                                      {"prompt_cache_breakpoint", true}}})}},
+                   "nested prompt_cache_breakpoint was dropped");
+    rejects_nested(
+        Json{{"type", "message"},
+             {"role", "user"},
+             {"content",
+              Json::array({Json{{"type", "input_text"}, {"text", "hello"}, {"semantic", true}}})}},
+        "unknown message content field was dropped");
+    rejects_nested(
+        Json{{"type", "reasoning"},
+             {"summary", Json::array({Json{
+                             {"type", "summary_text"}, {"text", "thought"}, {"semantic", true}}})}},
+        "unknown reasoning summary field was dropped");
+    rejects_nested(
+        Json{{"type", "function_call_output"},
+             {"call_id", "call_1"},
+             {"output",
+              Json::array({Json{{"type", "input_text"}, {"text", "result"}, {"semantic", true}}})}},
+        "unknown tool-output content field was dropped");
+
+    Json replay     = base;
+    replay["input"] = Json::array({
+        Json{{"type", "message"},
+             {"role", "assistant"},
+             {"content", Json::array({Json{{"type", "output_text"},
+                                           {"text", "answer"},
+                                           {"annotations", Json::array()},
+                                           {"logprobs", Json::array()},
+                                           {"provider_extension", nullptr}}})}},
+        Json{{"type", "message"}, {"role", "user"}, {"content", "continue"}},
+    });
+    failures += check(!throws_api([&] { (void)parse_responses_request(replay, limits()); }),
+                      "common AI SDK replay defaults were rejected");
+
+    Json annotated = replay;
+    annotated["input"][0]["content"][0]["annotations"] =
+        Json::array({Json{{"type", "url_citation"}}});
+    failures += check(throws_api([&] { (void)parse_responses_request(annotated, limits()); }),
+                      "nonempty dropped output annotations were accepted");
     return failures;
 }
 
@@ -340,12 +419,14 @@ GenerationOutcome sample_outcome() {
 }
 
 int test_response_object() {
-    ResponsesRequest request = parse_responses_request(Json{{"model", "qwen3.6-27b"},
-                                                            {"input", "hello"},
-                                                            {"max_output_tokens", 32},
-                                                            {"reasoning", Json{{"effort", "low"}}},
-                                                            {"store", false}},
-                                                       limits());
+    ResponsesRequest request =
+        parse_responses_request(Json{{"model", "qwen3.6-27b"},
+                                     {"input", "hello"},
+                                     {"max_output_tokens", 32},
+                                     {"reasoning", Json{{"effort", "low"}, {"summary", "auto"}}},
+                                     {"prompt_cache_key", "session_123"},
+                                     {"store", false}},
+                                limits());
     ResponsesRuntimeValues runtime;
     runtime.temperature = 0.6F;
     runtime.top_p       = 0.95F;
@@ -359,12 +440,20 @@ int test_response_object() {
                           response.at("output")[0].at("type") == "reasoning" &&
                           response.at("output")[1].at("type") == "message",
                       "typed reasoning and message output Items");
+    failures += check(response.at("output")[0].at("summary")[0].at("text") == "thought",
+                      "reasoning is exposed as a native summary_text part");
+    failures += check(!response.at("output")[0].contains("status"),
+                      "reasoning Item does not expose a nonstandard status");
     failures += check(!response.contains("output_text"),
                       "SDK-only output_text helper absent from wire body");
     failures += check(response.at("reasoning").at("effort") == "low",
                       "Responses object did not echo reasoning effort");
+    failures += check(response.at("reasoning").at("summary") == "auto" &&
+                          response.at("prompt_cache_key") == "session_123",
+                      "Responses object did not echo summary and cache key");
     failures +=
         check(response.at("usage").at("input_tokens_details").at("cached_tokens") == 4 &&
+                  response.at("usage").at("input_tokens_details").at("cache_write_tokens") == 0 &&
                   response.at("usage").at("output_tokens_details").at("reasoning_tokens") == 3 &&
                   response.at("usage").at("total_tokens") == 18,
               "Responses usage details serialized");
@@ -376,9 +465,10 @@ int test_response_object() {
     GenerationOutcome incomplete = sample_outcome();
     incomplete.finish_reason     = ninfer::FinishReason::OutputLimit;
     const Json limited = make_response_object("resp_limit", 123, request, runtime, incomplete).body;
-    failures += check(limited.at("status") == "incomplete" &&
-                          limited.at("incomplete_details").at("reason") == "max_output_tokens",
-                      "output limit mapped to incomplete response");
+    failures +=
+        check(limited.at("status") == "incomplete" && limited.at("completed_at").is_null() &&
+                  limited.at("incomplete_details").at("reason") == "max_output_tokens",
+              "output limit mapped to incomplete response");
 
     GenerationOutcome tools = sample_outcome();
     tools.text.clear();
@@ -391,12 +481,102 @@ int test_response_object() {
     return failures;
 }
 
+int test_public_reasoning_and_include_hint() {
+    const Json base = {
+        {"model", "qwen3.6-27b"}, {"input", "hello"}, {"max_output_tokens", 32}, {"store", false}};
+    const GenerationOutcome outcome = sample_outcome();
+    int failures                    = 0;
+
+    const ResponsesRequest public_request = parse_responses_request(base, limits());
+    const BuiltResponse public_response =
+        make_response_object("resp_public", 123, public_request, {}, outcome);
+    const Json& public_item = public_response.body.at("output")[0];
+    failures += check(public_response.body.at("reasoning").at("summary") == "auto" &&
+                          public_response.body.at("output").size() == 2 &&
+                          public_item.at("type") == "reasoning" &&
+                          public_item.at("summary")[0].at("text") == "thought",
+                      "omitted summary did not use the public auto default");
+    failures += check(public_response.output_history[0].reasoning_content == "thought",
+                      "reasoning was lost from internal continuation history");
+
+    Json hinted_body                      = base;
+    hinted_body["store"]                  = true;
+    hinted_body["include"]                = Json::array({"reasoning.encrypted_content"});
+    const ResponsesRequest hinted_request = parse_responses_request(hinted_body, limits());
+    const BuiltResponse hinted_response =
+        make_response_object("resp_hinted", 123, hinted_request, {}, outcome);
+    const Json& hinted_item = hinted_response.body.at("output")[0];
+    failures += check(hinted_item.at("summary")[0].at("text") == "thought" &&
+                          !hinted_item.contains("encrypted_content"),
+                      "ignored AI SDK include hint changed public reasoning output");
+
+    Json replay = {
+        {"model", "qwen3.6-27b"},
+        {"input",
+         Json::array({public_item,
+                      Json{{"type", "message"}, {"role", "assistant"}, {"content", "answer"}},
+                      Json{{"type", "message"}, {"role", "user"}, {"content", "continue"}}})}};
+    const ResponsesRequest replayed = parse_responses_request(replay, limits());
+    failures += check(replayed.input_turns[0].reasoning_content == "thought",
+                      "public summary_text was not translated into reasoning history");
+
+    replay["input"][0]["encrypted_content"] = nullptr;
+    failures += check(!throws_api([&] { (void)parse_responses_request(replay, limits()); }),
+                      "null encrypted_content SDK compatibility field was rejected");
+    replay["input"][0]["encrypted_content"] = "opaque-envelope";
+    failures += check(api_code([&] { (void)parse_responses_request(replay, limits()); }) ==
+                          "encrypted_reasoning_not_supported",
+                      "non-null encrypted reasoning was not rejected explicitly");
+
+    Json unsupported_include       = base;
+    unsupported_include["include"] = Json::array({"message.output_text.logprobs"});
+    failures += check(api_code([&] {
+                          (void)parse_responses_request(unsupported_include, limits());
+                      }) == "include_not_supported",
+                      "unsupported include value was accepted");
+    return failures;
+}
+
+int test_default_reasoning_stream() {
+    ResponsesRequest request =
+        parse_responses_request(Json{{"model", "qwen3.6-27b"},
+                                     {"input", "hello"},
+                                     {"include", Json::array({"reasoning.encrypted_content"})},
+                                     {"stream", true}},
+                                limits());
+    ResponsesEventStream encoder("resp_public_stream", 123, request, {});
+    (void)encoder.start();
+    int failures                    = 0;
+    std::vector<std::string> events = encoder.reasoning_delta("thought");
+    failures += check(!events.empty(), "default streaming reasoning omitted public events");
+    std::vector<std::string> content_events = encoder.content_delta("answer");
+    events.insert(events.end(), content_events.begin(), content_events.end());
+    const ResponsesStreamFinish finish = encoder.finish(sample_outcome());
+    events.insert(events.end(), finish.events_before_terminal.begin(),
+                  finish.events_before_terminal.end());
+    bool saw_summary_done = false;
+    for (const std::string& wire : events) {
+        const Json event = parse_event(wire);
+        if (event.at("type") == "response.output_item.done" &&
+            event.at("item").at("type") == "reasoning") {
+            saw_summary_done = event.at("item").at("summary")[0].at("text") == "thought";
+            failures += check(!event.at("item").contains("encrypted_content"),
+                              "stream emitted unsupported encrypted_content");
+        }
+    }
+    failures +=
+        check(saw_summary_done, "terminal reasoning stream Item omitted its public summary");
+    return failures;
+}
+
 int test_sse_sequence() {
-    ResponsesRequest request = parse_responses_request(Json{{"model", "qwen3.6-27b"},
-                                                            {"input", "hello"},
-                                                            {"max_output_tokens", 32},
-                                                            {"stream", true}},
-                                                       limits());
+    ResponsesRequest request =
+        parse_responses_request(Json{{"model", "qwen3.6-27b"},
+                                     {"input", "hello"},
+                                     {"max_output_tokens", 32},
+                                     {"reasoning", Json{{"summary", "auto"}}},
+                                     {"stream", true}},
+                                limits());
     ResponsesEventStream encoder("resp_stream", 123, request, {});
     std::vector<std::string> wire = encoder.start();
     std::vector<std::string> more = encoder.reasoning_delta("thought");
@@ -412,7 +592,8 @@ int test_sse_sequence() {
     int failures                    = 0;
     std::uint64_t expected_sequence = 0;
     std::string text_deltas;
-    bool saw_reasoning_delta = false;
+    std::string reasoning_deltas;
+    bool saw_reasoning_part_done = false;
     for (const std::string& event : wire) {
         failures += check(event.find("[DONE]") == std::string::npos,
                           "Responses stream must not emit Chat [DONE]");
@@ -422,14 +603,20 @@ int test_sse_sequence() {
         if (payload.at("type") == "response.output_text.delta") {
             text_deltas += payload.at("delta").get<std::string>();
         }
-        if (payload.at("type") == "response.reasoning_text.delta") { saw_reasoning_delta = true; }
+        if (payload.at("type") == "response.reasoning_summary_text.delta") {
+            reasoning_deltas += payload.at("delta").get<std::string>();
+        }
+        if (payload.at("type") == "response.reasoning_summary_part.done") {
+            saw_reasoning_part_done = true;
+        }
     }
     failures += check(parse_event(wire.front()).at("type") == "response.created",
                       "stream starts with response.created");
     failures += check(parse_event(wire.back()).at("type") == "response.completed",
                       "stream ends with response.completed");
     failures += check(text_deltas == "answer", "text deltas reconstruct terminal output");
-    failures += check(saw_reasoning_delta, "raw reasoning delta emitted");
+    failures += check(reasoning_deltas == "thought", "native reasoning summary deltas emitted");
+    failures += check(saw_reasoning_part_done, "native reasoning summary completion emitted");
     return failures;
 }
 
@@ -470,6 +657,24 @@ int test_sse_function_call() {
     return failures;
 }
 
+int test_cancelled_sse_terminal() {
+    ResponsesRequest request = parse_responses_request(
+        Json{{"model", "qwen3.6-27b"}, {"input", "hello"}, {"stream", true}}, limits());
+    ResponsesEventStream encoder("resp_cancelled", 123, request, {});
+    (void)encoder.start();
+    GenerationOutcome outcome;
+    outcome.finish_reason              = ninfer::FinishReason::Cancelled;
+    const ResponsesStreamFinish finish = encoder.finish(outcome);
+    const Json terminal                = parse_event(encoder.terminal(finish.response));
+    int failures                       = 0;
+    failures += check(terminal.at("type") == "response.failed",
+                      "cancelled stream uses AI SDK response.failed terminal");
+    failures += check(terminal.at("response").at("status") == "failed" &&
+                          terminal.at("response").at("error").at("code") == "request_cancelled",
+                      "cancelled terminal carries request_cancelled error");
+    return failures;
+}
+
 int test_input_tokens_schema() {
     const ResponsesRequest request = parse_response_input_tokens_request(
         Json{{"model", "qwen3.6-27b"}, {"input", "hello"}}, limits());
@@ -498,8 +703,11 @@ int main() {
     failures += test_typed_items_and_tools();
     failures += test_explicit_rejections();
     failures += test_response_object();
+    failures += test_public_reasoning_and_include_hint();
+    failures += test_default_reasoning_stream();
     failures += test_sse_sequence();
     failures += test_sse_function_call();
+    failures += test_cancelled_sse_terminal();
     failures += test_input_tokens_schema();
     if (failures == 0) { std::cout << "ok\n"; }
     return failures == 0 ? 0 : 1;

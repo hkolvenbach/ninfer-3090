@@ -78,14 +78,22 @@ The endpoint supports:
 - one stop string or an array of stop strings;
 - non-streaming responses and server-sent event streams;
 - `stream_options.include_usage`;
-- function tools, tool choices, assistant tool-call history, and tool-result messages;
+- non-strict function tools, `tool_choice` `auto`/`none`, assistant tool-call history, and tool-result
+  messages;
 - the top-level `reasoning_effort` field;
 - the `enable_thinking` extension;
 - `chat_template_kwargs.preserve_thinking` and the top-level `preserve_thinking` alias.
 
 The request `model` must equal the public model ID: the artifact `identity.model_id` by default, or
 the explicit `--model-id` override. Reasoning is returned separately as `reasoning_content`; answer
-text remains in `content`.
+text remains in `content`. Chat tool definitions are non-strict only. Tool choice is limited to
+`auto` and `none`, and logit bias is not implemented.
+
+Tool schemas with `strict:true` return `strict_tools_not_supported`; `tool_choice:required` and
+named choices return `tool_choice_not_supported`. Omitted, null, or false `strict` values are
+accepted. Omitted, null, or empty `logit_bias` is accepted as a client default, while a nonempty map
+returns `logit_bias_not_supported` because token bias is not applied by the sampler. Unknown request
+fields are rejected rather than silently ignored.
 
 At startup, NInfer resolves prompt capabilities from the exact `frontend/chat_template.jinja`
 resource embedded in the loaded artifact. It does not infer them from the request's `model` field,
@@ -177,8 +185,10 @@ wire response contains typed `output` Items.
 |---|---|
 | `model` | required non-empty string; must equal the artifact-derived public model ID or explicit `--model-id` override |
 | `input` | required string or non-empty typed Item array |
+| `input[].type=item_reference` | substitutes the exact retained output Item with that ID in place; independent of `previous_response_id`; stale, deleted, or evicted IDs return `item_not_found` |
 | `instructions` | optional string, inserted before the reconstructed conversation for this request only |
 | `previous_response_id` | optional ID of a retained local Response |
+| `prompt_cache_key` | optional string routing hint; accepted for OpenAI SDK compatibility and otherwise ignored |
 | `max_output_tokens` | integer at least `16`; default is `--default-max-tokens` |
 | `stream` | boolean; `true` selects Responses SSE rather than a JSON body |
 | `store` | boolean, default `true`; controls local retrieval and continuation state |
@@ -186,6 +196,7 @@ wire response contains typed `output` Items.
 | `top_p` | finite number in `[0,1]` |
 | `metadata` | at most 16 string pairs; keys at most 64 characters and values at most 512 |
 | `reasoning.effort` | `none` disables thinking; `low`, `medium`, or `xhigh` selects an effort exposed by the loaded chat template; `minimal`, `high`, and `max` return `reasoning_effort_not_supported` for the registered templates |
+| `reasoning.summary` | optional `auto` or `detailed`; omitted uses the effective default `auto`; generated Qwen thinking is always disclosed as native Responses `summary_text` Items and SSE events |
 | `chat_template_kwargs.preserve_thinking` | optional boolean controlling whether closed-turn reasoning remains in reconstructed prompts |
 | `preserve_thinking` | top-level alias for the same option; conflicting values are rejected |
 | `text.format` | omitted or `{"type":"text"}` only |
@@ -196,7 +207,7 @@ wire response contains typed `output` Items.
 | `top_logprobs` | omitted or `0` |
 | `service_tier` | omitted, `auto`, or `default`; the response reports `default` |
 | `background` | omitted or `false` |
-| `include` | omitted or an empty array |
+| `include` | omitted, an empty array, or `['reasoning.encrypted_content']`; that AI SDK compatibility hint is accepted and ignored |
 | `stream_options` | omitted or `{"include_obfuscation":false}` |
 
 Unknown top-level fields fail with `unknown_parameter`. Recognized but unsupported features fail
@@ -213,16 +224,17 @@ String `input` is normalized to one user `message` with an `input_text` part. Ar
 | `output_text` | assistant-message replay part containing string `text` |
 | `input_image` | user-message part with HTTP(S) or data-URI `image_url`; detail omitted or `auto`; requires server `--vision` |
 | `input_video` | NInfer extension with HTTP(S) or data-URI `video_url`; requires server `--vision` |
-| `reasoning` | raw replay Item with an empty `summary` and `reasoning_text` content parts |
+| `reasoning` | native `summary_text` replay Item; legacy raw `reasoning_text` content is also accepted; `encrypted_content` may be null for SDK compatibility but non-null values return `encrypted_reasoning_not_supported` |
 | `function_call` | completed assistant call with optional `id`, and required `call_id`, `name`, and JSON-object string `arguments` |
-| `function_call_output` | completed tool result with required `call_id` and string `output` |
+| `function_call_output` | completed tool result with required `call_id`; `output` may be a string or a non-empty array of `input_text` and `input_image` parts |
 
 Adjacent function-call Items are grouped into one assistant history turn. A reasoning Item attaches
 to the following assistant message or function call. Input Item IDs are preserved when supplied and
 generated otherwise; duplicate IDs fail.
 
-`input_file`, `input_audio`, image `file_id`, non-`auto` image detail, reasoning summaries or
-encrypted reasoning, message `phase`, and other Item/content types are not supported. HTTP media
+`input_file`, `input_audio`, image `file_id`, non-`auto` image detail, message `phase`, and other
+Item/content types are not supported. Rich function outputs support text and images, but not files.
+HTTP media
 URLs stored in a response chain are fetched again when that chain is continued; use data URIs when
 the historical media bytes must be immutable.
 
@@ -253,24 +265,27 @@ custom free-form tools are rejected.
 
 ### Response object and usage
 
-A terminal wire response has `object: "response"`, one of `completed`, `incomplete`, or
-`cancelled` in `status`, and a typed `output` array. NInfer may emit:
+A terminal wire response has `object: "response"` and exactly one of `completed`, `incomplete`, or
+`failed` in `status`, plus a typed `output` array. `cancelled` is not emitted. NInfer may emit:
 
-- a `reasoning` Item containing raw `reasoning_text` and an empty summary;
+- when generated reasoning is non-empty, a `reasoning` Item containing it as native `summary_text`;
 - an assistant `message` containing an `output_text` part;
 - one or more `function_call` Items.
 
-Ordinary model/string stops produce `completed`. Output-token or context-capacity exhaustion
-produces `incomplete` with `incomplete_details.reason: "max_output_tokens"`. Errors accepted after
-an SSE response has started produce `response.failed`; validation and preparation errors remain
-normal HTTP error responses.
+Reasoning disclosure is always enabled. Omitting `reasoning.summary` selects the truthful effective
+default `auto`, which is echoed in the response envelope; an explicit `auto` or `detailed` value is
+echoed unchanged. Ordinary model/string stops produce `completed`. Output-token or
+context-capacity exhaustion produces `incomplete` with
+`incomplete_details.reason: "max_output_tokens"`. Errors accepted after an SSE response has started,
+including cancellation while the connection remains writable, produce `response.failed` with an
+error; validation and preparation errors remain normal HTTP error responses.
 
 Usage is checkpoint-native:
 
 ```json
 {
   "input_tokens": 42,
-  "input_tokens_details": {"cached_tokens": 17},
+  "input_tokens_details": {"cached_tokens": 17, "cache_write_tokens": 0},
   "output_tokens": 12,
   "output_tokens_details": {"reasoning_tokens": 5},
   "total_tokens": 54
@@ -278,10 +293,11 @@ Usage is checkpoint-native:
 ```
 
 `input_tokens` includes the chat template and expanded media tokens. `cached_tokens` is the exact
-resident prompt prefix reused by Engine. `output_tokens` is the count of accepted generated token
-IDs, including a withheld stop token when applicable. `reasoning_tokens` is counted in the Qwen
-output decoder while accepted tokens are still in the reasoning channel; it is not estimated by
-re-tokenizing decoded text.
+resident prompt prefix reused by Engine. `cache_write_tokens` is always `0`: NInfer reports
+read-side prefix reuse but does not expose an OpenAI cache-write billing category.
+`output_tokens` is the count of accepted generated token IDs, including a withheld stop token when
+applicable. `reasoning_tokens` is counted in the Qwen output decoder while accepted tokens are
+still in the reasoning channel; it is not estimated by re-tokenizing decoded text.
 
 ### Responses streaming
 
@@ -297,9 +313,9 @@ data: {"type":"response.output_text.delta","sequence_number":7,...}
 The normal lifecycle is:
 
 1. `response.created`, then `response.in_progress`;
-2. `response.output_item.added` and `response.content_part.added`;
-3. zero or more `response.reasoning_text.delta` or `response.output_text.delta` events;
-4. matching `*.done`, `response.content_part.done`, and `response.output_item.done` events;
+2. `response.output_item.added`, followed by a reasoning-summary or message content part;
+3. zero or more `response.reasoning_summary_text.delta` or `response.output_text.delta` events;
+4. matching summary/content completion and `response.output_item.done` events;
 5. exactly one `response.completed`, `response.incomplete`, or `response.failed` terminal event.
 
 Function arguments use `response.function_call_arguments.delta` and `.done`. IDs, output indices,
@@ -307,6 +323,10 @@ and content indices remain stable, and concatenated deltas equal the terminal It
 does not emit the Chat Completions `[DONE]` sentinel. With tools enabled, ordinary answer text still
 streams immediately; only an ambiguous `<tool_call>` suffix or the structured tool region is held.
 Malformed tool markup is flushed back as ordinary text without losing bytes.
+
+For stored streams, successful storage is the commit point before staged completion events are sent.
+A disconnect or cancellation before that point does not create a retrievable record; a disconnect
+while flushing after commit does not erase it. The server emits at most one terminal event.
 
 ### Local response state and resources
 
@@ -319,6 +339,11 @@ context, matching the Responses rule that previous top-level instructions do not
 Function definitions are request configuration rather than conversation Items and must be sent
 again on tool-result turns. The reconstructed prompt follows the ordinary Engine path, so resident
 prefix reuse applies naturally.
+
+`item_reference` is a separate mechanism: each occurrence is replaced in place by the exact stored
+output Item it names, preserving surrounding input order. It neither implies nor rewrites
+`previous_response_id`; both mechanisms may be used in one request. Deleting or evicting the owner
+invalidates its Item references, while contexts already copied into stored descendants remain usable.
 
 A stored Response also retains its resolved `preserve_thinking` value. A child which omits the
 field inherits the parent value. An explicit different value creates a new semantic branch; prompt
@@ -339,10 +364,16 @@ explicit deletion also make an ID unavailable. A single Response larger than the
 capacity fails with `response_store_capacity_exceeded` rather than silently pretending it was
 stored.
 
+Stateless replay uses the public `summary_text` from a reasoning Item as the following assistant
+turn's `reasoning_content`. This works with `store:false` and does not depend on server-side state.
+AI SDK clients may still send `include:["reasoning.encrypted_content"]`; NInfer accepts that hint
+with either store value but ignores it and never emits `encrypted_content`.
+
 ### Responses input token count
 
-`POST /v1/responses/input_tokens` accepts exactly `model` and `input`, performs the same typed Item,
-template, and media expansion, and does not run generation:
+`POST /v1/responses/input_tokens` accepts `model`, `input`, and the thinking-history options
+`preserve_thinking` / `chat_template_kwargs.preserve_thinking`. It performs the same typed Item,
+template, and media expansion and does not run generation:
 
 ```bash
 curl http://127.0.0.1:8080/v1/responses/input_tokens \
@@ -355,9 +386,12 @@ curl http://127.0.0.1:8080/v1/responses/input_tokens \
 ```
 
 Unsupported Create fields include Conversations, prompt templates, context management, hosted
-moderation, prompt-cache controls, safety/user identifiers, Structured Outputs/JSON mode,
-non-empty `include`, background execution, compaction, files/audio, and OpenAI-hosted/MCP/custom
-tools. These are compatibility boundaries, not silently accepted placeholders.
+moderation, safety/user identifiers, Structured Outputs/JSON mode, background execution,
+compaction, files/audio, and OpenAI-hosted/MCP/custom tools. `prompt_cache_key` is accepted only as
+an inert SDK routing hint. The only non-empty `include` value accepted is the ignored AI SDK hint
+`reasoning.encrypted_content`; no encrypted field is produced. These
+are explicit compatibility boundaries; unsupported values return capability errors rather than
+being silently accepted.
 
 ## Anthropic Messages
 
@@ -408,7 +442,14 @@ curl http://127.0.0.1:8080/v1/models \
   -H 'Authorization: Bearer local-secret'
 ```
 
-`--cors` adds permissive browser CORS headers. It is disabled by default.
+Every HTTP response, including errors and SSE, carries `x-request-id`. HTTP 429 overload and HTTP
+503 queue-timeout responses also carry `Retry-After: 1`. `--cors` adds permissive browser headers,
+allows unauthenticated `OPTIONS` preflight, permits SDK authentication/content headers, and exposes
+`x-request-id` and `Retry-After`; it is disabled by default.
+
+Response retrieval rejects unsupported query options explicitly. Input-Item retrieval supports
+`after`, `limit=1..100`, and `order=asc|desc`; duplicate, unknown, and invalid pagination parameters
+are errors. Delete and cancel routes accept no query parameters.
 
 ## Server options
 
@@ -471,9 +512,10 @@ is also rejected if it resolves to the model artifact.
   --request-log-jsonl profiles/bench/run/server.requests.jsonl
 ```
 
-Every line is one `ninfer_serve_request_log` schema-v8 JSON object. All events carry
+Every line is one `ninfer_serve_request_log` schema-v9 JSON object. All events carry
 `timestamp_unix_ms` and a process-unique `server_instance_id`; request IDs are monotonic only within
-that server instance.
+that server instance. Generation request records retain that numeric `request_id` for metrics and
+also carry `x_request_id`, matching the client-visible HTTP response header for log correlation.
 
 | Event | Contents |
 |---|---|

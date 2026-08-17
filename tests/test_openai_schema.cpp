@@ -384,7 +384,7 @@ int test_parse_function_tools_and_choices() {
                    {"parameters", Json{{"type", "object"},
                                        {"properties", Json{{"city", Json{{"type", "string"}}}}},
                                        {"required", Json::array({"city"})}}},
-                   {"strict", true}}}};
+                   {"strict", false}}}};
     const Json base = {{"model", "m"},
                        {"messages", Json::array({Json{{"role", "user"}, {"content", "hi"}}})},
                        {"tools", Json::array({tool})}};
@@ -393,7 +393,7 @@ int test_parse_function_tools_and_choices() {
     failures += check(req.tools.size() == 1, "one tool parsed");
     failures += check(req.tools[0].name == "get_weather", "tool name parsed");
     failures += check(req.tools[0].description == "Fetch weather", "tool description parsed");
-    failures += check(req.tools[0].strict, "tool strict metadata parsed");
+    failures += check(!req.tools[0].strict, "non-strict tool metadata parsed");
     failures += check(Json::parse(req.tools[0].parameters_json).at("required").at(0) == "city",
                       "tool parameters carried");
     failures += check(Json::parse(req.tools[0].definition_json).at("type") == "function",
@@ -411,23 +411,43 @@ int test_parse_function_tools_and_choices() {
     failures += check(!to_request_options(req, default_server()).output.preserve_special_tokens,
                       "disabled tools do not preserve special tokens");
 
+    Json automatic           = base;
+    automatic["tool_choice"] = "auto";
+    req                      = parse_chat_completion_request(automatic, default_limits());
+    failures += check(req.tool_choice.mode == ToolChoiceMode::Auto, "tool_choice auto parsed");
+
     Json required           = base;
     required["tool_choice"] = "required";
-    req                     = parse_chat_completion_request(required, default_limits());
-    failures +=
-        check(req.tool_choice.mode == ToolChoiceMode::Required, "tool_choice required parsed");
+    failures += check(api_code([&] {
+                          (void)parse_chat_completion_request(required, default_limits());
+                      }) == "tool_choice_not_supported",
+                      "required tool_choice was not rejected explicitly");
 
     Json named           = base;
     named["tool_choice"] = Json{{"type", "function"}, {"function", Json{{"name", "get_weather"}}}};
-    req                  = parse_chat_completion_request(named, default_limits());
-    failures += check(req.tool_choice.mode == ToolChoiceMode::Named, "named tool_choice parsed");
-    failures += check(req.tool_choice.name == "get_weather", "named tool_choice name parsed");
+    failures += check(api_code([&] {
+                          (void)parse_chat_completion_request(named, default_limits());
+                      }) == "tool_choice_not_supported",
+                      "named tool_choice was not rejected explicitly");
 
-    Json unknown           = base;
-    unknown["tool_choice"] = Json{{"type", "function"}, {"function", Json{{"name", "missing"}}}};
-    failures +=
-        check(throws_api([&] { (void)parse_chat_completion_request(unknown, default_limits()); }),
-              "unknown named tool_choice rejected");
+    Json strict                              = base;
+    strict["tools"][0]["function"]["strict"] = true;
+    failures += check(api_code([&] {
+                          (void)parse_chat_completion_request(strict, default_limits());
+                      }) == "strict_tools_not_supported",
+                      "strict tool was not rejected explicitly");
+
+    Json null_strict                              = base;
+    null_strict["tools"][0]["function"]["strict"] = nullptr;
+    req = parse_chat_completion_request(null_strict, default_limits());
+    failures += check(!req.tools[0].strict &&
+                          Json::parse(req.tools[0].definition_json)["function"]["strict"] == false,
+                      "null strict was not accepted and normalized to false");
+
+    Json omitted_strict = base;
+    omitted_strict["tools"][0]["function"].erase("strict");
+    req = parse_chat_completion_request(omitted_strict, default_limits());
+    failures += check(!req.tools[0].strict, "omitted strict was not accepted as a non-strict tool");
     return failures;
 }
 
@@ -501,16 +521,13 @@ int test_parse_sampling_carried() {
                                    {"temperature", 0.7},
                                    {"top_p", 0.9},
                                    {"seed", 123},
-                                   {"logit_bias", Json{{"5", -1.5}}}};
+                                   {"logit_bias", Json::object()}};
     const GenerationRequest req = parse_chat_completion_request(body, default_limits());
     failures += check(req.sampling.temperature.has_value() && *req.sampling.temperature == 0.7,
                       "temperature carried");
     failures +=
         check(req.sampling.top_p.has_value() && *req.sampling.top_p == 0.9, "top_p carried");
     failures += check(req.sampling.seed.has_value() && *req.sampling.seed == 123u, "seed carried");
-    failures +=
-        check(req.sampling.logit_bias.count(5) == 1 && req.sampling.logit_bias.at(5) == -1.5,
-              "logit_bias carried");
     const ninfer::RequestOptions options = to_request_options(req, default_server());
     failures += check(options.execution.sampling.temperature == 0.7F,
                       "temperature reaches Engine overrides");
@@ -519,6 +536,93 @@ int test_parse_sampling_carried() {
     failures +=
         check(!options.execution.sampling.top_k && !options.execution.sampling.presence_penalty,
               "omitted request fields unexpectedly replaced model defaults");
+    return failures;
+}
+
+int test_capability_and_unknown_field_rejections() {
+    const Json base = {{"model", "m"},
+                       {"messages", Json::array({Json{{"role", "user"}, {"content", "hi"}}})}};
+    int failures    = 0;
+
+    for (const char* choice : {"auto", "none"}) {
+        Json body           = base;
+        body["tool_choice"] = choice;
+        failures +=
+            check(!throws_api([&] { (void)parse_chat_completion_request(body, default_limits()); }),
+                  std::string("tool_choice ") + choice + " without tools was rejected");
+    }
+
+    Json biased          = base;
+    biased["logit_bias"] = Json{{"5", -1.5}};
+    failures += check(api_code([&] {
+                          (void)parse_chat_completion_request(biased, default_limits());
+                      }) == "logit_bias_not_supported",
+                      "nonempty logit_bias was not rejected explicitly");
+
+    Json null_bias          = base;
+    null_bias["logit_bias"] = nullptr;
+    failures += check(
+        !throws_api([&] { (void)parse_chat_completion_request(null_bias, default_limits()); }),
+        "null logit_bias was rejected");
+
+    Json unknown       = base;
+    unknown["made_up"] = 1;
+    failures += check(api_code([&] {
+                          (void)parse_chat_completion_request(unknown, default_limits());
+                      }) == "unknown_parameter",
+                      "unknown top-level parameter was accepted");
+
+    Json nested              = base;
+    nested["stream_options"] = Json{{"include_usage", true}, {"made_up", true}};
+    failures += check(api_code([&] {
+                          (void)parse_chat_completion_request(nested, default_limits());
+                      }) == "unknown_parameter",
+                      "unknown nested parameter was accepted");
+
+    Json common                   = base;
+    common["metadata"]            = Json{{"client", "ai-sdk"}};
+    common["store"]               = false;
+    common["parallel_tool_calls"] = true;
+    common["logprobs"]            = false;
+    common["top_logprobs"]        = 0;
+    common["modalities"]          = Json::array({"text"});
+    common["service_tier"]        = "auto";
+    common["user"]                = "local-user";
+    failures +=
+        check(!throws_api([&] { (void)parse_chat_completion_request(common, default_limits()); }),
+              "common OpenAI client compatibility fields were rejected");
+
+    for (const auto& [key, value] : std::array<std::pair<const char*, Json>, 12>{{
+             {"logprobs", true},
+             {"top_logprobs", 1},
+             {"parallel_tool_calls", false},
+             {"modalities", Json::array({"audio"})},
+             {"audio", Json::object()},
+             {"prediction", Json::object()},
+             {"web_search_options", Json::object()},
+             {"store", true},
+             {"service_tier", "priority"},
+             {"prompt_cache_key", "session"},
+             {"safety_identifier", "user-1"},
+             {"verbosity", "low"},
+         }}) {
+        Json body = base;
+        body[key] = value;
+        failures +=
+            check(throws_api([&] { (void)parse_chat_completion_request(body, default_limits()); }),
+                  std::string("unsupported Chat field was accepted: ") + key);
+    }
+
+    Json bad_metadata        = base;
+    bad_metadata["metadata"] = Json{{"trace", 1}};
+    failures += check(
+        throws_api([&] { (void)parse_chat_completion_request(bad_metadata, default_limits()); }),
+        "non-string metadata value was accepted");
+    Json bad_user    = base;
+    bad_user["user"] = 42;
+    failures +=
+        check(throws_api([&] { (void)parse_chat_completion_request(bad_user, default_limits()); }),
+              "non-string user was accepted");
     return failures;
 }
 
@@ -712,6 +816,7 @@ int main() {
     failures += test_parse_tool_history_messages();
     failures += test_parse_stop_and_max_tokens();
     failures += test_parse_sampling_carried();
+    failures += test_capability_and_unknown_field_rejections();
     failures += test_response_serialization();
     failures += test_tool_response_serialization();
     failures += test_chunk_serialization();

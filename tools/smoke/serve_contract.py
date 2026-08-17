@@ -27,26 +27,46 @@ class ContractError(RuntimeError):
 class Response:
     status: int
     content_type: str
+    headers: dict[str, str]
     body: bytes
 
 
-def request(base_url: str, method: str, path: str, payload: Any | None = None) -> Response:
+def request(
+    base_url: str,
+    method: str,
+    path: str,
+    payload: Any | None = None,
+    headers: dict[str, str] | None = None,
+) -> Response:
     body = None
-    headers = {"Accept": "application/json"}
+    request_headers = {"Accept": "application/json"}
+    if headers is not None:
+        request_headers.update(headers)
     if payload is not None:
         body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
-        headers["Content-Type"] = "application/json"
-    req = urllib.request.Request(base_url + path, data=body, headers=headers, method=method)
+        request_headers["Content-Type"] = "application/json"
+    req = urllib.request.Request(
+        base_url + path, data=body, headers=request_headers, method=method
+    )
     try:
         with urllib.request.urlopen(req, timeout=300) as response:
-            return Response(
+            result = Response(
                 status=response.status,
                 content_type=response.headers.get_content_type(),
+                headers={key.lower(): value for key, value in response.headers.items()},
                 body=response.read(),
             )
     except urllib.error.HTTPError as error:
-        detail = error.read().decode("utf-8", errors="replace")
-        raise ContractError(f"{method} {path} returned HTTP {error.code}: {detail}") from error
+        result = Response(
+            status=error.code,
+            content_type=error.headers.get_content_type(),
+            headers={key.lower(): value for key, value in error.headers.items()},
+            body=error.read(),
+        )
+    # Request IDs are the cross-protocol handle for logs and support, including errors and SSE.
+    if not result.headers.get("x-request-id"):
+        raise ContractError(f"{method} {path} did not return x-request-id")
+    return result
 
 
 def json_response(
@@ -54,8 +74,10 @@ def json_response(
 ) -> dict[str, Any]:
     response = request(base_url, method, path, payload)
     if response.status != 200 or response.content_type != "application/json":
+        detail = response.body.decode("utf-8", errors="replace")
         raise ContractError(
-            f"{method} {path} returned status={response.status} content-type={response.content_type}"
+            f"{method} {path} returned status={response.status} "
+            f"content-type={response.content_type}: {detail}"
         )
     try:
         value = json.loads(response.body)
@@ -64,6 +86,33 @@ def json_response(
     if not isinstance(value, dict):
         raise ContractError(f"{method} {path} did not return a JSON object")
     return value
+
+
+def require_error(
+    base_url: str,
+    method: str,
+    path: str,
+    code: str,
+    payload: Any | None = None,
+    *,
+    status: int = 400,
+) -> Response:
+    response = request(base_url, method, path, payload)
+    if response.status != status or response.content_type != "application/json":
+        raise ContractError(
+            f"{method} {path} did not return the expected HTTP {status} JSON error"
+        )
+    try:
+        value = json.loads(response.body)
+    except json.JSONDecodeError as error:
+        raise ContractError(f"{method} {path} returned an invalid error body") from error
+    if not isinstance(value, dict) or not isinstance(value.get("error"), dict):
+        raise ContractError(f"{method} {path} returned the wrong error envelope")
+    if value["error"].get("code") != code:
+        raise ContractError(
+            f"{method} {path} returned error {value['error'].get('code')!r}, expected {code!r}"
+        )
+    return response
 
 
 def wait_for_health(base_url: str, timeout: float) -> None:
@@ -204,18 +253,32 @@ def response_text(response: dict[str, Any]) -> tuple[str, str]:
         if not isinstance(item, dict):
             raise ContractError("Responses output contains a non-object Item")
         item_type = item.get("type")
-        parts = item.get("content", [])
-        if item_type in {"message", "reasoning"} and not isinstance(parts, list):
-            raise ContractError(f"Responses {item_type} content is not an array")
-        for part in parts:
-            if not isinstance(part, dict) or not isinstance(part.get("text"), str):
-                raise ContractError("Responses text content part has the wrong shape")
-            if part.get("type") == "output_text":
-                content.append(part["text"])
-            elif part.get("type") == "reasoning_text":
+        if item_type == "reasoning":
+            summary = item.get("summary")
+            if not isinstance(summary, list):
+                raise ContractError("Responses reasoning summary is not an array")
+            for part in summary:
+                if (
+                    not isinstance(part, dict)
+                    or part.get("type") != "summary_text"
+                    or not isinstance(part.get("text"), str)
+                ):
+                    raise ContractError("Responses reasoning summary part has the wrong shape")
                 reasoning.append(part["text"])
-            else:
-                raise ContractError(f"unexpected Responses content type: {part.get('type')!r}")
+        elif item_type == "message":
+            parts = item.get("content")
+            if not isinstance(parts, list):
+                raise ContractError("Responses message content is not an array")
+            for part in parts:
+                if (
+                    not isinstance(part, dict)
+                    or part.get("type") != "output_text"
+                    or not isinstance(part.get("text"), str)
+                ):
+                    raise ContractError("Responses output_text part has the wrong shape")
+                content.append(part["text"])
+        elif item_type != "function_call":
+            raise ContractError(f"unexpected Responses output Item type: {item_type!r}")
     return "".join(content), "".join(reasoning)
 
 
@@ -229,6 +292,8 @@ def require_responses_usage(usage: Any) -> tuple[int, int]:
         input_details.get("cached_tokens"), int
     ):
         raise ContractError("Responses cached-token usage is missing")
+    if input_details.get("cache_write_tokens") != 0:
+        raise ContractError("Responses cache_write_tokens must be zero")
     if not isinstance(output_details, dict) or not isinstance(
         output_details.get("reasoning_tokens"), int
     ):
@@ -243,21 +308,25 @@ def responses_nonstream(
     *,
     store: bool,
     previous_response_id: str | None = None,
+    reasoning_summary: str | None = None,
+    max_output_tokens: int = 16,
 ) -> dict[str, Any]:
     payload: dict[str, Any] = {
         "model": model,
         "input": input_value,
-        "max_output_tokens": 16,
+        "max_output_tokens": max_output_tokens,
         "temperature": 0,
         "store": store,
     }
     if previous_response_id is not None:
         payload["previous_response_id"] = previous_response_id
+    if reasoning_summary is not None:
+        payload["reasoning"] = {"summary": reasoning_summary}
     response = json_response(base_url, "POST", "/v1/responses", payload)
-    if response.get("object") != "response" or response.get("status") not in {
-        "completed",
-        "incomplete",
-    }:
+    status = response.get("status")
+    if status == "cancelled" or status not in {"completed", "incomplete", "failed"}:
+        raise ContractError(f"Responses returned an invalid terminal status: {status!r}")
+    if response.get("object") != "response" or status not in {"completed", "incomplete"}:
         raise ContractError("Responses non-streaming envelope has the wrong shape")
     if not isinstance(response.get("id"), str) or not response["id"].startswith("resp_"):
         raise ContractError("Responses non-streaming envelope has an invalid id")
@@ -278,6 +347,38 @@ def parse_responses_stream(response: Response) -> tuple[str, str, dict[str, Any]
     reasoning: list[str] = []
     terminal: dict[str, Any] | None = None
     expected_sequence = 0
+    added_items: dict[int, str] = {}
+    done_items: set[int] = set()
+    reasoning_parts: set[tuple[int, int]] = set()
+    done_reasoning_parts: set[tuple[int, int]] = set()
+    content_parts: set[tuple[int, int]] = set()
+    done_content_parts: set[tuple[int, int]] = set()
+    item_types: dict[int, str] = {}
+    function_arguments: dict[int, list[str]] = {}
+    done_function_arguments: set[int] = set()
+    lifecycle: list[str] = []
+    response_id: str | None = None
+    allowed_events = {
+        "response.created",
+        "response.in_progress",
+        "response.output_item.added",
+        "response.reasoning_summary_part.added",
+        "response.reasoning_summary_text.delta",
+        "response.reasoning_summary_text.done",
+        "response.reasoning_summary_part.done",
+        "response.content_part.added",
+        "response.output_text.delta",
+        "response.output_text.done",
+        "response.content_part.done",
+        "response.function_call_arguments.delta",
+        "response.function_call_arguments.done",
+        "response.output_item.done",
+        "response.completed",
+        "response.incomplete",
+        "response.failed",
+    }
+    # This parser is intentionally a protocol state machine: accepting unknown events or merely
+    # checking the terminal frame would let lifecycle and Item-order regressions pass unnoticed.
     for block in response.body.decode("utf-8").replace("\r\n", "\n").split("\n\n"):
         if not block:
             continue
@@ -292,19 +393,149 @@ def parse_responses_stream(response: Response) -> tuple[str, str, dict[str, Any]
         event_type = event.get("type")
         if event_type != event_lines[0]:
             raise ContractError("Responses SSE event name differs from JSON type")
+        if event_type not in allowed_events:
+            raise ContractError(f"Responses stream emitted unknown event: {event_type!r}")
         if event.get("sequence_number") != expected_sequence:
             raise ContractError("Responses sequence_number is not contiguous")
         expected_sequence += 1
         if terminal is not None:
             raise ContractError("Responses stream emitted data after its terminal event")
-        if event_type == "response.output_text.delta":
+        if event_type in {"response.created", "response.in_progress"}:
+            expected_type = (
+                ["response.created", "response.in_progress"][len(lifecycle)]
+                if len(lifecycle) < 2
+                else None
+            )
+            value = event.get("response")
+            if event_type != expected_type or not isinstance(value, dict):
+                raise ContractError("Responses stream did not start created -> in_progress")
+            if value.get("status") != "in_progress" or not isinstance(value.get("id"), str):
+                raise ContractError("Responses lifecycle event has the wrong Response state")
+            if response_id is not None and value["id"] != response_id:
+                raise ContractError("Responses lifecycle changed Response id")
+            response_id = value["id"]
+            lifecycle.append(event_type)
+        elif len(lifecycle) != 2:
+            raise ContractError("Responses output preceded created -> in_progress")
+        elif event_type == "response.output_item.added":
+            index = event.get("output_index")
+            item = event.get("item")
+            if not isinstance(index, int) or not isinstance(item, dict) or not isinstance(
+                item.get("id"), str
+            ) or index in added_items:
+                raise ContractError("Responses output_item.added has invalid identity")
+            added_items[index] = item["id"]
+            item_type = item.get("type")
+            if item_type not in {"reasoning", "message", "function_call"}:
+                raise ContractError(f"Responses added unsupported output Item: {item_type!r}")
+            item_types[index] = item_type
+            if item_type == "function_call":
+                function_arguments[index] = []
+        elif event_type == "response.output_item.done":
+            index = event.get("output_index")
+            item = event.get("item")
+            if (
+                not isinstance(index, int)
+                or not isinstance(item, dict)
+                or added_items.get(index) != item.get("id")
+                or index in done_items
+                or item.get("type") != item_types.get(index)
+            ):
+                raise ContractError("Responses output_item.done does not match its added Item")
+            if any(
+                key[0] == index and key not in done_reasoning_parts
+                for key in reasoning_parts
+            ) or any(key[0] == index and key not in done_content_parts for key in content_parts):
+                raise ContractError("Responses output Item finished before one of its parts")
+            if item_types[index] == "function_call":
+                arguments = "".join(function_arguments[index])
+                if index not in done_function_arguments or item.get("arguments") != arguments:
+                    raise ContractError("function argument deltas do not reconstruct done Item")
+            done_items.add(index)
+        elif event_type == "response.reasoning_summary_part.added":
+            key = (event.get("output_index"), event.get("summary_index"))
+            if (
+                item_types.get(key[0]) != "reasoning"
+                or event.get("item_id") != added_items.get(key[0])
+                or key in reasoning_parts
+            ):
+                raise ContractError("Responses reasoning summary part was added out of order")
+            reasoning_parts.add(key)
+        elif event_type == "response.reasoning_summary_part.done":
+            key = (event.get("output_index"), event.get("summary_index"))
+            if (
+                event.get("item_id") != added_items.get(key[0])
+                or key not in reasoning_parts
+                or key in done_reasoning_parts
+            ):
+                raise ContractError("Responses reasoning summary part done has no matching add")
+            done_reasoning_parts.add(key)
+        elif event_type == "response.content_part.added":
+            key = (event.get("output_index"), event.get("content_index"))
+            if (
+                item_types.get(key[0]) != "message"
+                or event.get("item_id") != added_items.get(key[0])
+                or key in content_parts
+            ):
+                raise ContractError("Responses content part was added out of order")
+            content_parts.add(key)
+        elif event_type == "response.content_part.done":
+            key = (event.get("output_index"), event.get("content_index"))
+            if (
+                event.get("item_id") != added_items.get(key[0])
+                or key not in content_parts
+                or key in done_content_parts
+            ):
+                raise ContractError("Responses content part done has no matching add")
+            done_content_parts.add(key)
+        elif event_type == "response.output_text.delta":
             if not isinstance(event.get("delta"), str):
                 raise ContractError("Responses output_text delta is not a string")
+            key = (event.get("output_index"), event.get("content_index"))
+            if key not in content_parts or event.get("item_id") != added_items.get(key[0]):
+                raise ContractError("Responses output_text delta preceded its content part")
             content.append(event["delta"])
-        elif event_type == "response.reasoning_text.delta":
+        elif event_type == "response.output_text.done":
+            if (
+                event.get("item_id") != added_items.get(event.get("output_index"))
+                or not isinstance(event.get("text"), str)
+                or event["text"] != "".join(content)
+            ):
+                raise ContractError("Responses output_text.done differs from prior deltas")
+        elif event_type == "response.reasoning_summary_text.delta":
             if not isinstance(event.get("delta"), str):
                 raise ContractError("Responses reasoning delta is not a string")
+            key = (event.get("output_index"), event.get("summary_index"))
+            if key not in reasoning_parts or event.get("item_id") != added_items.get(key[0]):
+                raise ContractError("Responses reasoning delta preceded its summary part")
             reasoning.append(event["delta"])
+        elif event_type == "response.reasoning_summary_text.done":
+            if (
+                event.get("item_id") != added_items.get(event.get("output_index"))
+                or not isinstance(event.get("text"), str)
+                or event["text"] != "".join(reasoning)
+            ):
+                raise ContractError("Responses reasoning done differs from prior deltas")
+        elif event_type == "response.function_call_arguments.delta":
+            index = event.get("output_index")
+            if (
+                item_types.get(index) != "function_call"
+                or event.get("item_id") != added_items.get(index)
+                or not isinstance(event.get("delta"), str)
+                or index in done_function_arguments
+            ):
+                raise ContractError("Responses function argument delta has invalid state")
+            function_arguments[index].append(event["delta"])
+        elif event_type == "response.function_call_arguments.done":
+            index = event.get("output_index")
+            if (
+                item_types.get(index) != "function_call"
+                or event.get("item_id") != added_items.get(index)
+                or index in done_function_arguments
+                or event.get("arguments") != "".join(function_arguments[index])
+            ):
+                raise ContractError("Responses function argument completion differs from deltas")
+            done_function_arguments.add(index)
         elif event_type in {
             "response.completed",
             "response.incomplete",
@@ -313,9 +544,21 @@ def parse_responses_stream(response: Response) -> tuple[str, str, dict[str, Any]
             value = event.get("response")
             if not isinstance(value, dict):
                 raise ContractError("Responses terminal event is missing its Response")
+            if value.get("id") != response_id:
+                raise ContractError("Responses terminal event changed Response id")
+            if value.get("status") == "cancelled":
+                raise ContractError("Responses must represent cancellation as failed, not cancelled")
+            if event_type != f"response.{value.get('status')}":
+                raise ContractError("Responses terminal event type differs from Response status")
             terminal = value
-    if terminal is None or terminal.get("status") not in {"completed", "incomplete"}:
+    if terminal is None or terminal.get("status") not in {"completed", "incomplete", "failed"}:
+        raise ContractError("Responses stream has an unrecognized terminal status")
+    if terminal.get("status") not in {"completed", "incomplete"}:
         raise ContractError("Responses stream did not terminate successfully")
+    if set(added_items) != done_items:
+        raise ContractError("Responses stream did not finish every added output Item")
+    if reasoning_parts != done_reasoning_parts or content_parts != done_content_parts:
+        raise ContractError("Responses stream did not finish every added content part")
     terminal_content, terminal_reasoning = response_text(terminal)
     if "".join(content) != terminal_content or "".join(reasoning) != terminal_reasoning:
         raise ContractError("Responses deltas do not reconstruct terminal output Items")
@@ -323,7 +566,28 @@ def parse_responses_stream(response: Response) -> tuple[str, str, dict[str, Any]
     return terminal_content, terminal_reasoning, terminal
 
 
-def exercise(base_url: str, model: str) -> dict[str, Any]:
+def exercise(base_url: str, model: str, *, vision_disabled: bool = False) -> dict[str, Any]:
+    preflight = request(
+        base_url,
+        "OPTIONS",
+        "/v1/responses",
+        headers={
+            "Origin": "https://example.invalid",
+            "Access-Control-Request-Method": "POST",
+            "Access-Control-Request-Headers": "content-type,authorization",
+        },
+    )
+    # CORS is startup-optional. If enabled, verify the browser-visible contract completely.
+    if "access-control-allow-origin" in preflight.headers:
+        if preflight.status != 204:
+            raise ContractError("CORS preflight did not return HTTP 204")
+        exposed = preflight.headers.get("access-control-expose-headers", "").lower()
+        allowed = preflight.headers.get("access-control-allow-headers", "").lower()
+        if "x-request-id" not in exposed or "retry-after" not in exposed:
+            raise ContractError("CORS does not expose x-request-id and Retry-After")
+        if "content-type" not in allowed or "authorization" not in allowed:
+            raise ContractError("CORS does not allow SDK authentication/content headers")
+
     models = json_response(base_url, "GET", "/v1/models")
     entries = models.get("data")
     if models.get("object") != "list" or not isinstance(entries, list) or len(entries) != 1:
@@ -389,12 +653,26 @@ def exercise(base_url: str, model: str) -> dict[str, Any]:
         base_url, model, responses_input, store=False
     )
     response_sync_text, response_sync_reasoning = response_text(response_sync)
+    if response_sync.get("reasoning", {}).get("summary") != "auto":
+        raise ContractError("omitted reasoning.summary did not use the auto default")
     response_prompt_tokens, response_output_tokens = require_responses_usage(
         response_sync.get("usage")
     )
     if response_prompt_tokens != response_count["input_tokens"]:
         raise ContractError("Responses input_tokens differs from generation usage")
-    response_stream_payload = {
+    reasoning_tokens = response_sync["usage"]["output_tokens_details"]["reasoning_tokens"]
+    if reasoning_tokens > 0 and not response_sync_reasoning:
+        raise ContractError("default reasoning summary omitted generated reasoning")
+    summarized = responses_nonstream(
+        base_url, model, responses_input, store=False, reasoning_summary="auto"
+    )
+    summarized_text, summarized_reasoning = response_text(summarized)
+    if summarized_text != response_sync_text:
+        raise ContractError("requesting a reasoning summary changed greedy answer text")
+    if summarized_reasoning != response_sync_reasoning:
+        raise ContractError("explicit auto changed the default public reasoning summary")
+
+    response_stream_payload: dict[str, Any] = {
         "model": model,
         "input": responses_input,
         "max_output_tokens": 16,
@@ -402,6 +680,12 @@ def exercise(base_url: str, model: str) -> dict[str, Any]:
         "store": False,
         "stream": True,
     }
+    default_stream = request(base_url, "POST", "/v1/responses", response_stream_payload)
+    default_text, default_reasoning, _ = parse_responses_stream(default_stream)
+    if (default_text, default_reasoning) != (response_sync_text, response_sync_reasoning):
+        raise ContractError("default Responses SSE differs from non-streaming public output")
+
+    response_stream_payload["reasoning"] = {"summary": "auto"}
     response_stream = request(
         base_url, "POST", "/v1/responses", response_stream_payload
     )
@@ -409,8 +693,8 @@ def exercise(base_url: str, model: str) -> dict[str, Any]:
         response_stream
     )
     if (streamed_text, streamed_reasoning) != (
-        response_sync_text,
-        response_sync_reasoning,
+        summarized_text,
+        summarized_reasoning,
     ):
         raise ContractError("Responses streaming output differs from greedy non-streaming output")
     _, streamed_output_tokens = require_responses_usage(response_stream_terminal.get("usage"))
@@ -418,7 +702,11 @@ def exercise(base_url: str, model: str) -> dict[str, Any]:
         raise ContractError("Responses streaming output-token usage differs")
 
     stored_response = responses_nonstream(
-        base_url, model, "Remember the code word ORCHID. Reply briefly.", store=True
+        base_url,
+        model,
+        "Remember the code word ORCHID. Reply briefly.",
+        store=True,
+        max_output_tokens=64,
     )
     stored_id = stored_response.get("id")
     if not isinstance(stored_id, str) or not stored_id.startswith("resp_"):
@@ -427,9 +715,13 @@ def exercise(base_url: str, model: str) -> dict[str, Any]:
     if retrieved != stored_response:
         raise ContractError("retrieved Response differs from the created Response")
     input_items = json_response(
-        base_url, "GET", f"/v1/responses/{stored_id}/input_items?order=asc"
+        base_url, "GET", f"/v1/responses/{stored_id}/input_items?order=asc&limit=1"
     )
-    if input_items.get("object") != "list" or len(input_items.get("data", [])) != 1:
+    if (
+        input_items.get("object") != "list"
+        or len(input_items.get("data", [])) != 1
+        or input_items.get("first_id") != input_items.get("last_id")
+    ):
         raise ContractError("Responses input_items list has the wrong shape")
     continuation_input = "What code word was given? Reply with only that word."
     continuation = responses_nonstream(
@@ -438,6 +730,7 @@ def exercise(base_url: str, model: str) -> dict[str, Any]:
         continuation_input,
         store=True,
         previous_response_id=stored_id,
+        max_output_tokens=64,
     )
     standalone_continuation_count = json_response(
         base_url,
@@ -450,27 +743,166 @@ def exercise(base_url: str, model: str) -> dict[str, Any]:
         continuation_prompt_tokens <= standalone_continuation_count
     ):
         raise ContractError("previous_response_id did not reconstruct stored context")
+    continuation_text, _ = response_text(continuation)
+    if "ORCHID" not in continuation_text.upper():
+        raise ContractError("previous_response_id continuation did not recall ORCHID")
+
+    output_items = stored_response.get("output", [])
+    referenced_item = next(
+        (item for item in output_items if isinstance(item, dict) and item.get("type") == "message"),
+        None,
+    )
+    if not isinstance(referenced_item, dict) or not isinstance(referenced_item.get("id"), str):
+        raise ContractError("stored Response has no referenceable message Item")
+    if referenced_item.get("status") != "completed":
+        raise ContractError("stored Response did not complete a referenceable message Item")
+    reference_input = [
+        {"role": "user", "content": "Prefix before the exact reference."},
+        {"type": "item_reference", "id": referenced_item["id"]},
+        {"role": "user", "content": "Reply with one short word."},
+    ]
+    referenced = responses_nonstream(
+        base_url,
+        model,
+        reference_input,
+        store=True,
+        previous_response_id=continuation.get("id"),
+        max_output_tokens=64,
+    )
+    if referenced.get("previous_response_id") != continuation.get("id"):
+        raise ContractError("item_reference rewrote previous_response_id")
+    referenced_inputs = json_response(
+        base_url,
+        "GET",
+        f"/v1/responses/{referenced['id']}/input_items?order=asc&limit=100",
+    ).get("data")
+    if (
+        not isinstance(referenced_inputs, list)
+        or len(referenced_inputs) != 3
+        or not isinstance(referenced_inputs[1], dict)
+        or referenced_inputs[1].get("id") != referenced_item["id"]
+        or referenced_inputs[1].get("content") != referenced_item.get("content")
+    ):
+        raise ContractError("item_reference was not substituted exactly in place")
+
+    require_error(
+        base_url,
+        "POST",
+        f"/v1/responses/{stored_id}/cancel",
+        "background_not_supported",
+        {},
+    )
+    require_error(
+        base_url,
+        "GET",
+        f"/v1/responses/{stored_id}?stream=true",
+        "parameter_not_supported",
+    )
+
+    # Item references are exact in-place substitutions and depend on the owning record's index.
+    deleted = json_response(base_url, "DELETE", f"/v1/responses/{stored_id}")
+    if deleted != {"id": stored_id, "object": "response.deleted", "deleted": True}:
+        raise ContractError("Responses delete returned the wrong object")
+    require_error(
+        base_url,
+        "POST",
+        "/v1/responses",
+        "item_not_found",
+        {
+            "model": model,
+            "input": [{"type": "item_reference", "id": referenced_item["id"]}],
+            "max_output_tokens": 16,
+            "store": False,
+        },
+        status=404,
+    )
     continuation_id = continuation.get("id")
-    for response_id in (continuation_id, stored_id):
+    for response_id in (referenced.get("id"), continuation_id):
         deleted = json_response(base_url, "DELETE", f"/v1/responses/{response_id}")
         if deleted != {"id": response_id, "object": "response.deleted", "deleted": True}:
             raise ContractError("Responses delete returned the wrong object")
 
+    tool = {
+        "type": "function",
+        "function": {
+            "name": "noop",
+            "description": "No operation",
+            "parameters": {"type": "object", "properties": {}},
+            "strict": True,
+        },
+    }
+    require_error(
+        base_url,
+        "POST",
+        "/v1/chat/completions",
+        "strict_tools_not_supported",
+        {"model": model, "messages": messages, "tools": [tool]},
+    )
+    tool["function"]["strict"] = False
+    require_error(
+        base_url,
+        "POST",
+        "/v1/chat/completions",
+        "tool_choice_not_supported",
+        {"model": model, "messages": messages, "tools": [tool], "tool_choice": "required"},
+    )
+    require_error(
+        base_url,
+        "POST",
+        "/v1/chat/completions",
+        "logit_bias_not_supported",
+        {"model": model, "messages": messages, "logit_bias": {"1": 1}},
+    )
+    require_error(
+        base_url,
+        "POST",
+        "/v1/responses/compact",
+        "compaction_not_supported",
+        {},
+    )
+
+    image_prompt = "What is visible? Answer briefly."
     image_messages = [
         {
             "role": "user",
             "content": [
                 {"type": "image_url", "image_url": {"url": _IMAGE_DATA_URI}},
-                {"type": "text", "text": "What is visible? Answer briefly."},
+                {"type": "text", "text": image_prompt},
             ],
         }
     ]
-    image_response = openai_nonstream(base_url, model, image_messages, max_tokens=2)
-    image_prompt_tokens, _ = require_usage(
-        image_response.get("usage"), "prompt_tokens", "completion_tokens"
-    )
-    if image_prompt_tokens <= input_tokens:
-        raise ContractError("image request did not expand the prompt through the Vision frontend")
+    if vision_disabled:
+        require_error(
+            base_url,
+            "POST",
+            "/v1/chat/completions",
+            "vision_disabled",
+            {
+                "model": model,
+                "messages": image_messages,
+                "max_completion_tokens": 2,
+                "temperature": 0,
+            },
+        )
+        image_prompt_tokens = 0
+    else:
+        image_baseline = openai_nonstream(
+            base_url,
+            model,
+            [{"role": "user", "content": image_prompt}],
+            max_tokens=2,
+        )
+        baseline_prompt_tokens, _ = require_usage(
+            image_baseline.get("usage"), "prompt_tokens", "completion_tokens"
+        )
+        image_response = openai_nonstream(base_url, model, image_messages, max_tokens=2)
+        image_prompt_tokens, _ = require_usage(
+            image_response.get("usage"), "prompt_tokens", "completion_tokens"
+        )
+        if image_prompt_tokens <= baseline_prompt_tokens:
+            raise ContractError(
+                "image request did not exceed its identical no-image prompt baseline"
+            )
 
     anthropic = json_response(base_url, "POST", "/v1/messages", anthropic_prompt)
     if anthropic.get("type") != "message" or anthropic.get("role") != "assistant":
@@ -494,6 +926,7 @@ def exercise(base_url: str, model: str) -> dict[str, Any]:
         "openai_completion_tokens": stream_usage["completion_tokens"],
         "responses_input_tokens": response_prompt_tokens,
         "responses_output_tokens": response_output_tokens,
+        "responses_reasoning_tokens": reasoning_tokens,
         "image_prompt_tokens": image_prompt_tokens,
         "anthropic_stop_reason": anthropic["stop_reason"],
     }
@@ -504,11 +937,22 @@ def main() -> None:
     parser.add_argument("--base-url", default="http://127.0.0.1:18080")
     parser.add_argument("--model", required=True)
     parser.add_argument("--health-timeout", type=float, default=300.0)
+    parser.add_argument(
+        "--vision-disabled",
+        action="store_true",
+        help="expect image requests to fail with vision_disabled instead of exercising Vision",
+    )
     args = parser.parse_args()
 
     base_url = args.base_url.rstrip("/")
     wait_for_health(base_url, args.health_timeout)
-    print(json.dumps(exercise(base_url, args.model), ensure_ascii=False, indent=2))
+    print(
+        json.dumps(
+            exercise(base_url, args.model, vision_disabled=args.vision_disabled),
+            ensure_ascii=False,
+            indent=2,
+        )
+    )
 
 
 if __name__ == "__main__":

@@ -1,13 +1,15 @@
 #include "serve/http_server.h"
 
+#include "serve/console_log.h"
 #include "serve/openai_schema.h"
 #include "serve/responses_schema.h"
+#include "serve/responses_state.h"
+#include "serve/responses_transport.h"
 
 #include <nlohmann/json.hpp>
 
 #include <algorithm>
 #include <atomic>
-#include <charconv>
 #include <cstddef>
 #include <cstdint>
 #include <exception>
@@ -15,7 +17,6 @@
 #include <memory>
 #include <optional>
 #include <string>
-#include <system_error>
 #include <utility>
 #include <vector>
 
@@ -40,8 +41,18 @@ struct StreamingResponse {
 };
 
 void write_error(httplib::Response& response, const ApiError& error) {
-    response.status = error.status;
-    response.set_content(make_error_body(error), "application/json");
+    ApiError rendered = error;
+    if (rendered.status == 500) {
+        rendered.type = "server_error";
+        rendered.code.clear();
+        rendered.param.clear();
+        rendered.message = "Internal server error.";
+    }
+    response.status = rendered.status;
+    if (rendered.status == 429 || rendered.status == 503) {
+        response.set_header("Retry-After", "1");
+    }
+    response.set_content(make_error_body(rendered), "application/json");
 }
 
 ApiError responses_error(ApiError error) {
@@ -49,11 +60,20 @@ ApiError responses_error(ApiError error) {
     return error;
 }
 
-ApiError internal_error(const std::exception& exception) {
+ApiError internal_error() {
     ApiError error;
     error.status  = 500;
     error.type    = "server_error";
-    error.message = exception.what();
+    error.message = "Internal server error.";
+    return error;
+}
+
+ApiError request_cancelled_error() {
+    ApiError error;
+    error.status  = 499;
+    error.type    = "request_cancelled";
+    error.code    = "request_cancelled";
+    error.message = "Request was cancelled.";
     return error;
 }
 
@@ -92,6 +112,11 @@ Json parse_json_body(const httplib::Request& request) {
 
 bool disconnected(const httplib::Request& request) {
     return request.is_connection_alive && !request.is_connection_alive();
+}
+
+bool disconnected(const httplib::DataSink& sink, const StreamingResponse& request) {
+    return request.cancelled.load(std::memory_order_acquire) ||
+           (sink.is_writable && !sink.is_writable());
 }
 
 void write_stream_item(httplib::DataSink& sink, StreamingResponse& request,
@@ -135,51 +160,18 @@ std::string path_response_id(const httplib::Request& request) {
     return request.matches.size() > 1 ? request.matches[1].str() : std::string();
 }
 
-int parse_limit(const httplib::Request& request) {
-    if (!request.has_param("limit")) { return 20; }
-    const std::string value = request.get_param_value("limit");
-    int parsed              = 0;
-    const auto result       = std::from_chars(value.data(), value.data() + value.size(), parsed);
-    if (result.ec != std::errc{} || result.ptr != value.data() + value.size() || parsed < 1 ||
-        parsed > 100) {
-        ApiError error;
-        error.status  = 400;
-        error.param   = "limit";
-        error.code    = "invalid_pagination";
-        error.message = "limit must be an integer in [1,100]";
-        throw ApiException(std::move(error));
-    }
-    return parsed;
+std::vector<std::pair<std::string, std::string>> query_parameters(const httplib::Request& request) {
+    return {request.params.begin(), request.params.end()};
 }
 
-Json paginated_input_items(const httplib::Request& request, const std::vector<Json>& stored_items) {
-    if (request.has_param("include") && !request.get_param_value("include").empty()) {
-        ApiError error;
-        error.status  = 400;
-        error.param   = "include";
-        error.code    = "include_not_supported";
-        error.message = "additional input Item fields are not supported";
-        throw ApiException(std::move(error));
-    }
-    const int limit   = parse_limit(request);
-    std::string order = request.has_param("order") ? request.get_param_value("order") : "desc";
-    if (order != "asc" && order != "desc") {
-        ApiError error;
-        error.status  = 400;
-        error.param   = "order";
-        error.code    = "invalid_pagination";
-        error.message = "order must be 'asc' or 'desc'";
-        throw ApiException(std::move(error));
-    }
-
+Json paginated_input_items(const RetrievalQuery& query, const std::vector<Json>& stored_items) {
     std::vector<Json> ordered = stored_items;
-    if (order == "desc") { std::reverse(ordered.begin(), ordered.end()); }
+    if (query.order == "desc") { std::reverse(ordered.begin(), ordered.end()); }
     std::size_t begin = 0;
-    if (request.has_param("after")) {
-        const std::string after = request.get_param_value("after");
+    if (query.after) {
         const auto found = std::find_if(ordered.begin(), ordered.end(), [&](const Json& item) {
             return item.contains("id") && item.at("id").is_string() &&
-                   item.at("id").get<std::string>() == after;
+                   item.at("id").get<std::string>() == *query.after;
         });
         if (found == ordered.end()) {
             ApiError error;
@@ -191,7 +183,7 @@ Json paginated_input_items(const httplib::Request& request, const std::vector<Js
         }
         begin = static_cast<std::size_t>(std::distance(ordered.begin(), found)) + 1;
     }
-    const std::size_t end = std::min(ordered.size(), begin + static_cast<std::size_t>(limit));
+    const std::size_t end = std::min(ordered.size(), begin + static_cast<std::size_t>(query.limit));
     Json data             = Json::array();
     for (std::size_t index = begin; index < end; ++index) { data.push_back(ordered[index]); }
     return Json{{"object", "list"},
@@ -210,7 +202,9 @@ void HttpServer::handle_responses(const httplib::Request& req, httplib::Response
     try {
         RequestLimits limits;
         limits.default_max_tokens = options_.default_max_tokens;
-        request                   = parse_responses_request(parse_json_body(req), limits);
+        Json body                 = parse_json_body(req);
+        resolve_response_item_references(body, response_store_);
+        request = parse_responses_request(body, limits);
         validate_model(request.generation.model, public_model_id_);
         if (request.previous_response_id) {
             const std::shared_ptr<const StoredResponse> previous =
@@ -227,7 +221,9 @@ void HttpServer::handle_responses(const httplib::Request& req, httplib::Response
         write_error(res, responses_error(exception.error()));
         return;
     } catch (const std::exception& exception) {
-        write_error(res, internal_error(exception));
+        write_console_log(ConsoleLogLevel::Error,
+                          "responses preparation exception: " + std::string(exception.what()));
+        write_error(res, internal_error());
         return;
     }
 
@@ -235,16 +231,28 @@ void HttpServer::handle_responses(const httplib::Request& req, httplib::Response
     const std::int64_t created = unix_time_now();
     const std::uint64_t req_id = ++request_seq_;
     const RequestLogContext log_context =
-        make_request_log_context(req_id, "openai_responses", request.generation, prepared);
+        make_request_log_context(req_id, res.get_header_value("x-request-id"), "openai_responses",
+                                 request.generation, prepared);
     log_request_start(log_context);
 
     if (!request.stream) {
         try {
             const GenerationOutcome outcome =
                 service_->run(prepared, nullptr, [&req] { return disconnected(req); });
+            const ResponseCommitAction commit =
+                response_commit_action(disconnected(req), outcome.finish_reason, request.store);
+            if (commit == ResponseCommitAction::FailCancelled) {
+                throw ApiException(request_cancelled_error());
+            }
             const ResponsesRuntimeValues runtime = runtime_values(prepared, &outcome);
             BuiltResponse response = make_response_object(id, created, request, runtime, outcome);
-            if (request.store) {
+            // Storage is the success commit point. Re-check immediately before mutation; after
+            // put succeeds, a later socket disconnect must not erase the durable record.
+            if (commit == ResponseCommitAction::StoreThenSend) {
+                if (response_commit_action(disconnected(req), outcome.finish_reason, true) ==
+                    ResponseCommitAction::FailCancelled) {
+                    throw ApiException(request_cancelled_error());
+                }
                 StoredResponse stored;
                 stored.id                = id;
                 stored.response          = response.body;
@@ -261,7 +269,7 @@ void HttpServer::handle_responses(const httplib::Request& req, httplib::Response
             write_error(res, error);
         } catch (const std::exception& exception) {
             log_request_error(log_context, exception.what());
-            write_error(res, internal_error(exception));
+            write_error(res, internal_error());
         }
         return;
     }
@@ -299,8 +307,20 @@ void HttpServer::handle_responses(const httplib::Request& req, httplib::Response
                 };
 
                 const GenerationOutcome outcome = service_->run(stream->prepared, &output);
-                ResponsesStreamFinish finished  = stream->encoder->finish(outcome);
-                if (stream->request.store) {
+                if (response_commit_action(disconnected(sink, *stream), outcome.finish_reason,
+                                           stream->request.store) ==
+                    ResponseCommitAction::FailCancelled) {
+                    throw ApiException(request_cancelled_error());
+                }
+                ResponsesStreamFinish finished    = stream->encoder->finish(outcome);
+                const ResponseCommitAction commit = response_commit_action(
+                    disconnected(sink, *stream), outcome.finish_reason, stream->request.store);
+                if (commit == ResponseCommitAction::FailCancelled) {
+                    throw ApiException(request_cancelled_error());
+                }
+                // finish() only stages success events. Nothing reaches the wire until put()
+                // succeeds, so a storage failure can emit exactly one response.failed terminal.
+                if (commit == ResponseCommitAction::StoreThenSend) {
                     StoredResponse stored;
                     stored.id          = finished.response.body.at("id").get<std::string>();
                     stored.response    = finished.response.body;
@@ -310,6 +330,8 @@ void HttpServer::handle_responses(const httplib::Request& req, httplib::Response
                     stored.preserve_thinking = stream->prepared.preserve_thinking;
                     response_store_.put(std::move(stored));
                 }
+                // The record is committed now. Any disconnect while flushing staged events keeps
+                // it retrievable, and ResponsesEventStream enforces at most one terminal event.
                 write_stream_items(sink, *stream, std::move(finished.events_before_terminal));
                 log_request_done(stream->log_context, outcome);
                 write_stream_item(sink, *stream, stream->encoder->terminal(finished.response));
@@ -319,16 +341,17 @@ void HttpServer::handle_responses(const httplib::Request& req, httplib::Response
                 log_request_error(stream->log_context, exception.what());
                 return false;
             } catch (const ApiException& exception) {
-                const ApiError error = responses_error(exception.error());
-                log_request_error(stream->log_context, error.message);
+                const ApiError reported = responses_error(exception.error());
+                const ApiError error    = reported.status == 500 ? internal_error() : reported;
+                log_request_error(stream->log_context, reported.message);
                 try {
                     write_stream_item(sink, *stream, stream->encoder->failed(error));
                     sink.done();
                     return true;
                 } catch (const ClientDisconnected&) { return false; }
             } catch (const std::exception& exception) {
-                const ApiError error = internal_error(exception);
-                log_request_error(stream->log_context, error.message);
+                const ApiError error = internal_error();
+                log_request_error(stream->log_context, exception.what());
                 try {
                     write_stream_item(sink, *stream, stream->encoder->failed(error));
                     sink.done();
@@ -343,18 +366,29 @@ void HttpServer::handle_response_input_tokens(const httplib::Request& req, httpl
     try {
         RequestLimits limits;
         limits.default_max_tokens = options_.default_max_tokens;
-        ResponsesRequest request =
-            parse_response_input_tokens_request(parse_json_body(req), limits);
+        Json body                 = parse_json_body(req);
+        resolve_response_item_references(body, response_store_);
+        ResponsesRequest request = parse_response_input_tokens_request(body, limits);
         validate_model(request.generation.model, public_model_id_);
         const int tokens =
             service_->count_prompt_tokens(request.generation, [&req] { return disconnected(req); });
         res.set_content(make_response_input_tokens_body(tokens), "application/json");
     } catch (const ApiException& exception) {
         write_error(res, responses_error(exception.error()));
-    } catch (const std::exception& exception) { write_error(res, internal_error(exception)); }
+    } catch (const std::exception& exception) {
+        write_console_log(ConsoleLogLevel::Error,
+                          "response input_tokens exception: " + std::string(exception.what()));
+        write_error(res, internal_error());
+    }
 }
 
 void HttpServer::handle_response_get(const httplib::Request& req, httplib::Response& res) {
+    try {
+        (void)parse_retrieval_query(RetrievalRoute::Response, query_parameters(req));
+    } catch (const ApiException& exception) {
+        write_error(res, exception.error());
+        return;
+    }
     const std::string id                               = path_response_id(req);
     const std::shared_ptr<const StoredResponse> stored = response_store_.get(id);
     if (!stored) {
@@ -365,6 +399,12 @@ void HttpServer::handle_response_get(const httplib::Request& req, httplib::Respo
 }
 
 void HttpServer::handle_response_delete(const httplib::Request& req, httplib::Response& res) {
+    try {
+        (void)parse_retrieval_query(RetrievalRoute::DeleteResponse, query_parameters(req));
+    } catch (const ApiException& exception) {
+        write_error(res, exception.error());
+        return;
+    }
     const std::string id = path_response_id(req);
     if (!response_store_.erase(id)) {
         write_error(res, response_not_found(id));
@@ -375,6 +415,13 @@ void HttpServer::handle_response_delete(const httplib::Request& req, httplib::Re
 }
 
 void HttpServer::handle_response_input_items(const httplib::Request& req, httplib::Response& res) {
+    RetrievalQuery query;
+    try {
+        query = parse_retrieval_query(RetrievalRoute::InputItems, query_parameters(req));
+    } catch (const ApiException& exception) {
+        write_error(res, exception.error());
+        return;
+    }
     const std::string id                               = path_response_id(req);
     const std::shared_ptr<const StoredResponse> stored = response_store_.get(id);
     if (!stored) {
@@ -382,11 +429,18 @@ void HttpServer::handle_response_input_items(const httplib::Request& req, httpli
         return;
     }
     try {
-        res.set_content(paginated_input_items(req, stored->input_items).dump(), "application/json");
+        res.set_content(paginated_input_items(query, stored->input_items).dump(),
+                        "application/json");
     } catch (const ApiException& exception) { write_error(res, exception.error()); }
 }
 
 void HttpServer::handle_response_cancel(const httplib::Request& req, httplib::Response& res) {
+    try {
+        (void)parse_retrieval_query(RetrievalRoute::CancelResponse, query_parameters(req));
+    } catch (const ApiException& exception) {
+        write_error(res, exception.error());
+        return;
+    }
     const std::string id = path_response_id(req);
     if (!response_store_.get(id)) {
         write_error(res, response_not_found(id));

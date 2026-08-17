@@ -16,9 +16,9 @@
 #include <utility>
 
 #ifdef _WIN32
-#include <process.h>
+#    include <process.h>
 #else
-#include <unistd.h>
+#    include <unistd.h>
 #endif
 
 namespace ninfer::serve {
@@ -171,6 +171,7 @@ Json overrides_json(const ninfer::SamplingOverrides& overrides) {
 
 Json request_json(const RequestLogContext& context) {
     return Json{{"request_id", context.id},
+                {"x_request_id", context.x_request_id},
                 {"protocol", context.protocol},
                 {"model", context.model},
                 {"stream", context.stream},
@@ -255,11 +256,12 @@ std::string speculative_str(const GenerationMetrics& metrics) {
 
 } // namespace
 
-RequestLogContext make_request_log_context(std::uint64_t id, std::string protocol,
-                                           const GenerationRequest& request,
+RequestLogContext make_request_log_context(std::uint64_t id, std::string x_request_id,
+                                           std::string protocol, const GenerationRequest& request,
                                            const PreparedRequest& prepared) {
     RequestLogContext context;
     context.id                                 = id;
+    context.x_request_id                       = std::move(x_request_id);
     context.protocol                           = std::move(protocol);
     context.model                              = request.model;
     context.stream                             = request.stream;
@@ -279,10 +281,10 @@ RequestLogContext make_request_log_context(std::uint64_t id, std::string protoco
 
 std::string format_request_start(const RequestLogContext& context) {
     std::ostringstream out;
-    out << "[req " << context.id << "] " << context.protocol << ' '
-        << (context.stream ? "stream" : "non-stream") << " msgs=" << context.message_count
-        << " max_tokens=" << context.requested_output_tokens << ' '
-        << (context.requested_output_tokens_client_set ? "(client)" : "(server default)")
+    out << "[req " << context.id << " x_request_id=" << context.x_request_id << "] "
+        << context.protocol << ' ' << (context.stream ? "stream" : "non-stream")
+        << " msgs=" << context.message_count << " max_tokens=" << context.requested_output_tokens
+        << ' ' << (context.requested_output_tokens_client_set ? "(client)" : "(server default)")
         << " tools=" << context.tool_count
         << " tool_choice=" << tool_choice_name(context.tool_choice)
         << " tool_history=" << (context.has_tool_history ? "yes" : "no")
@@ -304,7 +306,7 @@ std::string format_request_done(const RequestLogContext& context,
         std::max(0, outcome.prompt_tokens - static_cast<int>(metrics.prefix_cache_hit_tokens)));
 
     std::ostringstream out;
-    out << "[req " << context.id << "] done finish="
+    out << "[req " << context.id << " x_request_id=" << context.x_request_id << "] done finish="
         << (outcome.tool_calls.empty() ? finish_reason_name(outcome.finish_reason) : "tool_calls");
     if (!outcome.tool_calls.empty()) { out << " tool_calls=" << outcome.tool_calls.size(); }
     out << " prompt=" << outcome.prompt_tokens << " gen=" << outcome.completion_tokens
@@ -320,7 +322,8 @@ std::string format_request_done(const RequestLogContext& context,
 
 std::string format_request_error(const RequestLogContext& context, const std::string& message) {
     std::ostringstream out;
-    out << "[req " << context.id << "] error " << message;
+    out << "[req " << context.id << " x_request_id=" << context.x_request_id << "] error "
+        << message;
     return out.str();
 }
 

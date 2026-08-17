@@ -17,11 +17,12 @@
 
 namespace ninfer::serve {
 
-inline constexpr int kRequestLogSchemaVersion        = 8;
+inline constexpr int kRequestLogSchemaVersion        = 9;
 inline constexpr const char* kRequestLogArtifactType = "ninfer_serve_request_log";
 
 struct RequestLogContext {
     std::uint64_t id = 0;
+    std::string x_request_id;
     std::string protocol;
     std::string model;
     bool stream                             = false;
@@ -59,8 +60,8 @@ struct ThroughputReport {
     ninfer::RuntimeStats scheduler;
 };
 
-RequestLogContext make_request_log_context(std::uint64_t id, std::string protocol,
-                                           const GenerationRequest& request,
+RequestLogContext make_request_log_context(std::uint64_t id, std::string x_request_id,
+                                           std::string protocol, const GenerationRequest& request,
                                            const PreparedRequest& prepared);
 
 // Compact console records retained for operator visibility.
