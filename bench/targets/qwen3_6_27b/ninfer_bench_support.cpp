@@ -51,7 +51,19 @@ std::uint32_t parse_u32(std::string_view text, const char* label, bool allow_zer
 KvCacheStorage parse_kv_cache(std::string_view text) {
     if (text == "bf16") { return KvCacheStorage::BFloat16; }
     if (text == "int8") { return KvCacheStorage::Int8Group64; }
-    throw std::invalid_argument("--kv-dtype must be bf16 or int8");
+    if (text == "rk8v4") {
+        return KvCacheStorage::RotatedInt8KeyInt4ValueGroup64;
+    }
+    if (text == "rk4v4") {
+        return KvCacheStorage::RotatedInt4KeyInt4ValueGroup64;
+    }
+    if (text == "rk4v4-e8") {
+        return KvCacheStorage::RK4V4E8;
+    }
+    if (text == "rk2v4-e8") {
+        return KvCacheStorage::RK2V4E8;
+    }
+    throw std::invalid_argument("--kv-dtype must be bf16, int8, rk8v4, rk4v4, rk4v4-e8, or rk2v4-e8");
 }
 
 std::vector<int> parse_int_list(std::string_view value, const char* label) {
@@ -270,7 +282,7 @@ std::string usage_text(std::string_view program) {
         << "  --max-ctx <tokens>          override auto-sized context capacity\n"
         << "  --prefill-chunk <tokens>    multiple of " << kPrefillChunkAlignment
         << " (default: " << kDefaultPrefillChunk << ")\n"
-        << "  --kv-dtype <bf16|int8>      KV cache storage (default: bf16)\n"
+        << "  --kv-dtype <bf16|int8|rk8v4|e8> KV cache storage (default: bf16)\n"
         << "  --mtp-draft-tokens <0..5>   speculative draft window (default: 0)\n"
         << "  --lm-head-draft             use the optimized proposal head; requires MTP\n"
         << "  --device <id>               CUDA device ordinal (default: 0)\n"
@@ -820,6 +832,14 @@ std::string kv_cache_name(KvCacheStorage storage) {
         return "bf16";
     case KvCacheStorage::Int8Group64:
         return "int8-group64";
+    case KvCacheStorage::RotatedInt8KeyInt4ValueGroup64:
+        return "rk8v4";
+    case KvCacheStorage::RotatedInt4KeyInt4ValueGroup64:
+        return "rk4v4";
+    case KvCacheStorage::RK4V4E8:
+        return "rk4v4-e8";
+    case KvCacheStorage::RK2V4E8:
+        return "rk2v4-e8";
     }
     return "unknown";
 }

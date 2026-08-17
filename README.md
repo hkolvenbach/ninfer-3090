@@ -32,6 +32,12 @@ decode rows use the `ninfer` CLI.
 MTP acceptance, and with it the decoded rate, tracks how predictable the output is: structured
 code accepts about 81% of draft tokens, the mixed bench corpus about 49%.
 
+The shipping default has since moved from INT8 KV to the E8 4-bit KV mode, which serves the
+model's full native 262,144-token context on this card. Retrieval stays exact through 260K
+(single-needle, 5-needle, and exact-code-detail probes), MTP acceptance at depth is unchanged,
+and the costs against the INT8 numbers above are a 5.7% decode tax and 1-2% of prefill; see
+[Quick start](#text-only-full-262k-native-context-e8-4-bit-kv-default) for the measured deltas.
+
 For scale: llama.cpp on the same card decodes the Qwen3.8-27B `UD-Q4_K_XL` GGUF at about
 46 tok/s in a 144K-context configuration where the MTP buffers do not fit. The upstream engine
 on an RTX 5090 measures 172 tok/s on the same code-generation prompts with a 400 W power cap
@@ -39,47 +45,57 @@ on an RTX 5090 measures 172 tok/s on the same code-generation prompts with a 400
 
 ### Depth sweep against llama.cpp
 
-Both engines were measured on the same card on 2026-08-15. llama.cpp build 10358 ran
-`llama bench` on the `UD-Q4_K_XL` GGUF (16.68 GiB) with q8_0 KV cache, flash attention, and
-`-ub 1024 -b 4096`, which matches its deployed configuration. NInfer ran the deployed 168K
-serve configuration and was measured through the `/metrics` counters. Two caveats: the
-artifacts differ by about 2% in size, and `llama bench` is a bare kernel loop while the
-NInfer numbers include the full server path.
+Both engines were measured on the same card. llama.cpp build 10358 ran `llama bench` on the
+`UD-Q4_K_XL` GGUF (16.68 GiB) with q8_0 KV cache, flash attention, and `-ub 1024 -b 4096`,
+which matches its deployed configuration, on 2026-08-15. The NInfer side was re-measured on
+2026-08-17 on the deployed E8 262K configuration through the `/metrics` counters; the
+llama.cpp configuration did not change between the dates. Two caveats: the artifacts differ
+by about 2% in size, and `llama bench` is a bare kernel loop while the NInfer numbers
+include the full server path.
 
 Marginal rates at depth:
 
 | Depth | llama.cpp pp2048 | llama.cpp tg32 | NInfer decode, no speculation |
 |---:|---:|---:|---:|
-| 0 | 3,024 tok/s | 45.9 tok/s | 50.5 tok/s |
+| 0 | 3,024 tok/s | 45.9 tok/s | 50.4 tok/s |
 | 32K | 2,327 | 42.0 | - |
 | 64K | 1,866 | 38.6 | - |
-| 128K | 1,336 | 33.1 | 39.6 |
+| 128K | 1,336 | 33.1 | 42.1 |
+| 256K | no entry | no entry | 36.6 |
 
 Wall time to prefill one full prompt (llama.cpp integrated from the marginal rates, NInfer
 measured):
 
 | Prompt | llama.cpp | NInfer |
 |---:|---:|---:|
-| 32K | 12.5 s (2,630 tok/s) | 15.5 s (2,012 tok/s) |
-| 64K | 28.3 s (2,317 tok/s) | 34.4 s (1,849 tok/s) |
-| 128K | 70.4 s (1,862 tok/s) | 82.0 s (1,561 tok/s) |
+| 32K | 12.5 s (2,630 tok/s) | 14.5 s (2,027 tok/s) |
+| 64K | 28.3 s (2,317 tok/s) | 31.7 s (1,857 tok/s) |
+| 128K | 70.4 s (1,862 tok/s) | 74.5 s (1,581 tok/s) |
+| 192K | no entry | 127.9 s (1,381 tok/s) |
+| 256K | no entry | 191.7 s (1,228 tok/s) |
 
 The llama.cpp prefill lead narrows with depth. Server-measured, it prefills a 64K prompt in
-28.7 s against 34.4 s (a 20% lead) and a 128K prompt in 71.6 s against 82.0 s (15%); the
-server path costs llama.cpp 2-4% over the bare-loop estimates above. Decode inverts this.
-NInfer leads by 10% shallow and by 20% at 128K without speculation, and the MTP3 gap grows
-with depth:
+28.7 s against 31.7 s (a 10% lead) and a 128K prompt in 71.6 s against 74.5 s (4%); the
+server path costs llama.cpp 2-4% over the bare-loop estimates above. Everything past its
+144K ceiling is NInfer-only. Decode inverts the shallow picture. NInfer leads by 10%
+shallow and by 27% at 128K without speculation, and the MTP3 gap grows with depth:
 
-| Workload | llama.cpp `draft-mtp` | NInfer MTP3 |
+| Workload | llama.cpp `draft-mtp` | NInfer MTP3 (E8) |
 |---|---:|---:|
-| Code, shallow | 118.8 tok/s at 85.9% acceptance | 148.6 tok/s at 81.0% |
-| Prose, 64K depth | 55.5 tok/s at 45.3% | 85.9 tok/s at 44.6% |
-| Prose, 128K depth | 42.3 tok/s at 45.4% | 77.1 tok/s at 45.6% |
+| Code, shallow | 118.8 tok/s at 85.9% acceptance | 142.9 tok/s at 78.0% |
+| Prose, 64K depth | 55.5 tok/s at 45.3% | 86.1 tok/s at 42.3% |
+| Prose, 128K depth | 42.3 tok/s at 45.4% | 77.5 tok/s at 41.6% |
+| Prose, 256K depth | no entry | 65.4 tok/s at 41.1% |
+| Code, 256K depth | no entry | 91.2 tok/s at 72.1% |
 
-The llama.cpp MTP rows required a reduced 131,584-token context; the draft buffers push VRAM
+The NInfer rows in this table use the 2026-08-17 generated corpora; acceptance on them runs
+a few points below the 2026-08-15 payloads (code 78% against 81%), which accounts for the
+difference from the headline 148.6 tok/s. The llama.cpp MTP rows required a reduced
+131,584-token context; the draft buffers push VRAM
 to 23.8 of 24 GiB, and the deployed 144K llama.cpp configuration cannot fit them at all.
-NInfer serves 172,032 tokens with MTP in the same VRAM. Acceptance matches per content type,
-so the decode gap is engine time, not draft quality.
+NInfer serves 172,032 tokens with MTP in the same VRAM at INT8 KV, and the full native
+262,144 with the E8 4-bit KV default. Acceptance matches per content type, so the decode gap
+is engine time, not draft quality.
 
 Full configurations, method, and raw numbers:
 [NInfer against llama.cpp](docs/llamacpp-comparison.md).
@@ -95,9 +111,34 @@ docker build --tag ninfer-4090:sm89 .
 NINFER_MODEL_DIR="$PWD/models" bash scripts/download-qwen38.sh
 ```
 
-Then start one of the two profiles. The API is available at `http://127.0.0.1:8080/v1`.
+Then start one of the three profiles. The API is available at `http://127.0.0.1:8080/v1`.
 
-### Text-only, 168K context
+### Text-only, full 262K native context (E8 4-bit KV, default)
+
+The E8 Conway-Sloane lattice KV mode (`rk4v4-e8`, ported from
+[UDPSendToFailed/ninfer-4090](https://github.com/UDPSendToFailed/ninfer-4090); see
+[the fork comparison](docs/udp-fork-comparison.md)) fits the model's entire native
+262,144-token context on 24 GB with 1.4 GiB to spare:
+
+```bash
+docker run --rm --gpus all --publish 8080:8080 \
+  --volume "$PWD/models:/workspace/models:ro" \
+  ninfer-4090:sm89 \
+  ninfer-serve models/qwen3_8_27b.ninfer \
+  --host 0.0.0.0 --port 8080 \
+  --max-context 262144 --kv-capacity 262144 \
+  --max-concurrency 1 --max-pending-requests 16 \
+  --prefill-chunk 1024 --kv-dtype rk4v4-e8 \
+  --spec mtp --draft-tokens 3 --lm-head-draft \
+  --preserve-thinking
+```
+
+Measured against INT8 KV on this build: identical MTP acceptance at 111K depth
+(78.8% vs 78.4%), a 5.7% decode tax (126.6 vs 134.2 tok/s on a shallow greedy code
+probe), prefill within 1-2% at matched depth, and exact single-needle, 5-needle, and
+code-detail retrieval through 260K tokens.
+
+### Text-only, 168K context (INT8 KV, maximum precision)
 
 ```bash
 docker run --rm --gpus all --publish 8080:8080 \
@@ -129,17 +170,23 @@ docker run --rm --gpus all --publish 8080:8080 \
 
 ### The tradeoff
 
-Vision and maximum context trade against each other on a 24 GB card:
+KV precision, vision, and maximum context trade against each other on a 24 GB card:
 
-| Profile | Context | Startup VRAM |
-|---|---:|---:|
-| Text-only, MTP3 | 172032 (168K) | 23.9 GiB |
-| With `--vision`, MTP3 | 98304 (96K) | 23.5 GiB |
+| Profile | KV mode | Context | KV runtime | Startup slack |
+|---|---|---:|---:|---:|
+| Text-only, MTP3 | `rk4v4-e8` | 262144 (256K) | 5.08 GiB | 1.37 GiB |
+| Text-only, MTP3 | `rk2v4-e8` | 262144 (256K) | 4.01 GiB | 2.43 GiB |
+| Text-only, MTP3 | `int8` | 172032 (168K) | 6.31 GiB | 136 MiB |
+| With `--vision`, MTP3 | `int8` | 98304 (96K) | - | ~1 GiB |
 
-Dropping vision buys about 72K more tokens of context at INT8 KV. The text-only ceiling is near
-176K: 172032 starts, and 196608 is rejected at startup with a byte-exact deficit. The server
-validates memory before it listens, so an oversized context fails fast instead of at request
-time.
+262,144 is the model's own context limit, so `rk2v4-e8` (2-bit keys, 96.2% cosine)
+buys no additional context over `rk4v4-e8` here - only slack, which may matter for a
+future vision-plus-long-context profile. It passes the same retrieval gates
+(single-needle at 260K, 5-needle at 118K, exact code details at 168K) at a 10%
+decode tax (120.5 tok/s on the shallow code probe). The INT8 text-only ceiling is
+near 176K: 172032 starts, and 196608 is rejected at startup with a byte-exact
+deficit. The server validates memory before it listens, so an oversized context
+fails fast instead of at request time.
 
 For a native build, follow the [Linux build guide](docs/rtx-3090-linux.md) with
 `CMAKE_CUDA_ARCHITECTURES=89` (the default in this fork). The build requires CUDA 12.8 or newer,
@@ -172,6 +219,13 @@ GCC 13, and CMake 3.28 or newer; the Docker image builds with CUDA 13.1.
   mid-flight and reported as zero.
 - **NVFP4-A4 test gating.** The A4 activation tests skip on hardware without FP4 tensor cores
   instead of aborting. The full remaining suite passes on the RTX 4090.
+- **E8 lattice KV quantization (ported).** The `rk8v4`/`rk4v4`/`rk4v4-e8`/`rk2v4-e8` KV modes
+  and the 262K-to-1M visible-keys envelope lift from the
+  [UDPSendToFailed/ninfer-4090](https://github.com/UDPSendToFailed/ninfer-4090) sibling fork,
+  merged under this fork's retuned `sm_89` attention prefill schedule. The E8 codec verifies
+  bit-exactly against the upstream microbenchmark (96.155% / 98.678% cosine); their 1 GiB
+  CUDA-graph allowance bump was deliberately not taken (it would evict the INT8 168K profile).
+  Method and measurements in [docs/udp-fork-comparison.md](docs/udp-fork-comparison.md).
 
 ## Known limits on the RTX 4090
 
@@ -220,6 +274,12 @@ JSONL request logs. See [HTTP serving](docs/serving.md) and [CLI usage](docs/cli
 - [Don-Chad/ninfer-3090](https://github.com/Don-Chad/ninfer-3090) - the SM86 compatibility layer,
   ReplaySSM integration, and Qwen3.8 runtime support this fork builds on. Its
   [v0.6.1 release notes](RELEASE_NOTES_0.6.1.md) describe the inherited state.
+- [UDPSendToFailed/ninfer-4090](https://github.com/UDPSendToFailed/ninfer-4090) - a sibling
+  RTX 4090 port from the same 3090 base. The rotated and E8-lattice KV-cache quantization
+  modes (`rk8v4`, `rk4v4`, `rk4v4-e8`, `rk2v4-e8`), the E8 codecs, and the 1M visible-keys
+  envelope are their work, cherry-picked here with authorship preserved. The full 262K
+  default profile exists because of it; see
+  [the fork comparison](docs/udp-fork-comparison.md).
 - [jram4/ninfer-4090](https://github.com/jram4/ninfer-4090) - an earlier RTX 4090 port of a July
   2026 snapshot. Its Ada dispatch tuning targets a kernel organization that upstream has since
   replaced, so this fork starts from the current 3090 base instead.
