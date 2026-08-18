@@ -152,7 +152,7 @@ dropping, stochastic routing, or auxiliary-loss term in the forward pass.
 | Vision LayerNorm epsilon | `1e-6` |
 | deep-stack injection layers | none |
 
-The Vision backbone geometry matches Qwen3.6-27B, but its merger is checkpoint-specific and emits
+The Vision backbone geometry matches Qwen3.8-27B, but its merger is checkpoint-specific and emits
 width 2048 rather than 5120. `deepstack_visual_indexes` is empty and the checkpoint contains no
 deep-stack merger weights.
 
@@ -796,7 +796,7 @@ The first five layers may use 4096-slot cyclic K/V storage, but a proposal query
 last 4095 committed context positions according to its absolute position; a retained row at
 distance 4096 is outside the mask. These caches do not grow with total context.
 
-The Program freezes its feature set and memory plan at startup. The Qwen3.6 family computes named
+The Program freezes its feature set and memory plan at startup. The Qwen3.8 family computes named
 Text, MTP, DFlash, and Vision phase capacities from the configured finite execution domains and
 reserves their maximum as one pure scratch arena; sequential phases and scoped child Ops reuse the
 same addresses. DFlash target features and positions survive between target verification and
@@ -930,8 +930,8 @@ The registered implementation maps these concerns as follows:
 | exact 2048-wide dimensions, 40-layer topology, limits, scales, and option facts | `src/targets/qwen3_6_35b_a3b/impl/config.h` |
 | exact 934-tensor/six-resource binding, conditional residency, and immutable Text/MTP/Vision/MoE/DFlash views | `src/targets/qwen3_6_35b_a3b/impl/load/` |
 | fused attention projection, fused staged GDN projection/control, sparse-MoE post-mixer leaves, leaf workspace, and graph frontier ranges | `src/targets/qwen3_6_35b_a3b/impl/variant.h`, `impl/variant.cpp` |
-| fixed Text/MTP/Vision/DFlash execution, planning, Program lifecycle, workspace composition, prefix/state transactions, speculative verification/acceptance, and graph mechanics | `src/targets/qwen3_6/impl/runtime/` |
-| tokenizer, template, multimodal processing, and output decoding | `src/targets/qwen3_6/impl/frontend/` |
+| fixed Text/MTP/Vision/DFlash execution, planning, Program lifecycle, workspace composition, prefix/state transactions, speculative verification/acceptance, and graph mechanics | `src/targets/qwen3_8/impl/runtime/` |
+| tokenizer, template, multimodal processing, and output decoding | `src/targets/qwen3_8/impl/frontend/` |
 | mathematical and explicit local-state Op contracts/implementations | `include/ninfer/ops/`, `src/ops/` |
 | fixed all-layer GDN state pool, ReplaySSM record arena, and Fold contract | `src/core/linear_attention_state.*`, `src/core/gdn_replay_records.*`, `include/ninfer/ops/gdn_replay.h`, `src/ops/linear_attention/gated_delta_net/replay.cpp` |
 | exact artifact and converter | [`qwen3.6-35b-a3b-artifact.md`](qwen3.6-35b-a3b-artifact.md), `tools/convert/qwen3_6_35b_a3b/` |

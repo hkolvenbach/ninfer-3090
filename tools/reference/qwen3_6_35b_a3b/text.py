@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import torch
 
-from tools.reference.qwen3_6.common.tap import NullTap
+from tools.reference.qwen3_8.common.tap import NullTap
 
 from .config import CFG
 from .moe import forward as sparse_moe

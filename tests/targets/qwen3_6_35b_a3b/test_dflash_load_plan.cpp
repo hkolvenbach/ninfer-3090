@@ -16,7 +16,7 @@ std::filesystem::path artifact_path() {
     return std::filesystem::path(NINFER_SOURCE_DIR) / "out/qwen3_6_35b_a3b.ninfer";
 }
 
-ninfer::targets::qwen3_6::StartupFeatures load_features(bool dflash) {
+ninfer::targets::qwen3_8::StartupFeatures load_features(bool dflash) {
     return {
         .vision = !dflash,
         .speculative =

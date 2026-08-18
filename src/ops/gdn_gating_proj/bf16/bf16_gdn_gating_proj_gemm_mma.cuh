@@ -2,8 +2,8 @@
 
 // SM120 BF16 GDN gating projection for the two exact registered geometries:
 //
-//   Qwen3.6-27B:     a/b = W[48,5120] @ x[5120,T]
-//   Qwen3.6-35B-A3B: a/b = W[32,2048] @ x[2048,T]
+//   Qwen3.8-27B:     a/b = W[48,5120] @ x[5120,T]
+//   qwen3.6-35b-a3b: a/b = W[32,2048] @ x[2048,T]
 //
 // A CTA computes the same 16 output rows from both weights over 128 (27B) or
 // 64 (35B) tokens.

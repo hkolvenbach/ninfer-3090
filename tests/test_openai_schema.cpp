@@ -102,10 +102,10 @@ Json parse_sse(const std::string& event) {
 
 int test_parse_string_content() {
     int failures                = 0;
-    const Json body             = {{"model", "qwen3.6-27b"},
+    const Json body             = {{"model", "qwen3.8-27b"},
                                    {"messages", Json::array({Json{{"role", "user"}, {"content", "hello"}}})}};
     const GenerationRequest req = parse_chat_completion_request(body, default_limits());
-    failures += check(req.model == "qwen3.6-27b", "model parsed");
+    failures += check(req.model == "qwen3.8-27b", "model parsed");
     failures += check(req.messages.size() == 1, "one message parsed");
     failures += check(req.messages[0].role == "user", "role parsed");
     failures += check(req.messages[0].content.size() == 1, "one content part");
@@ -793,15 +793,15 @@ int test_tool_chunk_serialization() {
 
 int test_models_and_error() {
     int failures    = 0;
-    const Json list = Json::parse(make_models_list("qwen3.6-27b", 1, 65536));
+    const Json list = Json::parse(make_models_list("qwen3.8-27b", 1, 65536));
     failures += check(list.at("object") == "list", "models list object");
-    failures += check(list.at("data").at(0).at("id") == "qwen3.6-27b", "models list id");
+    failures += check(list.at("data").at(0).at("id") == "qwen3.8-27b", "models list id");
     failures += check(list.at("data").at(0).at("object") == "model", "models list entry object");
     failures += check(list.at("data").at(0).at("owned_by") == "ninfer", "models list owner");
     failures += check(list.at("data").at(0).at("context_window") == 65536, "models list context");
 
-    const Json one = Json::parse(make_model_object("qwen3.6-27b", 1, 65536));
-    failures += check(one.at("id") == "qwen3.6-27b" && one.at("object") == "model", "model object");
+    const Json one = Json::parse(make_model_object("qwen3.8-27b", 1, 65536));
+    failures += check(one.at("id") == "qwen3.8-27b" && one.at("object") == "model", "model object");
     failures += check(one.at("owned_by") == "ninfer", "model owner");
     failures += check(one.at("context_window") == 65536, "model object context");
 

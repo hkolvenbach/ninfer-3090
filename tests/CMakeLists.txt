@@ -69,9 +69,15 @@ ninfer_add_test(ninfer_sampling_defaults_test
   SOURCES test_sampling_defaults.cpp
   LIBRARIES ninfer_engine)
 target_include_directories(ninfer_sampling_defaults_test PRIVATE
-  ${PROJECT_SOURCE_DIR}/src/targets/qwen3_6/export
-  ${PROJECT_SOURCE_DIR}/src/targets/qwen3_8_27b/export
-  ${PROJECT_SOURCE_DIR}/src/targets/qwen3_6_35b_a3b/export)
+  ${PROJECT_SOURCE_DIR}/src/targets/qwen3_8/export)
+if(NINFER_BUILD_QWEN3_8_27B)
+  target_include_directories(ninfer_sampling_defaults_test PRIVATE
+    ${PROJECT_SOURCE_DIR}/src/targets/qwen3_8_27b/export)
+endif()
+if(NINFER_BUILD_QWEN3_6_35B_A3B)
+  target_include_directories(ninfer_sampling_defaults_test PRIVATE
+    ${PROJECT_SOURCE_DIR}/src/targets/qwen3_6_35b_a3b/export)
+endif()
 ninfer_add_test(ninfer_kv_cache_test
   SOURCES test_kv_cache.cpp
   LIBRARIES ninfer_core)
@@ -91,19 +97,20 @@ set_tests_properties(
   ninfer_state_store_test
   PROPERTIES SKIP_RETURN_CODE 77)
 # Family frontend and one opt-in real-artifact prefix/MTP integration test.
-ninfer_add_test(ninfer_qwen3_6_frontend_test
-  SOURCES targets/qwen3_6/test_frontend.cpp
+ninfer_add_test(ninfer_qwen3_8_frontend_test
+  SOURCES targets/qwen3_8/test_frontend.cpp
   NEEDS_SOURCE_DIR
   LIBRARIES ninfer_engine ninfer_core)
-target_include_directories(ninfer_qwen3_6_frontend_test PRIVATE
-  ${PROJECT_SOURCE_DIR}/src/targets/qwen3_6/export
-  ${PROJECT_SOURCE_DIR}/src/targets/qwen3_6/impl)
-ninfer_add_test(ninfer_qwen3_6_runtime_mechanisms_test
-  SOURCES targets/qwen3_6/test_runtime_mechanisms.cpp
+target_include_directories(ninfer_qwen3_8_frontend_test PRIVATE
+  ${PROJECT_SOURCE_DIR}/src/targets/qwen3_8/export
+  ${PROJECT_SOURCE_DIR}/src/targets/qwen3_8/impl)
+ninfer_add_test(ninfer_qwen3_8_runtime_mechanisms_test
+  SOURCES targets/qwen3_8/test_runtime_mechanisms.cpp
   LIBRARIES ninfer_engine ninfer_core)
-target_include_directories(ninfer_qwen3_6_runtime_mechanisms_test PRIVATE
-  ${PROJECT_SOURCE_DIR}/src/targets/qwen3_6/export)
-ninfer_add_test(ninfer_qwen3_8_27b_prefix_real_test
+target_include_directories(ninfer_qwen3_8_runtime_mechanisms_test PRIVATE
+  ${PROJECT_SOURCE_DIR}/src/targets/qwen3_8/export)
+if(NINFER_BUILD_QWEN3_8_27B)
+  ninfer_add_test(ninfer_qwen3_8_27b_prefix_real_test
   SOURCES targets/qwen3_8_27b/test_engine_prefix_real.cpp
   LIBRARIES ninfer_engine)
 set_tests_properties(ninfer_qwen3_8_27b_prefix_real_test PROPERTIES SKIP_RETURN_CODE 77)
@@ -112,11 +119,13 @@ ninfer_add_test(ninfer_qwen3_8_27b_load_plan_test
   NEEDS_SOURCE_DIR
   LIBRARIES ninfer_engine)
 target_include_directories(ninfer_qwen3_8_27b_load_plan_test PRIVATE
-  ${PROJECT_SOURCE_DIR}/src/targets/qwen3_6/export
+  ${PROJECT_SOURCE_DIR}/src/targets/qwen3_8/export
   ${PROJECT_SOURCE_DIR}/src/targets/qwen3_8_27b/export)
 target_link_libraries(ninfer_qwen3_8_27b_load_plan_test PRIVATE CUDA::cudart)
-set_tests_properties(ninfer_qwen3_8_27b_load_plan_test PROPERTIES SKIP_RETURN_CODE 77)
-ninfer_add_test(ninfer_qwen3_6_35b_a3b_real_test
+  set_tests_properties(ninfer_qwen3_8_27b_load_plan_test PROPERTIES SKIP_RETURN_CODE 77)
+endif()
+if(NINFER_BUILD_QWEN3_6_35B_A3B)
+  ninfer_add_test(ninfer_qwen3_6_35b_a3b_real_test
   SOURCES targets/qwen3_6_35b_a3b/test_engine_real.cpp
   LIBRARIES ninfer_engine)
 set_tests_properties(ninfer_qwen3_6_35b_a3b_real_test PROPERTIES SKIP_RETURN_CODE 77)
@@ -129,11 +138,12 @@ ninfer_add_test(ninfer_qwen3_6_35b_a3b_dflash_load_plan_test
   NEEDS_SOURCE_DIR
   LIBRARIES ninfer_engine)
 target_include_directories(ninfer_qwen3_6_35b_a3b_dflash_load_plan_test PRIVATE
-  ${PROJECT_SOURCE_DIR}/src/targets/qwen3_6/export
+  ${PROJECT_SOURCE_DIR}/src/targets/qwen3_8/export
   ${PROJECT_SOURCE_DIR}/src/targets/qwen3_6_35b_a3b/export)
 target_link_libraries(ninfer_qwen3_6_35b_a3b_dflash_load_plan_test PRIVATE CUDA::cudart)
 set_tests_properties(ninfer_qwen3_6_35b_a3b_dflash_load_plan_test
   PROPERTIES SKIP_RETURN_CODE 77)
+endif()
 
 # Product protocol contracts.
 ninfer_add_test(ninfer_openai_schema_test
@@ -166,12 +176,14 @@ ninfer_add_test(ninfer_serve_options_test
 ninfer_add_test(ninfer_request_log_test
   SOURCES test_request_log.cpp
   LIBRARIES ninfer_serve)
-ninfer_add_test(ninfer_bench_support_test
+if(NINFER_BUILD_QWEN3_8_27B)
+  ninfer_add_test(ninfer_bench_support_test
   SOURCES test_ninfer_bench_support.cpp
           ${PROJECT_SOURCE_DIR}/bench/targets/qwen3_8_27b/ninfer_bench_support.cpp
   NEEDS_SOURCE_DIR
   LIBRARIES ninfer_engine)
 target_include_directories(ninfer_bench_support_test PRIVATE ${PROJECT_SOURCE_DIR}/bench/targets/qwen3_8_27b)
+endif()
 
 # Shared Op numerical tests. Target-composed schedule tests are registered separately below.
 set(ninfer_op_tests
@@ -292,10 +304,12 @@ ninfer_add_fused_linear_test(
   ops/linear_swiglu/test_nvfp4.cpp
   ops/linear_swiglu/linear_swiglu_test_common.cpp)
 
-ninfer_add_test(ninfer_qwen3_8_27b_visual_scatter_test
+if(NINFER_BUILD_QWEN3_8_27B)
+  ninfer_add_test(ninfer_qwen3_8_27b_visual_scatter_test
   SOURCES targets/qwen3_8_27b/test_visual_scatter.cpp
   LIBRARIES ninfer_engine ninfer_core)
-set_tests_properties(ninfer_qwen3_8_27b_visual_scatter_test PROPERTIES SKIP_RETURN_CODE 77)
+  set_tests_properties(ninfer_qwen3_8_27b_visual_scatter_test PROPERTIES SKIP_RETURN_CODE 77)
+endif()
 
 # Isolated E8 Lattice Tensor Core KV Codec Testbed
 add_executable(ninfer_test_e8_codec
@@ -310,12 +324,9 @@ set_target_properties(ninfer_test_e8_codec PROPERTIES CUDA_ARCHITECTURES "89")
 
 # These tests deliberately compile against the exact target's internal contracts; the target does
 # not export impl/ to ordinary consumers.
-set(ninfer_qwen3_8_27b_internal_tests
-  ninfer_qwen3_8_27b_visual_scatter_test)
-foreach(test_target IN LISTS ninfer_qwen3_8_27b_internal_tests)
-  target_include_directories(${test_target} PRIVATE
+if(NINFER_BUILD_QWEN3_8_27B)
+  target_include_directories(ninfer_qwen3_8_27b_visual_scatter_test PRIVATE
     ${PROJECT_SOURCE_DIR}/src/targets/qwen3_8_27b/impl
     ${PROJECT_SOURCE_DIR}/src/targets/qwen3_8_27b/export
-    ${PROJECT_SOURCE_DIR}/src/targets/qwen3_6/export)
-endforeach()
-
+    ${PROJECT_SOURCE_DIR}/src/targets/qwen3_8/export)
+endif()

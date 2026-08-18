@@ -276,7 +276,7 @@ workspace 或 graph。当前 fixed-state backing 是 lane-affine 的：retained 
 capacity 时可以先驱逐其他 free lanes 上的 retained state。新 request 的 sampling、RNG、stop 和 output
 state 始终重新创建。
 
-Qwen3.6 的 lane 是 Linear Attention state 的唯一 locator。`C=max_concurrency` 时，shared pool 固定使用
+Qwen3.8 的 lane 是 Linear Attention state 的唯一 locator。`C=max_concurrency` 时，shared pool 固定使用
 `[0,C)` 作为各 lane 的 current committed state，使用 `[C,2C)` 作为各 lane 的 turn-checkpoint
 checkpoint；一份 slot 同时选择全部 GDN layers 的 convolution history 和 recurrent state。Decode round
 不在 `SequenceState` 中维护随 speculative position 变化的 state selector。
@@ -477,7 +477,7 @@ service work = known Text/Vision suffix-prefill and finalization work
 
 Output 部分使用声明的 finite effective output bound，不预测 prompt 内容、reasoning difficulty 或实际 EOS。
 Prefill 部分使用已经 bounded 的 target scheduling-unit profiles；短 output 不能抵消任意长的 Text/Vision
-prefill。当前 Qwen3.6 profile 以 externally scheduled prefill/finalization steps 的有限上界作为 prefill
+prefill。当前 Qwen3.8 profile 以 externally scheduled prefill/finalization steps 的有限上界作为 prefill
 quanta，并把每个 effective remaining output token 计为一个 decode quantum；prompt snapshot 和 Vision item
 造成的已知 prefill split 在 planning 时计入。Selected speculative backend 可以影响 target 的统一 work
 projection，但不会在 Scheduler 中产生 MTP/DFlash policy branches。
@@ -689,7 +689,7 @@ block-table 和 allocator 的 contract 属于 Paged KV Context Store，不在本
 
 Retained prefix 是从已结束 request 中分离出来的、单一 owner 的 SequenceState。它留在原 physical lane，
 但该 lane 的 control slot 对 scheduler 是 free。Retained state 只发布 target 已保存完整 continuation state
-的 checkpoints。当前 Qwen3.6 retained state 可以发布 current
+的 checkpoints。当前 Qwen3.8 retained state 可以发布 current
 resume frontier，以及一份有效时的 turn checkpoint。两者引用同一份 KV allocation；turn checkpoint
 额外保存对应的 recurrent、hidden、speculative-backend 和 position state，
 不复制 KV payload。
@@ -865,7 +865,7 @@ SamplingConfig[B] + logical sampling positions[B]
 sampled_tokens[B]
 ```
 
-`lanes[b]` 是 row `b` 的 stable execution lane。Qwen3.6 用它同时选择 Linear Attention current state 和
+`lanes[b]` 是 row `b` 的 stable execution lane。Qwen3.8 用它同时选择 Linear Attention current state 和
 continuation-hidden destination；speculative Fold 也从 frozen membership 取得同一个 lane。KV table row
 保持独立，因为它描述 paged allocation binding，不是 fixed-state ownership。
 
@@ -920,7 +920,7 @@ Host 可以对 `B<=C` 的 metadata 做轻量循环，但 GPU ingress 必须是 b
 ### 8.4 Ordinary round state transaction
 
 一个 `DECODE_READY` sequence 始终保存 target-defined committed cursor 和唯一 current decode anchor。以
-Qwen3.6 的 ordinary transition 为例：
+Qwen3.8 的 ordinary transition 为例：
 
 ```text
 before:
@@ -947,7 +947,7 @@ Ordinary round 对每个未取消 row 恰好 license 一个 token。EOS、stop �
 成为 terminal token，但不把同一 row 的 model state 与 output 截在不同 frontier。Cancellation 是唯一可以
 丢弃整行 provisional result 的 ordinary boundary outcome；该 `SequenceState` 随即释放。
 
-Qwen3.6 ordinary GDN 以 `initial_state_slots=lanes`、`snapshot_base_slots=lanes` 调用已有 width-1 Snapshot
+Qwen3.8 ordinary GDN 以 `initial_state_slots=lanes`、`snapshot_base_slots=lanes` 调用已有 width-1 Snapshot
 leaf。该 leaf 在完整读取 row 的 initial checkpoint 后原地覆盖同一 current slot，因此不产生 speculative
 trajectory，也不需要额外 state slot。
 
@@ -1197,7 +1197,7 @@ Engine capability 在 startup 时固定。MTP Engine 可以同时启用 Vision�
 verification、重放 model 或形成 acceptance cohort。Target model 始终是 output authority，只有 accepted
 target/backend state 可以 commit。
 
-Qwen3.6 的 MTP 与 DFlash 共用同一 target ReplaySSM transaction：target verify 按 compact row 把每层
+Qwen3.8 的 MTP 与 DFlash 共用同一 target ReplaySSM transaction：target verify 按 compact row 把每层
 convolution/key/value/gate records 写入固定 arena，physical record row 恒等于本轮 batch row；CPU 得到
 最终 output prefix 后，一次 Fold 用 frozen `lanes[b]` 把 row `b` 提交到该 lane 的 current state。Rows
 不得因取消或不同 acceptance length 被压缩、重排。Record 位于 CUDA Graph 内，Fold 位于 CPU 决策后的
@@ -1393,5 +1393,5 @@ admission。Later arrivals 从未成为 H 的 donor，也不能恢复已消费�
 - [Paged KV context storage](paged-kv-cache.md)
 - [ReplaySSM GDN technical reference](replayssm-gdn.md)
 - [Serving behavior](../serving.md)
-- [Qwen3.6-27B model semantics](qwen3.6-27b-model.md)
+- [Qwen3.8-27B model semantics](qwen3.8-27b-model.md)
 - [Qwen3.6-35B-A3B model semantics](qwen3.6-35b-a3b-model.md)

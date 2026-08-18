@@ -5,7 +5,7 @@ from __future__ import annotations
 from pathlib import Path
 
 from tools.convert.common.safetensors import ShardReader
-from tools.convert.qwen3_6.common.recipe import (
+from tools.convert.qwen3_8.common.recipe import (
     Cast,
     Concat,
     DraftHeadTokenIds,

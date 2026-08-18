@@ -18,6 +18,16 @@ project(ninfer LANGUAGES C CXX CUDA)
 option(NINFER_BUILD_APPS "Build the NInfer CLI and server" ON)
 option(BUILD_TESTING "Build NInfer tests" OFF)
 option(NINFER_BUILD_BENCHMARKS "Build NInfer benchmarks" OFF)
+option(NINFER_BUILD_QWEN3_8_27B "Build the Qwen3.8-27B target package" ON)
+option(NINFER_BUILD_QWEN3_6_35B_A3B "Build the Qwen3.6-35B-A3B target package" OFF)
+
+if(NOT NINFER_BUILD_QWEN3_8_27B AND NOT NINFER_BUILD_QWEN3_6_35B_A3B)
+  message(FATAL_ERROR "At least one NInfer target package must be enabled")
+endif()
+
+add_compile_definitions(
+  NINFER_BUILD_QWEN3_8_27B=$<BOOL:${NINFER_BUILD_QWEN3_8_27B}>
+  NINFER_BUILD_QWEN3_6_35B_A3B=$<BOOL:${NINFER_BUILD_QWEN3_6_35B_A3B}>)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)

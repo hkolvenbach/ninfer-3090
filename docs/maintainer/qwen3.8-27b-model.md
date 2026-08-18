@@ -436,16 +436,16 @@ complete artifact inventory is still validated before these resident views are p
 
 | Model concern | Source |
 |---|---|
-| exact dimensions/layer counts and family hybrid-layer mapping | `src/targets/qwen3_8_27b/impl/config.h`, `src/targets/qwen3_6/export/ninfer/targets/qwen3_6/hybrid_topology.h` |
+| exact dimensions/layer counts and family hybrid-layer mapping | `src/targets/qwen3_8_27b/impl/config.h`, `src/targets/qwen3_8/export/ninfer/targets/qwen3_8/hybrid_topology.h` |
 | immutable Text/MTP/Vision bindings | `src/targets/qwen3_8_27b/impl/load/` |
 | split attention projection, staged GDN projection/control, dense post-mixer leaves, leaf workspace, and graph frontier ranges | `src/targets/qwen3_8_27b/impl/variant.h`, `impl/variant.cpp` |
-| Text/MTP/Vision execution, planning, Program lifecycle, workspace composition, prefix/state transactions, and graph mechanics | `src/targets/qwen3_6/impl/runtime/` |
-| tokenizer, template, multimodal processing, output decoder | `src/targets/qwen3_6/impl/frontend/` |
+| Text/MTP/Vision execution, planning, Program lifecycle, workspace composition, prefix/state transactions, and graph mechanics | `src/targets/qwen3_8/impl/runtime/` |
+| tokenizer, template, multimodal processing, output decoder | `src/targets/qwen3_8/impl/frontend/` |
 | mathematical and explicit local-state Op contracts/implementations | `include/ninfer/ops/`, `src/ops/` |
 | growing GQA paged cache pools, allocations, and per-layer views | `src/core/paged_kv_cache.*` |
-| GDN layout/views/reset/copy and Text/MTP/GDN composition | `src/targets/qwen3_6/export/ninfer/targets/qwen3_6/decoder_state.h`, `src/targets/qwen3_6/impl/state/decoder_state.cpp` |
+| GDN layout/views/reset/copy and Text/MTP/GDN composition | `src/targets/qwen3_8/export/ninfer/targets/qwen3_8/decoder_state.h`, `src/targets/qwen3_8/impl/state/decoder_state.cpp` |
 | fixed all-layer GDN state pool, ReplaySSM record arena, and Fold contract | `src/core/linear_attention_state.*`, `src/core/gdn_replay_records.*`, `include/ninfer/ops/gdn_replay.h`, `src/ops/linear_attention/gated_delta_net/replay.cpp` |
-| generated-round buffer schema, MTP alignment, and Vision control | `src/targets/qwen3_6/export/ninfer/targets/qwen3_6/`, `src/targets/qwen3_6/impl/state/round_state.cpp`, `src/targets/qwen3_6/impl/vision/control.cpp` |
+| generated-round buffer schema, MTP alignment, and Vision control | `src/targets/qwen3_8/export/ninfer/targets/qwen3_8/`, `src/targets/qwen3_8/impl/state/round_state.cpp`, `src/targets/qwen3_8/impl/vision/control.cpp` |
 | `.ninfer` tensor assignment and binding | [`qwen3.8-27b-artifact.md`](qwen3.8-27b-artifact.md), `tools/reference/qwen3_8_27b/bindings.py` |
 | native `.ninfer` converter and verifier | `tools/convert/qwen3_8_27b` |
 | artifact-native Python Text/Vision/MTP reference | `tools/reference/qwen3_8_27b` |

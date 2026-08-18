@@ -26,8 +26,8 @@ import torch
 from tools.artifact.container import ArtifactIdentity, ArtifactObject, ArtifactWriter
 from tools.convert.common.quantize import pick_device
 from tools.convert.common.safetensors import ShardReader
-from tools.convert.qwen3_6.common import conversion as family_conversion
-from tools.convert.qwen3_6.common import official_resources
+from tools.convert.qwen3_8.common import conversion as family_conversion
+from tools.convert.qwen3_8.common import official_resources
 
 from . import draft_head, inventory, recipe
 

@@ -8,9 +8,9 @@ from typing import Callable, Iterable
 
 import torch
 
-from tools.reference.qwen3_6.common.multimodal import MultimodalBatch
-from tools.reference.qwen3_6.common.sampling import Sampler
-from tools.reference.qwen3_6.common.tap import NullTap
+from tools.reference.qwen3_8.common.multimodal import MultimodalBatch
+from tools.reference.qwen3_8.common.sampling import Sampler
+from tools.reference.qwen3_8.common.tap import NullTap
 
 from . import mtp as mtp_schedule
 from .bindings import ArtifactBinding, RowAddressable, WeightObject

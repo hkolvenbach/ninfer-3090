@@ -10,10 +10,10 @@ from typing import Sequence
 
 import torch
 
-from tools.reference.qwen3_6.common.frontend import Frontend
-from tools.reference.qwen3_6.common.multimodal import MultimodalBatch, load_messages
-from tools.reference.qwen3_6.common.sampling import Sampler, SamplingConfig
-from tools.reference.qwen3_6.common.tap import FileTap
+from tools.reference.qwen3_8.common.frontend import Frontend
+from tools.reference.qwen3_8.common.multimodal import MultimodalBatch, load_messages
+from tools.reference.qwen3_8.common.sampling import Sampler, SamplingConfig
+from tools.reference.qwen3_8.common.tap import FileTap
 
 from .bindings import ArtifactBinding
 from .config import CFG

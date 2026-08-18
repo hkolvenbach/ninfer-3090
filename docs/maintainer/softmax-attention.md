@@ -137,9 +137,9 @@ scale 隐藏在 Vision、Text 或某个 kernel 名称中。
 
 | 使用位置 | geometry | cache/布局 | 迁移后 entry |
 |---|---:|---|---|
-| Qwen3.6-27B Text/MTP | `D256/Hq24/Hkv4` | BF16 或 INT8-G64 线性 cache | `causal_softmax_attention` |
+| Qwen3.8-27B Text/MTP | `D256/Hq24/Hkv4` | BF16 或 INT8-G64 线性 cache | `causal_softmax_attention` |
 | Qwen3.6-35B-A3B Text/MTP | `D256/Hq16/Hkv2` | BF16 或 INT8-G64 线性 cache | `causal_softmax_attention` |
-| Qwen3.6 Vision | `D72/Hq16/Hkv16` | packed BF16 Q/K/V | `packed_softmax_attention` |
+| Qwen3.8 Vision | `D72/Hq16/Hkv16` | packed BF16 Q/K/V | `packed_softmax_attention` |
 | Qwen3.6-35B-A3B DFlash full | `D128/Hq32/Hkv8` | 只读 BF16 context + query K/V | `context_softmax_attention` |
 | Qwen3.6-35B-A3B DFlash local | `D128/Hq32/Hkv8` | 只读 BF16 cyclic context + query K/V | `sliding_window_attention` |
 
@@ -471,11 +471,11 @@ source 或同时维护的新旧测试。
 
 | 调用方 | 迁移 |
 |---|---|
-| `src/targets/qwen3_6/impl/runtime/text_context_impl.h` | include `softmax_attention.h`；Text/MTP 调用 `causal_softmax_attention` 或 `_cached`；standalone cache 写调用 `kv_cache_append` |
-| `src/targets/qwen3_6/impl/runtime/layouts_impl.h` | capacity 查询改用 geometry 和新 entry 名称 |
-| `src/targets/qwen3_6/impl/runtime/vision_context_impl.h` | include `softmax_attention.h`；调用 `packed_softmax_attention`，不向 Op 传递 Vision 身份 |
-| `src/targets/qwen3_6/impl/runtime/dflash_impl.h` | full route 调用 `context_softmax_attention`；local route 调用 `sliding_window_attention` |
-| `src/targets/qwen3_6/impl/runtime/workspace_recipe.h` | target-local region 名可保留模型含义；Op capacity 和 shape 使用统一 geometry |
+| `src/targets/qwen3_8/impl/runtime/text_context_impl.h` | include `softmax_attention.h`；Text/MTP 调用 `causal_softmax_attention` 或 `_cached`；standalone cache 写调用 `kv_cache_append` |
+| `src/targets/qwen3_8/impl/runtime/layouts_impl.h` | capacity 查询改用 geometry 和新 entry 名称 |
+| `src/targets/qwen3_8/impl/runtime/vision_context_impl.h` | include `softmax_attention.h`；调用 `packed_softmax_attention`，不向 Op 传递 Vision 身份 |
+| `src/targets/qwen3_8/impl/runtime/dflash_impl.h` | full route 调用 `context_softmax_attention`；local route 调用 `sliding_window_attention` |
+| `src/targets/qwen3_8/impl/runtime/workspace_recipe.h` | target-local region 名可保留模型含义；Op capacity 和 shape 使用统一 geometry |
 
 Family schedule 仍决定何时调用 full、local、Vision 或 MTP 路径；Op wrapper 不读取 layer role
 或 target Variant。

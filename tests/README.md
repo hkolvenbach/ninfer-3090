@@ -15,10 +15,10 @@ benchmark-report, and external protocol behavior. Repository verification princi
 - `ops/linear_add/`, `ops/linear_pair/`, `ops/linear_swiglu/` — fused-Op suites split by registered
   weight/activation profile, each evaluating its complete formula rather than composing production
   Ops;
-- `targets/qwen3_6/` — shared tokenizer/template, multimodal preprocessing, MRoPE, prepared-prompt,
+- `targets/qwen3_8/` — shared tokenizer/template, multimodal preprocessing, MRoPE, prepared-prompt,
   stop/output decoding, hybrid topology, decoder/GDN and round-state layouts/views, shifted-MTP
   alignment, Vision control, and family runtime mechanisms;
-- `targets/qwen3_6_27b/` — registered inventory, converter recipe, source verifier, artifact
+- `targets/qwen3_8_27b/` — registered inventory, converter recipe, source verifier, artifact
   bindings, reference diagnostics, family Program/multimodal/MTP behavior, and the opt-in real-Engine
   prefix test;
 - `targets/qwen3_6_35b_a3b/` — registered inventory/converter contracts, artifact-native diagnostic
@@ -56,6 +56,10 @@ cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTING=ON
 cmake --build build --parallel
 ctest --test-dir build --output-on-failure
 ```
+
+This default matrix builds Qwen3.8-27B only. Add `-DNINFER_BUILD_QWEN3_6_35B_A3B=ON` for both
+packages, or also set `-DNINFER_BUILD_QWEN3_8_27B=OFF` for a 35B-only build. Target-specific CTest
+executables exist only when their package is enabled.
 
 Run a focused target for a localized change:
 
@@ -98,12 +102,12 @@ Run the native Python suites with the project Python environment:
 
 ```bash
 python3 -m pytest \
-  tests/artifact tests/targets/qwen3_6_27b tests/targets/qwen3_6_35b_a3b \
+  tests/artifact tests/targets/qwen3_8_27b tests/targets/qwen3_6_35b_a3b \
   tests/test_bench_matrix.py tests/test_serve_corpus.py
 ```
 
-The Python binding tests use `NINFER_QWEN3_6_27B_ARTIFACT` when set, otherwise they look for
-`out/qwen3_6_27b.ninfer`. They report a pytest skip when neither path provides the real
+The Python binding tests use `NINFER_QWEN3_8_27B_ARTIFACT` when set, otherwise they look for
+`out/qwen3_8_27b.ninfer`. They report a pytest skip when neither path provides the real
 artifact. The 35B-A3B reference binding test follows the same rule with
 `NINFER_QWEN3_6_35B_A3B_ARTIFACT` and `out/qwen3_6_35b_a3b.ninfer`. The remaining Python
 target tests still run without either artifact.
@@ -112,8 +116,8 @@ The C++ prefix/MTP integration test is separately opt-in because it loads the fu
 runs the real engine:
 
 ```bash
-NINFER_QWEN3_6_27B_WEIGHTS=$PWD/out/qwen3_6_27b.ninfer \
-  ctest --test-dir build -R ninfer_qwen3_6_27b_prefix_real_test --output-on-failure
+NINFER_QWEN3_8_27B_WEIGHTS=$PWD/out/qwen3_8_27b.ninfer \
+  ctest --test-dir build -R ninfer_qwen3_8_27b_prefix_real_test --output-on-failure
 ```
 
 Run the peer 35B-A3B route independently:
@@ -136,13 +140,13 @@ PYTHONPATH=eval eval/.venv/bin/python -m unittest discover \
 Run the serving contract manually after starting a resident server in another terminal:
 
 ```bash
-./build/apps/ninfer-serve out/qwen3_6_27b.ninfer \
+./build/apps/ninfer-serve out/qwen3_8_27b.ninfer \
   --host 127.0.0.1 --port 18080 --vision
 ```
 
 ```bash
 python3 -m tools.smoke.serve_contract \
-  --base-url http://127.0.0.1:18080 --model qwen3.6-27b
+  --base-url http://127.0.0.1:18080 --model qwen3.8-27b
 ```
 
 This smoke check is intentionally not a CTest: it needs the real artifact, a supported GPU, and a
@@ -160,7 +164,7 @@ npm ci
 npm test
 
 NINFER_BASE_URL=http://127.0.0.1:18080 \
-NINFER_MODEL=qwen3.6-27b npm test
+NINFER_MODEL=qwen3.8-27b npm test
 ```
 
 Without both environment variables, only the live tests are reported as skipped. The harness only
@@ -176,14 +180,14 @@ prompt lengths, and verifies rolling checkpoint growth and Responses inheritance
 
 ```bash
 python3 tools/smoke/serve_thinking_preservation.py \
-  --artifact out/qwen3_6_27b.ninfer --backend mtp
+  --artifact out/qwen3_8_27b.ninfer --backend mtp
 
 python3 tools/smoke/serve_thinking_preservation.py \
   --artifact out/qwen3_6_35b_a3b.ninfer --backend dflash
 ```
 
 The shared messages are in
-[`fixtures/serve/qwen3_6_thinking_preservation.json`](fixtures/serve/qwen3_6_thinking_preservation.json).
+[`fixtures/serve/qwen3_8_thinking_preservation.json`](fixtures/serve/qwen3_8_thinking_preservation.json).
 
 ## What belongs here
 

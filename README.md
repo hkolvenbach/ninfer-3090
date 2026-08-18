@@ -196,6 +196,11 @@ For a native build, follow the [Linux build guide](docs/rtx-3090-linux.md) with
 `CMAKE_CUDA_ARCHITECTURES=89` (the default in this fork). The build requires CUDA 12.8 or newer,
 GCC 13, and CMake 3.28 or newer; the Docker image builds with CUDA 13.1.
 
+The default build registers only Qwen3.8-27B. Enable the optional Qwen3.6-35B-A3B package with
+`-DNINFER_BUILD_QWEN3_6_35B_A3B=ON`, or with
+`BUILD_QWEN3_6_35B_A3B=ON make configure`. A 35B-only build additionally sets
+`NINFER_BUILD_QWEN3_8_27B=OFF`. At least one target package must be enabled.
+
 ## What this fork changes
 
 - **`sm_89` retarget.** The CMake architecture pin, the runtime compute-capability check, and the

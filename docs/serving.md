@@ -6,7 +6,7 @@ Anthropic-compatible HTTP endpoints over one resident NInfer Engine.
 ## Start the server
 
 ```bash
-./build/apps/ninfer-serve models/qwen3_6_27b.ninfer \
+./build/apps/ninfer-serve models/qwen3_8_27b.ninfer \
   --host 127.0.0.1 \
   --port 8080 \
   --max-context 16384 \
@@ -17,7 +17,8 @@ Anthropic-compatible HTTP endpoints over one resident NInfer Engine.
 ```
 
 For the 35B-A3B artifact, select its artifact path; the public model ID follows the container
-identity automatically:
+identity automatically. This package is optional and requires
+`-DNINFER_BUILD_QWEN3_6_35B_A3B=ON` at configure time:
 
 ```bash
 ./build/apps/ninfer-serve models/qwen3_6_35b_a3b.ninfer \
@@ -60,7 +61,7 @@ cannot be combined with `--vision`. A later request cannot enable a capability o
 curl http://127.0.0.1:8080/v1/chat/completions \
   -H 'Content-Type: application/json' \
   -d '{
-    "model": "qwen3.6-27b",
+    "model": "qwen3.8-27b",
     "messages": [
       {"role": "system", "content": "Answer concisely."},
       {"role": "user", "content": "What is speculative decoding?"}
@@ -125,7 +126,7 @@ Start the server with `--vision` before sending media:
 curl http://127.0.0.1:8080/v1/chat/completions \
   -H 'Content-Type: application/json' \
   -d '{
-    "model": "qwen3.6-27b",
+    "model": "qwen3.8-27b",
     "messages": [{
       "role": "user",
       "content": [
@@ -153,7 +154,7 @@ Conversations, or compaction.
 curl http://127.0.0.1:8080/v1/responses \
   -H 'Content-Type: application/json' \
   -d '{
-    "model": "qwen3.6-27b",
+    "model": "qwen3.8-27b",
     "instructions": "Answer concisely.",
     "input": "What is speculative decoding?",
     "max_output_tokens": 128,
@@ -168,7 +169,7 @@ from openai import OpenAI
 
 client = OpenAI(base_url="http://127.0.0.1:8080/v1", api_key="local-secret")
 response = client.responses.create(
-    model="qwen3.6-27b",
+    model="qwen3.8-27b",
     instructions="Answer concisely.",
     input="What is speculative decoding?",
     max_output_tokens=128,
@@ -378,7 +379,7 @@ template, and media expansion and does not run generation:
 ```bash
 curl http://127.0.0.1:8080/v1/responses/input_tokens \
   -H 'Content-Type: application/json' \
-  -d '{"model":"qwen3.6-27b","input":"Count this prompt."}'
+  -d '{"model":"qwen3.8-27b","input":"Count this prompt."}'
 ```
 
 ```json
@@ -399,7 +400,7 @@ being silently accepted.
 curl http://127.0.0.1:8080/v1/messages \
   -H 'Content-Type: application/json' \
   -d '{
-    "model": "qwen3.6-27b",
+    "model": "qwen3.8-27b",
     "max_tokens": 128,
     "messages": [
       {"role": "user", "content": "Explain prefix reuse in one sentence."}
@@ -427,7 +428,7 @@ without running GPU generation:
 curl http://127.0.0.1:8080/v1/messages/count_tokens \
   -H 'Content-Type: application/json' \
   -d '{
-    "model": "qwen3.6-27b",
+    "model": "qwen3.8-27b",
     "messages": [{"role": "user", "content": "Count this prompt."}]
   }'
 ```
@@ -493,7 +494,7 @@ are errors. Delete and cancel routes accept no query parameters.
 | `--greedy` | force exact argmax for all requests | off |
 
 Engine selects sampling defaults from the loaded model and the request's resolved thinking mode.
-Qwen3.6-27B and Qwen3.8-27B use `1.0/0.95/20/0/0` for
+Qwen3.8-27B uses `1.0/0.95/20/0/0` for
 temperature/top-p/top-k/min-p/presence penalty in thinking mode and `0.7/0.80/20/0/1.5` in
 non-thinking mode. Qwen3.6-35B-A3B differs only in its thinking presence penalty, which is `1.5`.
 Frequency penalty is `0` for all registered presets. Process flags override registered values,
@@ -509,7 +510,7 @@ file. The parent directory must already exist. Failure to open the file aborts s
 is also rejected if it resolves to the model artifact.
 
 ```bash
-./build/apps/ninfer-serve models/qwen3_6_27b.ninfer \
+./build/apps/ninfer-serve models/qwen3_8_27b.ninfer \
   --request-log-jsonl profiles/bench/run/server.requests.jsonl
 ```
 

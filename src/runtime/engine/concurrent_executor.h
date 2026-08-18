@@ -7,7 +7,7 @@
 #include "runtime/engine/admission_policy.h"
 #include "runtime/engine/request_memory.h"
 #include "runtime/generation/generation_budget.h"
-#include "targets/qwen3_6/export/ninfer/targets/qwen3_6/frontend.h"
+#include "targets/qwen3_8/export/ninfer/targets/qwen3_8/frontend.h"
 
 #include <algorithm>
 #include <array>
@@ -116,7 +116,7 @@ public:
         friend class ConcurrentExecutor;
     };
 
-    Submission submit(targets::qwen3_6::PreparedPrompt prompt, PromptSummary prompt_summary,
+    Submission submit(targets::qwen3_8::PreparedPrompt prompt, PromptSummary prompt_summary,
                       double prepare_seconds, ResolvedRequestOptions options,
                       Clock::time_point pending_deadline = {}, HostInputLease host_input = {}) {
         const Clock::time_point submitted = Clock::now();
@@ -269,8 +269,8 @@ private:
     }
 
     struct Request {
-        Request(std::uint64_t request_identity, targets::qwen3_6::PreparedPrompt input,
-                targets::qwen3_6::OutputSession output_session, PromptSummary summary,
+        Request(std::uint64_t request_identity, targets::qwen3_8::PreparedPrompt input,
+                targets::qwen3_8::OutputSession output_session, PromptSummary summary,
                 double frontend_seconds, ResolvedRequestOptions request_options,
                 Clock::time_point limit, Clock::time_point submit_time, HostInputLease input_lease)
             : id(request_identity), host_input(std::move(input_lease)), prompt(std::move(input)),
@@ -280,8 +280,8 @@ private:
 
         const std::uint64_t id;
         HostInputLease host_input;
-        targets::qwen3_6::PreparedPrompt prompt;
-        targets::qwen3_6::OutputSession output;
+        targets::qwen3_8::PreparedPrompt prompt;
+        targets::qwen3_8::OutputSession output;
         PromptSummary prompt_summary;
         double prepare_seconds = 0.0;
         ResolvedRequestOptions options;
@@ -352,7 +352,7 @@ private:
     };
 
     void append_output(const std::shared_ptr<Request>& request,
-                       targets::qwen3_6::PublishedOutput output) {
+                       targets::qwen3_8::PublishedOutput output) {
         if (output.empty()) { return; }
         {
             std::lock_guard lock(request->mutex);

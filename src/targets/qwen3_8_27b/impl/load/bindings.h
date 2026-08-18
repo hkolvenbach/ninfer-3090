@@ -1,10 +1,10 @@
 #pragma once
 
 #include <ninfer/targets/qwen3_8_27b/package.h>
-#include <ninfer/targets/qwen3_6/frontend_resources.h>
-#include <ninfer/targets/qwen3_6/model_view.h>
-#include <ninfer/targets/qwen3_6/startup_features.h>
-#include <ninfer/targets/qwen3_6/vision.h>
+#include <ninfer/targets/qwen3_8/frontend_resources.h>
+#include <ninfer/targets/qwen3_8/model_view.h>
+#include <ninfer/targets/qwen3_8/startup_features.h>
+#include <ninfer/targets/qwen3_8/vision.h>
 
 #include "artifact/binder.h"
 #include "artifact/materializer.h"
@@ -94,8 +94,8 @@ struct MtpPlan {
 };
 
 struct BindingPlan {
-    qwen3_6::FrontendResourcePlan frontend;
-    qwen3_6::StartupFeatures features;
+    qwen3_8::FrontendResourcePlan frontend;
+    qwen3_8::StartupFeatures features;
 
     WeightPlan token_embedding;
     std::array<TextLayerPlan, kTextLayers> text_layers;
@@ -105,11 +105,11 @@ struct BindingPlan {
     artifact::ObjectHandle draft_head_token_ids;
     MtpPlan mtp;
 
-    qwen3_6::VisionBackbonePlan vision_backbone;
-    qwen3_6::VisionMergerInputPlan vision_merger_input;
+    qwen3_8::VisionBackbonePlan vision_backbone;
+    qwen3_8::VisionMergerInputPlan vision_merger_input;
     artifact::ObjectHandle vision_merger_fc2;
     artifact::ObjectHandle vision_merger_fc2_bias;
-    qwen3_6::VisionMergerNormPlan vision_merger_norm;
+    qwen3_8::VisionMergerNormPlan vision_merger_norm;
 };
 
 struct ArtifactLoadPlan {
@@ -118,7 +118,7 @@ struct ArtifactLoadPlan {
 };
 
 ArtifactLoadPlan bind_artifact(artifact::Binder& binder, WeightsProfile weights_profile,
-                               qwen3_6::StartupFeatures features);
+                               qwen3_8::StartupFeatures features);
 
 struct DensePostMixerPayload {
     Weight gate_up;
@@ -166,8 +166,8 @@ struct MtpAttentionPayload {
 };
 
 using RuntimeModelView =
-    qwen3_6::ModelView<FullAttentionProjectionPayload, GdnProjectionPayload, DensePostMixerPayload,
-                       MtpAttentionPayload, DensePostMixerPayload, qwen3_6::DFlashWeights<6>,
+    qwen3_8::ModelView<FullAttentionProjectionPayload, GdnProjectionPayload, DensePostMixerPayload,
+                       MtpAttentionPayload, DensePostMixerPayload, qwen3_8::DFlashWeights<6>,
                        kFullAttentionLayers, kGdnLayers>;
 using FullAttentionWeights = RuntimeModelView::FullLayer;
 using GdnWeights           = RuntimeModelView::GdnLayer;
@@ -183,7 +183,7 @@ public:
     LoadedModelData& operator=(LoadedModelData&&)      = delete;
 
     artifact::MaterializedArtifact backing;
-    qwen3_6::FrontendResources frontend;
+    qwen3_8::FrontendResources frontend;
     RuntimeModelView runtime;
 };
 

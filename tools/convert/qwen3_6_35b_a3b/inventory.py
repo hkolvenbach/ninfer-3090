@@ -6,7 +6,7 @@ names and transformations live in :mod:`recipe`.
 
 from __future__ import annotations
 
-from tools.convert.qwen3_6.common.inventory import (
+from tools.convert.qwen3_8.common.inventory import (
     BF16,
     CONTIGUOUS_LAYOUT,
     FORMAT_NAMES,

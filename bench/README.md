@@ -13,6 +13,10 @@ cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DNINFER_BUILD_BENCHMARKS=ON
 cmake --build build --parallel --target ninfer_bench
 ```
 
+The default benchmark build contains the Qwen3.8-27B product benchmarks. Configure with
+`-DNINFER_BUILD_QWEN3_6_35B_A3B=ON` before building the 35B DFlash round benchmark. Disabled
+packages do not contribute target-specific benchmark executables.
+
 ## Product benchmark
 
 The benchmark slices exact token counts from `bench/fixtures/bench_corpus.ids`, calls
@@ -56,7 +60,7 @@ Example:
 
 ```bash
 ./build/bench/ninfer_bench \
-  --weights out/qwen3_6_27b.ninfer \
+  --weights out/qwen3_8_27b.ninfer \
   -p 512,2048 -n 128 -pg '2048,128' -r 5 --warmup 1
 ```
 
@@ -113,7 +117,7 @@ They are compact performance surveys, not copies of the production selector or n
 matrix:
 
 ```bash
-./build/bench/ninfer_linear_bench --suite qwen3_6_27b
+./build/bench/ninfer_linear_bench --suite qwen3_8_27b
 ./build/bench/ninfer_linear_bench --suite qwen3_6_35b_a3b
 ./build/bench/ninfer_linear_bench --suite all
 ```
@@ -253,7 +257,7 @@ cmake --build build --parallel --target ninfer_gdn_input_proj_bench
 
 ## GDN input projection/convolution/snapshot Op benchmark
 
-`ninfer_gdn_input_proj_conv_snapshot_bench` measures the public Qwen3.6 Q4/Q5, NVFP4, and W8
+`ninfer_gdn_input_proj_conv_snapshot_bench` measures the public Qwen3.8 Q4/Q5, NVFP4, and W8
 `gdn_input_proj_conv_snapshot` forms for exact `B=1..8`. The timed body is exactly one complete
 public Op call; the benchmark does not include private launchers, candidate selection, duplicated
 compositions, or route labels. Its default `T=1..6` sweep is the production MTP verification
@@ -570,15 +574,15 @@ cmake --build build --parallel --target ninfer_mtp_pack_bench
 
 ## Target MTP round benchmark
 
-`ninfer_qwen3_6_27b_mtp_round_bench` measures the registered target's native proposal and
+`ninfer_qwen3_8_27b_mtp_round_bench` measures the registered target's native proposal and
 verification round without introducing a second generation controller. It loads the same `.ninfer`
 artifact through the target-private package facade, prepares a real prompt with that target's
 Frontend, and reports draft/accept statistics for the target-owned MTP schedule:
 
 ```bash
-cmake --build build --parallel --target ninfer_qwen3_6_27b_mtp_round_bench
-./build/bench/ninfer_qwen3_6_27b_mtp_round_bench \
-  --artifact out/qwen3_6_27b.ninfer
+cmake --build build --parallel --target ninfer_qwen3_8_27b_mtp_round_bench
+./build/bench/ninfer_qwen3_8_27b_mtp_round_bench \
+  --artifact out/qwen3_8_27b.ninfer
 ```
 
 ## 35B complete DFlash round benchmark

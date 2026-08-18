@@ -106,7 +106,7 @@ intermediate artifacts are excluded unless requested or themselves the deliverab
 
 NInfer is a from-scratch C++/CUDA inference engine for maximum single-GPU inference performance on
 a small set of explicitly registered checkpoint artifacts. The supported identities are
-`qwen3.6-27b/groupwise-int`, `qwen3.6-27b/nvfp4`, `qwen3.8-27b/groupwise-int`, and
+`qwen3.8-27b/groupwise-int`, `qwen3.8-27b/nvfp4`, and
 `qwen3.6-35b-a3b/groupwise-int`. The current implementation is compiled for `sm_120a` and tuned
 and measured on NVIDIA GeForce RTX 5090. All identities execute Text, image/video Vision, MTP,
 prefix reuse, CLI, OpenAI/Anthropic serving, and measurement through the same public `.ninfer`
@@ -121,7 +121,7 @@ generated artifacts, and the local workflow are trusted.
 Requirements derived from a different workload, trust model, or deployment model are out of scope
 until that product contract is explicitly changed.
 
-The 27B and 35B-A3B execution packages are peer compile-time Variants of one identity-free Qwen3.6
+The 27B and 35B-A3B execution packages are peer compile-time Variants of one identity-free Qwen3.8
 family runtime. The family owns the shared `SequencePlan<Variant>`, `RequestPlan<Variant>`, and
 `Program<Variant>` algorithms; frontend and output semantics; Text/Vision/speculative schedules;
 state transactions; workspace composition; and CUDA Graph capture/replay mechanics. Each package
@@ -131,6 +131,9 @@ instance bytes. No mutable state or device allocation is shared between Programs
 is defined as a delta from the other, and there is no runtime family selection or target-dependent
 branch inside family scheduling. All artifacts embed the same six frontend resources, and a
 prepared prompt carries no exact-target tag.
+
+The normal build enables Qwen3.8-27B and disables Qwen3.6-35B-A3B. Explicit CMake package options
+compose either package or both into the closed registry; a build with no package is invalid.
 
 ## Engineering priorities
 
@@ -162,9 +165,9 @@ routing map, not a mandatory reading list:
   layouts, and paged consumer contracts;
 - `docs/maintainer/artifact-container.md`, `storage-layouts.md`, and `tensor-formats.md`:
   generic `.ninfer` contracts;
-- `docs/maintainer/qwen3.6-27b-artifact.md`, `qwen3.8-27b-artifact.md`, and
+- `docs/maintainer/qwen3.8-27b-artifact.md` and
   `qwen3.6-35b-a3b-artifact.md`: exact target inventories, conversion, and binding;
-- `docs/maintainer/qwen3.6-27b-model.md` and `qwen3.6-35b-a3b-model.md`: exact model mathematics,
+- `docs/maintainer/qwen3.8-27b-model.md` and `qwen3.6-35b-a3b-model.md`: exact model mathematics,
   dimensions, and state semantics;
 - `docs/maintainer/op-development.md`: Op admission, contracts, implementation ownership,
   qualification, and performance evidence rules;
@@ -190,7 +193,7 @@ them, but must update the corresponding active authorities and affected implemen
 - `src/ops` owns every semantically closed Op implementation, including fused, fixed-shape, and
   device-specialized paths. Op ownership follows the mathematical or state-transition contract,
   not its first model caller or demonstrated cross-target reuse.
-- `src/targets/qwen3_6` owns only the Qwen3.6-family invariants shared by the 27B and 35B-A3B
+- `src/targets/qwen3_8` owns only the Qwen3.8-family invariants shared by the 27B and 35B-A3B
   targets: tokenizer/template and output semantics, media preprocessing and MRoPE prompt
   construction, owning prepared-prompt/output-session types, semantic weight-view schemas, passive
   Vision definitions, and the fixed
@@ -306,8 +309,8 @@ These are conventional project resources, not a checklist of resources every tas
 | repository | current checkout |
 | Python 3.11 | `python3` in the selected maintainer environment |
 | BF16 source checkpoint | explicit local checkpoint directory |
-| product artifact | `out/qwen3_6_27b.ninfer` |
-| conversion report | `out/qwen3_6_27b.ninfer.conversion.json` |
+| product artifact | `out/qwen3_8_27b.ninfer` |
+| conversion report | `out/qwen3_8_27b.ninfer.conversion.json` |
 | normal build | `build/` |
 | profiler output | `profiles/ncu/`, `profiles/nsys/`, `profiles/bench/` |
 | hardware/toolchain | RTX 5090, `sm_120a`, CUDA 13.1 |
@@ -319,8 +322,8 @@ do not download or regenerate them unless that work is in scope.
 
 ```bash
 PYTHON=python3
-MODEL=/path/to/Qwen3.6-27B
-NINFER_WEIGHTS=out/qwen3_6_27b.ninfer
+MODEL=/path/to/Qwen3.8-27B
+NINFER_WEIGHTS=out/qwen3_8_27b.ninfer
 ```
 
 ## Commits

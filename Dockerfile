@@ -30,6 +30,8 @@ RUN --mount=type=cache,id=ninfer-sm89-cuda13.2-release,target=/build,sharing=loc
         -DNINFER_BUILD_APPS=ON \
         -DBUILD_TESTING=OFF \
         -DNINFER_BUILD_BENCHMARKS=OFF \
+        -DNINFER_BUILD_QWEN3_8_27B=ON \
+        -DNINFER_BUILD_QWEN3_6_35B_A3B=OFF \
     && cmake --build /build --parallel --target ninfer ninfer-serve \
     && install -D /build/apps/ninfer /opt/ninfer/bin/ninfer \
     && install -D /build/apps/ninfer-serve /opt/ninfer/bin/ninfer-serve

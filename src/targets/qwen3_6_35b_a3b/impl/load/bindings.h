@@ -1,10 +1,10 @@
 #pragma once
 
 #include <ninfer/targets/qwen3_6_35b_a3b/package.h>
-#include <ninfer/targets/qwen3_6/frontend_resources.h>
-#include <ninfer/targets/qwen3_6/model_view.h>
-#include <ninfer/targets/qwen3_6/startup_features.h>
-#include <ninfer/targets/qwen3_6/vision.h>
+#include <ninfer/targets/qwen3_8/frontend_resources.h>
+#include <ninfer/targets/qwen3_8/model_view.h>
+#include <ninfer/targets/qwen3_8/startup_features.h>
+#include <ninfer/targets/qwen3_8/vision.h>
 
 #include "artifact/binder.h"
 #include "artifact/materializer.h"
@@ -87,8 +87,8 @@ struct DFlashPlan {
 };
 
 struct BindingPlan {
-    qwen3_6::FrontendResourcePlan frontend;
-    qwen3_6::StartupFeatures features;
+    qwen3_8::FrontendResourcePlan frontend;
+    qwen3_8::StartupFeatures features;
     artifact::ObjectHandle token_embedding;
     std::array<TextLayerPlan, kTextLayers> text_layers;
     artifact::ObjectHandle final_norm;
@@ -96,11 +96,11 @@ struct BindingPlan {
     artifact::ObjectHandle draft_head;
     artifact::ObjectHandle draft_head_token_ids;
     MtpPlan mtp;
-    qwen3_6::VisionBackbonePlan vision_backbone;
-    qwen3_6::VisionMergerInputPlan vision_merger_input;
+    qwen3_8::VisionBackbonePlan vision_backbone;
+    qwen3_8::VisionMergerInputPlan vision_merger_input;
     artifact::ObjectHandle vision_merger_fc2;
     artifact::ObjectHandle vision_merger_fc2_bias;
-    qwen3_6::VisionMergerNormPlan vision_merger_norm;
+    qwen3_8::VisionMergerNormPlan vision_merger_norm;
     DFlashPlan dflash;
 };
 
@@ -109,7 +109,7 @@ struct ArtifactLoadPlan {
     artifact::MaterializationPlan materialization;
 };
 
-ArtifactLoadPlan bind_artifact(artifact::Binder& binder, qwen3_6::StartupFeatures features);
+ArtifactLoadPlan bind_artifact(artifact::Binder& binder, qwen3_8::StartupFeatures features);
 
 struct SparseMoePayload {
     ops::SparseMoeWeights op;
@@ -127,14 +127,14 @@ struct GdnProjectionPayload {
 };
 
 using RuntimeModelView =
-    qwen3_6::ModelView<AttentionProjectionPayload, GdnProjectionPayload, SparseMoePayload,
+    qwen3_8::ModelView<AttentionProjectionPayload, GdnProjectionPayload, SparseMoePayload,
                        AttentionProjectionPayload, SparseMoePayload,
-                       qwen3_6::DFlashWeights<kDFlashLayers>, kFullAttentionLayers, kGdnLayers>;
+                       qwen3_8::DFlashWeights<kDFlashLayers>, kFullAttentionLayers, kGdnLayers>;
 using FullAttentionWeights = RuntimeModelView::FullLayer;
 using GdnWeights           = RuntimeModelView::GdnLayer;
 using MtpWeights           = RuntimeModelView::MtpLayer;
 using DFlashWeights        = RuntimeModelView::DFlash;
-using DFlashLayerWeights   = qwen3_6::DFlashLayerWeights;
+using DFlashLayerWeights   = qwen3_8::DFlashLayerWeights;
 
 class LoadedModelData {
 public:
@@ -146,7 +146,7 @@ public:
     LoadedModelData& operator=(LoadedModelData&&)      = delete;
 
     artifact::MaterializedArtifact backing;
-    qwen3_6::FrontendResources frontend;
+    qwen3_8::FrontendResources frontend;
     RuntimeModelView runtime;
 };
 

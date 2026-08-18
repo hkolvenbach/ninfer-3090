@@ -8,7 +8,7 @@ from typing import Callable
 
 import torch
 
-from tools.reference.qwen3_6.common.vision_ops import (
+from tools.reference.qwen3_8.common.vision_ops import (
     add_bias,
     apply_vision_rope,
     gelu,

@@ -9,7 +9,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from tools.convert.qwen3_6.common.draft_head import (
+from tools.convert.qwen3_8.common.draft_head import (
     DraftHeadContext,
     compute_shortlist as _compute_shortlist,
     materialize_draft_head,
@@ -26,7 +26,7 @@ DRAFT_HEAD_TOKEN_IDS_OBJECT = "text/draft_head_token_ids"
 DEFAULT_RANKING = Path(
     "tools/freq_corpus/fixtures/ranking/ranking.train.counts.i64"
 )
-RANKING_SOURCE_TARGET = "qwen3_6_27b"
+RANKING_SOURCE_TARGET = "qwen3_8_27b"
 
 
 def compute_shortlist(

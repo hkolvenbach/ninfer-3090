@@ -2,26 +2,25 @@
 
 Tested Git revisions:
 
-- Concurrent MTP3 decode saturation for the three measured Qwen3.6 artifact profiles:
+- Concurrent MTP3 decode saturation for the three measured artifact profiles:
   `26da9df7c1b3d3c04ea7bbd730271aa01d00742a`;
-- Refreshed Qwen3.6-35B-A3B and Qwen3.6-27B NVFP4 MTP3:
+- Refreshed Qwen3.6-35B-A3B and Qwen3.8-27B NVFP4 MTP3:
   `f4f21cc36bd1a83cbc046f668719d591dc9c1e2e`;
 - Qwen3.6-35B-A3B stored MTP3 response audit:
   `b1a220f028aa750f75bceb3522ac00bbaab7e42d`;
 - Qwen3.6-35B-A3B DFlash block=8 (`k=7`):
   `0dc94097e8ec5c5bcf59b9e13e9d1852f504eb61`;
-- Qwen3.6-27B NVFP4 accuracy and MTP0:
+- Qwen3.8-27B NVFP4 accuracy and MTP0:
   `b3d4d0f50b868711c62432bbd68e746217a2f49a`;
-- Qwen3.6-27B groupwise-int MTP3: `5ea3242a206cdb0c4c1beaeb9d8a3048e6248423`;
-- Qwen3.6-35B-A3B MTP0 and Qwen3.6-27B groupwise-int MTP0:
+- Qwen3.8-27B groupwise-int MTP3: `5ea3242a206cdb0c4c1beaeb9d8a3048e6248423`;
+- Qwen3.6-35B-A3B MTP0 and Qwen3.8-27B groupwise-int MTP0:
   `0795169393cab0f2c16246d4bac20dee735dc2a4`.
 
-The serving measurements characterize the two measured Qwen3.6 model IDs independently on one
+The serving measurements characterize the two measured model IDs independently on one
 NVIDIA GeForce RTX 5090. They cover long-context prefill and baseline decode with speculative
 decoding disabled, plus long-reasoning and cross-scenario decode with MTP and DFlash. The 27B
 results report its `groupwise-int` and `nvfp4` weight profiles separately. The concurrent
-decode-saturation campaign measures the same three Qwen3.6 artifact profiles at C=1, 2, 4, and 8.
-Qwen3.8-27B is supported by current NInfer builds but is not included in this published campaign.
+decode-saturation campaign measures the same three artifact profiles at C=1, 2, 4, and 8.
 
 The single-request corpus requests were submitted serially to a persistent `ninfer-serve` process
 over the loopback OpenAI-compatible HTTP endpoint. Each reported corpus fixture used five fixed
@@ -106,14 +105,14 @@ wave rather than a repeated-sample mean.
 
 | Model profile | C | Steady (s) | Avg batch | Aggregate decode tok/s | MTP acceptance | Speedup vs. C1 | Wave makespan (s) |
 |---|---:|---:|---:|---:|---:|---:|---:|
-| Qwen3.6-27B `groupwise-int` | 1 | 43.01 | 1.00 | 185.8 | 68.2% | 1.00× | 44.23 |
-| Qwen3.6-27B `groupwise-int` | 2 | 65.01 | 2.00 | 247.0 | 69.0% | 1.33× | 66.67 |
-| Qwen3.6-27B `groupwise-int` | 4 | 102.02 | 4.00 | 309.5 | 68.4% | 1.67× | 107.49 |
-| Qwen3.6-27B `groupwise-int` | 8 | 118.02 | 8.00 | 535.0 | 68.3% | 2.88× | 125.20 |
-| Qwen3.6-27B `nvfp4` | 1 | 39.01 | 1.00 | 202.4 | 69.3% | 1.00× | 40.46 |
-| Qwen3.6-27B `nvfp4` | 2 | 39.01 | 2.00 | 399.7 | 71.4% | 1.97× | 41.82 |
-| Qwen3.6-27B `nvfp4` | 4 | 44.01 | 4.00 | 699.7 | 69.3% | 3.46× | 47.92 |
-| Qwen3.6-27B `nvfp4` | 8 | 55.01 | 8.00 | 1,146.9 | 68.6% | 5.67× | 58.57 |
+| Qwen3.8-27B `groupwise-int` | 1 | 43.01 | 1.00 | 185.8 | 68.2% | 1.00× | 44.23 |
+| Qwen3.8-27B `groupwise-int` | 2 | 65.01 | 2.00 | 247.0 | 69.0% | 1.33× | 66.67 |
+| Qwen3.8-27B `groupwise-int` | 4 | 102.02 | 4.00 | 309.5 | 68.4% | 1.67× | 107.49 |
+| Qwen3.8-27B `groupwise-int` | 8 | 118.02 | 8.00 | 535.0 | 68.3% | 2.88× | 125.20 |
+| Qwen3.8-27B `nvfp4` | 1 | 39.01 | 1.00 | 202.4 | 69.3% | 1.00× | 40.46 |
+| Qwen3.8-27B `nvfp4` | 2 | 39.01 | 2.00 | 399.7 | 71.4% | 1.97× | 41.82 |
+| Qwen3.8-27B `nvfp4` | 4 | 44.01 | 4.00 | 699.7 | 69.3% | 3.46× | 47.92 |
+| Qwen3.8-27B `nvfp4` | 8 | 55.01 | 8.00 | 1,146.9 | 68.6% | 5.67× | 58.57 |
 | Qwen3.6-35B-A3B `groupwise-int` | 1 | 12.00 | 1.00 | 593.0 | 67.2% | 1.00× | 13.75 |
 | Qwen3.6-35B-A3B `groupwise-int` | 2 | 17.00 | 2.00 | 877.7 | 68.2% | 1.48× | 18.87 |
 | Qwen3.6-35B-A3B `groupwise-int` | 4 | 26.01 | 4.00 | 1,166.0 | 69.8% | 1.97× | 28.43 |
@@ -139,19 +138,19 @@ python3 tools/bench/run_serve_concurrency.py \
 
 python3 tools/bench/run_serve_corpus.py \
   --serve build/apps/ninfer-serve \
-  --artifact qwen3_6_27b=out/qwen3_6_27b.ninfer \
+  --artifact qwen3_8_27b=out/qwen3_8_27b.ninfer \
   --mode mtp3 \
   --output profiles/bench/serve_corpus_27b_mtp3_20260724
 
 python3 tools/bench/run_serve_corpus.py \
   --serve build/apps/ninfer-serve \
-  --artifact qwen3_6_27b=out/qwen3_6_27b_nvfp4.ninfer \
+  --artifact qwen3_8_27b=out/qwen3_8_27b_nvfp4.ninfer \
   --mode mtp0 --sampling stochastic \
   --output profiles/bench/serve_corpus_27b_nvfp4_w8_20260731
 
 python3 tools/bench/run_serve_concurrency.py \
   --serve build/apps/ninfer-serve \
-  --artifact qwen3_6_27b=out/qwen3_6_27b_nvfp4.ninfer \
+  --artifact qwen3_8_27b=out/qwen3_8_27b_nvfp4.ninfer \
   --mode mtp3 --suite corpus-makespan --concurrency 1 \
   --max-context 131072 --kv-capacity auto \
   --output profiles/bench/concurrent_corpus_27b_nvfp4_mtp3_20260811
@@ -162,7 +161,7 @@ The concurrent decode-saturation campaigns use:
 ```bash
 python3 tools/bench/run_serve_concurrency.py \
   --serve build/apps/ninfer-serve \
-  --artifact qwen3_6_27b=out/qwen3_6_27b.ninfer \
+  --artifact qwen3_8_27b=out/qwen3_8_27b.ninfer \
   --mode mtp3 --suite decode-saturation \
   --concurrency 1 --concurrency 2 --concurrency 4 --concurrency 8 \
   --decode-tokens 8192 --max-context 16384 --kv-capacity auto \
@@ -170,7 +169,7 @@ python3 tools/bench/run_serve_concurrency.py \
 
 python3 tools/bench/run_serve_concurrency.py \
   --serve build/apps/ninfer-serve \
-  --artifact qwen3_6_27b=out/qwen3_6_27b_nvfp4.ninfer \
+  --artifact qwen3_8_27b=out/qwen3_8_27b_nvfp4.ninfer \
   --mode mtp3 --suite decode-saturation \
   --concurrency 1 --concurrency 2 --concurrency 4 --concurrency 8 \
   --decode-tokens 8192 --max-context 16384 --kv-capacity auto \
@@ -188,21 +187,21 @@ python3 tools/bench/run_serve_concurrency.py \
 Use `--mode dflash7` for the corresponding DFlash block=8 campaign; add `--sampling greedy` for
 the exact-argmax profile.
 
-Omit `--mode` and supply the two measured Qwen3.6 groupwise-int artifacts to run the complete
-published Qwen3.6 MTP0/MTP3 campaign:
+Omit `--mode` and supply the two measured groupwise-int artifacts to run the complete published
+MTP0/MTP3 campaign:
 
 ```bash
 python3 tools/bench/run_serve_corpus.py \
   --serve build/apps/ninfer-serve \
   --artifact qwen3_6_35b_a3b=out/qwen3_6_35b_a3b.ninfer \
-  --artifact qwen3_6_27b=out/qwen3_6_27b.ninfer \
+  --artifact qwen3_8_27b=out/qwen3_8_27b.ninfer \
   --output profiles/bench/serve_corpus_20260720
 ```
 
 For the 27B NVFP4 accuracy run, start the model service with:
 
 ```bash
-build/apps/ninfer-serve out/qwen3_6_27b_nvfp4.ninfer \
+build/apps/ninfer-serve out/qwen3_8_27b_nvfp4.ninfer \
   --host 127.0.0.1 --port 18080 \
   --max-context 262144 --prefill-chunk 1024 --kv-dtype int8 \
   --spec mtp --draft-tokens 3 --lm-head-draft
@@ -212,7 +211,7 @@ Then run the repository's full 27B reasoning suite in a separate shell:
 
 ```bash
 PYTHONPATH=eval eval/.venv/bin/python -m ninfer_eval run \
-  --config eval/configs/qwen3_6_27b_reasoning.yaml \
+  --config eval/configs/qwen3_8_27b_reasoning.yaml \
   --suite reasoning_full
 ```
 
@@ -384,7 +383,7 @@ The exact-line and repeated-token scan found no other response with a short-cycl
 to greedy AIME 30. Output-limit and prompt-compliance failures above remain material even when no
 repetition loop is present.
 
-## `qwen3_6_27b`
+## `qwen3_8_27b`
 
 ### EvalScope reasoning accuracy
 

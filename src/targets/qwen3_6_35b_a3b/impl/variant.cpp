@@ -9,9 +9,9 @@
 #include <algorithm>
 #include <stdexcept>
 
-#define NINFER_QWEN36_VARIANT    ::ninfer::targets::qwen3_6_35b_a3b::detail::Variant
-#define NINFER_QWEN36_RUNTIME_NS qwen3_6_35b_a3b_runtime
-#include "targets/qwen3_6/impl/runtime/instantiate.h"
+#define NINFER_QWEN38_VARIANT    ::ninfer::targets::qwen3_6_35b_a3b::detail::Variant
+#define NINFER_QWEN38_RUNTIME_NS qwen3_6_35b_a3b_runtime
+#include "targets/qwen3_8/impl/runtime/instantiate.h"
 
 namespace ninfer::targets::qwen3_6_35b_a3b::detail {
 namespace {
@@ -126,13 +126,13 @@ std::vector<GraphExecutionProfile> Variant::dflash_graph_profiles(std::uint32_t 
 
 void Variant::attention_projection(const Tensor& hidden,
                                    const FullAttentionProjectionWeights& weights, Tensor& query,
-                                   Tensor& gate, Tensor& key, Tensor& value, qwen3_6::TextPhase,
+                                   Tensor& gate, Tensor& key, Tensor& value, qwen3_8::TextPhase,
                                    WorkspaceArena&, cudaStream_t stream) {
     ops::attn_input_proj(hidden, weights.query_key_gate_value, query, gate, key, value, stream);
 }
 
 void Variant::attention_output_projection(const Tensor& attention, const Weight& weight,
-                                          Tensor& residual, qwen3_6::TextPhase,
+                                          Tensor& residual, qwen3_8::TextPhase,
                                           WorkspaceArena& workspace, cudaStream_t stream) {
     ops::linear_add(attention, weight, residual, workspace, stream);
 }
@@ -165,7 +165,7 @@ void Variant::mtp_q_gate_projection(const Tensor& hidden,
 }
 
 void Variant::gdn_input_projection(const Tensor& hidden, const GdnProjectionWeights& weights,
-                                   Tensor& qkv, Tensor& output_gate, qwen3_6::TextPhase,
+                                   Tensor& qkv, Tensor& output_gate, qwen3_8::TextPhase,
                                    WorkspaceArena&, cudaStream_t stream) {
     Tensor output_gate_flat =
         output_gate.view({TextConfig::value_dim, static_cast<int>(hidden.ne[1] * hidden.ne[2])});
@@ -176,7 +176,7 @@ void Variant::gdn_input_projection_snapshot(
     const Tensor& hidden, const GdnProjectionWeights& weights, const Tensor& conv_weight,
     Tensor& conv_states, const Tensor& valid_columns, const Tensor& initial_slot,
     const Tensor& snapshot_base_slot, Tensor& query, Tensor& key, Tensor& value,
-    Tensor& output_gate, qwen3_6::TextPhase, WorkspaceArena& workspace, cudaStream_t stream) {
+    Tensor& output_gate, qwen3_8::TextPhase, WorkspaceArena& workspace, cudaStream_t stream) {
     Tensor output_gate_view = output_gate.view({TextConfig::value_dim, hidden.ne[1], hidden.ne[2]});
     ops::gdn_input_proj_conv_snapshot(hidden, weights.query_key_value_z, conv_weight, conv_states,
                                       valid_columns, initial_slot, snapshot_base_slot, query, key,
@@ -187,7 +187,7 @@ void Variant::gdn_input_projection_record(const Tensor& hidden, const GdnProject
                                           const Tensor& conv_weight, const Tensor& conv_states,
                                           const Tensor& valid_columns, const Tensor& initial_slots,
                                           Tensor& conv_record, Tensor& query, Tensor& key,
-                                          Tensor& value, Tensor& output_gate, qwen3_6::TextPhase,
+                                          Tensor& value, Tensor& output_gate, qwen3_8::TextPhase,
                                           WorkspaceArena& workspace, cudaStream_t stream) {
     auto workspace_scope     = workspace.scope();
     const DeviceSpan storage = workspace.alloc_bytes(gdn_record_workspace_bytes(hidden));
@@ -199,7 +199,7 @@ void Variant::gdn_input_projection_record(const Tensor& hidden, const GdnProject
 }
 
 void Variant::gdn_output_projection(const Tensor& hidden, const Weight& weight, Tensor& residual,
-                                    qwen3_6::TextPhase, WorkspaceArena& workspace,
+                                    qwen3_8::TextPhase, WorkspaceArena& workspace,
                                     cudaStream_t stream) {
     ops::linear_add(hidden, weight, residual, workspace, stream);
 }
@@ -213,7 +213,7 @@ void Variant::gdn_norm_control_projection(const Tensor& residual, const Tensor& 
 }
 
 void Variant::post_mixer(const Tensor& hidden, const PostMixerWeights& weights, Tensor& residual,
-                         qwen3_6::TextPhase, WorkspaceArena& workspace, cudaStream_t stream) {
+                         qwen3_8::TextPhase, WorkspaceArena& workspace, cudaStream_t stream) {
     run_sparse_moe(hidden, weights.op, residual, workspace, stream);
 }
 
@@ -247,7 +247,7 @@ std::size_t Variant::mtp_q_gate_projection_workspace_capacity_bytes(std::int32_t
 }
 
 std::size_t Variant::attention_projection_workspace_capacity_bytes(WeightsProfile,
-                                                                   qwen3_6::TextPhase,
+                                                                   qwen3_8::TextPhase,
                                                                    std::int32_t first,
                                                                    std::int32_t last) {
     return ops::attn_input_proj_workspace_capacity_bytes(
@@ -255,7 +255,7 @@ std::size_t Variant::attention_projection_workspace_capacity_bytes(WeightsProfil
 }
 
 std::size_t Variant::attention_output_projection_workspace_capacity_bytes(WeightsProfile,
-                                                                          qwen3_6::TextPhase,
+                                                                          qwen3_8::TextPhase,
                                                                           std::int32_t first,
                                                                           std::int32_t last) {
     return ops::linear_add_workspace_capacity_bytes(QType::W8G32_F16S, TextConfig::hidden,
@@ -264,7 +264,7 @@ std::size_t Variant::attention_output_projection_workspace_capacity_bytes(Weight
 }
 
 std::size_t Variant::gdn_input_projection_workspace_capacity_bytes(WeightsProfile,
-                                                                   qwen3_6::TextPhase,
+                                                                   qwen3_8::TextPhase,
                                                                    std::int32_t first,
                                                                    std::int32_t last) {
     return ops::gdn_input_proj_workspace_capacity_bytes(
@@ -272,7 +272,7 @@ std::size_t Variant::gdn_input_projection_workspace_capacity_bytes(WeightsProfil
 }
 
 std::size_t Variant::gdn_input_projection_snapshot_workspace_capacity_bytes(WeightsProfile,
-                                                                            qwen3_6::TextPhase,
+                                                                            qwen3_8::TextPhase,
                                                                             std::int32_t batch_size,
                                                                             std::int32_t first,
                                                                             std::int32_t last) {
@@ -281,7 +281,7 @@ std::size_t Variant::gdn_input_projection_snapshot_workspace_capacity_bytes(Weig
 }
 
 std::size_t Variant::gdn_input_projection_record_workspace_capacity_bytes(WeightsProfile,
-                                                                          qwen3_6::TextPhase,
+                                                                          qwen3_8::TextPhase,
                                                                           std::int32_t batch_size,
                                                                           std::int32_t first,
                                                                           std::int32_t last) {
@@ -292,7 +292,7 @@ std::size_t Variant::gdn_input_projection_record_workspace_capacity_bytes(Weight
 }
 
 std::size_t Variant::gdn_output_projection_workspace_capacity_bytes(WeightsProfile,
-                                                                    qwen3_6::TextPhase,
+                                                                    qwen3_8::TextPhase,
                                                                     std::int32_t first,
                                                                     std::int32_t last) {
     return ops::linear_add_workspace_capacity_bytes(QType::W8G32_F16S, TextConfig::hidden,
@@ -306,7 +306,7 @@ std::size_t Variant::gdn_norm_control_projection_workspace_capacity_bytes(std::i
                                                               TextConfig::hidden, first, last);
 }
 
-std::size_t Variant::post_mixer_workspace_capacity_bytes(WeightsProfile, qwen3_6::TextPhase,
+std::size_t Variant::post_mixer_workspace_capacity_bytes(WeightsProfile, qwen3_8::TextPhase,
                                                          std::int32_t first, std::int32_t last) {
     return std::max(
         ops::sparse_moe_workspace_capacity_bytes(QType::Q4G64_F16S, QType::Q5G64_F16S, first, last),

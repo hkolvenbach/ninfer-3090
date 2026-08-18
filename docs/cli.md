@@ -2,11 +2,13 @@
 
 `build/apps/ninfer` runs one request against one registered `.ninfer` artifact. Build NInfer and
 download an artifact using the [project README](../README.md) before following this guide.
+The default build contains Qwen3.8-27B. Commands using Qwen3.6-35B-A3B require configuring with
+`-DNINFER_BUILD_QWEN3_6_35B_A3B=ON`.
 
 ## Text input
 
 ```bash
-./build/apps/ninfer models/qwen3_6_27b.ninfer \
+./build/apps/ninfer models/qwen3_8_27b.ninfer \
   --prompt "Summarize the difference between prefill and decode." \
   --max-context 16384 \
   --max-new 256
@@ -19,7 +21,7 @@ canonical `weights_id`), timings, throughput, GPU memory, and speculative-decodi
 written to stderr, so stdout can be redirected independently:
 
 ```bash
-./build/apps/ninfer models/qwen3_6_27b.ninfer \
+./build/apps/ninfer models/qwen3_8_27b.ninfer \
   --prompt "Return one sentence." --max-new 64 \
   > answer.txt 2> run.log
 ```
@@ -76,7 +78,7 @@ and an optional `tools` array.
 Run message files from the repository root when they contain repository-relative media paths:
 
 ```bash
-./build/apps/ninfer models/qwen3_6_27b.ninfer \
+./build/apps/ninfer models/qwen3_8_27b.ninfer \
   --messages examples/cli/messages/image_chart.json \
   --max-context 8192 \
   --max-new 128 \
@@ -160,8 +162,6 @@ the loaded model and the rendered prompt mode. The current presets are:
 
 | Model | Prompt mode | Temperature | Top-p | Top-k | Min-p | Presence penalty |
 |---|---|---:|---:|---:|---:|---:|
-| Qwen3.6-27B | thinking | `1.0` | `0.95` | `20` | `0` | `0` |
-| Qwen3.6-27B | non-thinking | `0.7` | `0.80` | `20` | `0` | `1.5` |
 | Qwen3.8-27B | thinking | `1.0` | `0.95` | `20` | `0` | `0` |
 | Qwen3.8-27B | non-thinking | `0.7` | `0.80` | `20` | `0` | `1.5` |
 | Qwen3.6-35B-A3B | thinking | `1.0` | `0.95` | `20` | `0` | `1.5` |

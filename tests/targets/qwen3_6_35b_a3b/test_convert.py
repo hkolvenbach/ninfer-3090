@@ -56,7 +56,7 @@ def test_report_retains_target_specific_provenance_and_component_bytes(
     assert report["draft_head"] == {
         "rows": 131072,
         "tokenizer_vocab_size": 248077,
-        "ranking_source_target": "qwen3_6_27b",
+        "ranking_source_target": "qwen3_8_27b",
         "shared_semantic_vocabulary": True,
     }
     assert report["quantization"] == {

@@ -2,8 +2,12 @@
 
 #include "ninfer/types.h"
 #include "runtime/engine/request_memory.h"
-#include <ninfer/targets/qwen3_8_27b/package.h>
-#include <ninfer/targets/qwen3_6_35b_a3b/package.h>
+#if NINFER_BUILD_QWEN3_8_27B
+#    include <ninfer/targets/qwen3_8_27b/package.h>
+#endif
+#if NINFER_BUILD_QWEN3_6_35B_A3B
+#    include <ninfer/targets/qwen3_6_35b_a3b/package.h>
+#endif
 
 #include <memory>
 #include <variant>
@@ -14,8 +18,8 @@ struct DeviceContext;
 
 namespace targets {
 
-using Qwen3_8_27B    = qwen3_8_27b::Package;
-using Qwen3_6_35BA3B = qwen3_6_35b_a3b::Package;
+#if NINFER_BUILD_QWEN3_8_27B
+using Qwen3_8_27B = qwen3_8_27b::Package;
 
 struct LoadedQwen3_8_27B {
     std::unique_ptr<Qwen3_8_27B::LoadedModel> model;
@@ -46,6 +50,10 @@ struct Qwen3_8_27BInstance {
     Qwen3_8_27BInstance(const Qwen3_8_27BInstance&)            = delete;
     Qwen3_8_27BInstance& operator=(const Qwen3_8_27BInstance&) = delete;
 };
+#endif
+
+#if NINFER_BUILD_QWEN3_6_35B_A3B
+using Qwen3_6_35BA3B = qwen3_6_35b_a3b::Package;
 
 struct LoadedQwen3_6_35BA3B {
     std::unique_ptr<Qwen3_6_35BA3B::LoadedModel> model;
@@ -76,9 +84,16 @@ struct Qwen3_6_35BA3BInstance {
     Qwen3_6_35BA3BInstance(const Qwen3_6_35BA3BInstance&)            = delete;
     Qwen3_6_35BA3BInstance& operator=(const Qwen3_6_35BA3BInstance&) = delete;
 };
+#endif
 
+#if NINFER_BUILD_QWEN3_8_27B && NINFER_BUILD_QWEN3_6_35B_A3B
 using ActiveTarget =
     std::variant<std::unique_ptr<Qwen3_8_27BInstance>, std::unique_ptr<Qwen3_6_35BA3BInstance>>;
+#elif NINFER_BUILD_QWEN3_8_27B
+using ActiveTarget = std::variant<std::unique_ptr<Qwen3_8_27BInstance>>;
+#else
+using ActiveTarget = std::variant<std::unique_ptr<Qwen3_6_35BA3BInstance>>;
+#endif
 
 struct ConstructedTarget {
     ActiveTarget active;

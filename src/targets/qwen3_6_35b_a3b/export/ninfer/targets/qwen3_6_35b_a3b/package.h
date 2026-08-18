@@ -3,8 +3,8 @@
 #include "ninfer/types.h"
 #include "runtime/contract/types.h"
 #include "runtime/contract/transient_region.h"
-#include <ninfer/targets/qwen3_6/frontend.h>
-#include <ninfer/targets/qwen3_6/runtime.h>
+#include <ninfer/targets/qwen3_8/frontend.h>
+#include <ninfer/targets/qwen3_8/runtime.h>
 
 #include <cstdint>
 #include <memory>
@@ -33,9 +33,9 @@ enum class WeightsProfile : std::uint8_t {
     GroupwiseInt,
 };
 
-using Frontend       = qwen3_6::Frontend;
-using PreparedPrompt = qwen3_6::PreparedPrompt;
-using OutputSession  = qwen3_6::OutputSession;
+using Frontend       = qwen3_8::Frontend;
+using PreparedPrompt = qwen3_8::PreparedPrompt;
+using OutputSession  = qwen3_8::OutputSession;
 
 class LoadPlan {
 public:
@@ -85,11 +85,11 @@ struct Package {
     using Frontend        = detail::Frontend;
     using PreparedPrompt  = detail::PreparedPrompt;
     using OutputSession   = detail::OutputSession;
-    using SequencePlanner = qwen3_6::SequencePlanner<detail::Variant>;
-    using SequencePlan    = qwen3_6::SequencePlan<detail::Variant>;
-    using RequestBasePlan = qwen3_6::RequestBasePlan<detail::Variant>;
-    using RequestPlan     = qwen3_6::RequestPlan<detail::Variant>;
-    using Program         = qwen3_6::Program<detail::Variant>;
+    using SequencePlanner = qwen3_8::SequencePlanner<detail::Variant>;
+    using SequencePlan    = qwen3_8::SequencePlan<detail::Variant>;
+    using RequestBasePlan = qwen3_8::RequestBasePlan<detail::Variant>;
+    using RequestPlan     = qwen3_8::RequestPlan<detail::Variant>;
+    using Program         = qwen3_8::Program<detail::Variant>;
 
     [[nodiscard]] static ModelSamplingDefaults sampling_defaults(std::string_view model);
     [[nodiscard]] static WeightsProfile resolve_weights(const artifact::ArtifactIdentity& identity);

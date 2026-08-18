@@ -133,6 +133,7 @@ ConstructedTarget construct_registered(const EngineOptions& options, DeviceConte
 
 } // namespace
 
+#if NINFER_BUILD_QWEN3_8_27B
 LoadedQwen3_8_27B::LoadedQwen3_8_27B(std::unique_ptr<Qwen3_8_27B::LoadedModel> stable_model,
                                      PrefixCheckpointPolicy prefix_checkpoint_policy)
     : model(std::move(stable_model)),
@@ -150,7 +151,9 @@ Qwen3_8_27BInstance::Qwen3_8_27BInstance(std::unique_ptr<LoadedQwen3_8_27B> stab
       program(Qwen3_8_27B::create_program(*loaded->model, std::move(sequence_plan), device)) {}
 
 Qwen3_8_27BInstance::~Qwen3_8_27BInstance() = default;
+#endif
 
+#if NINFER_BUILD_QWEN3_6_35B_A3B
 LoadedQwen3_6_35BA3B::LoadedQwen3_6_35BA3B(
     std::unique_ptr<Qwen3_6_35BA3B::LoadedModel> stable_model,
     PrefixCheckpointPolicy prefix_checkpoint_policy)
@@ -169,6 +172,7 @@ Qwen3_6_35BA3BInstance::Qwen3_6_35BA3BInstance(std::unique_ptr<LoadedQwen3_6_35B
       program(Qwen3_6_35BA3B::create_program(*loaded->model, std::move(sequence_plan), device)) {}
 
 Qwen3_6_35BA3BInstance::~Qwen3_6_35BA3BInstance() = default;
+#endif
 
 ConstructedTarget construct_target(const EngineOptions& options, DeviceContext& device) {
     validate_options(options);
@@ -176,16 +180,20 @@ ConstructedTarget construct_target(const EngineOptions& options, DeviceContext& 
 
     artifact::Reader reader(options.artifact_path);
     const auto& identity = reader.identity();
+#if NINFER_BUILD_QWEN3_8_27B
     if (identity.model_id == Qwen3_8_27B::model_id) {
         return construct_registered<Qwen3_8_27B, LoadedQwen3_8_27B, Qwen3_8_27BInstance>(
             options, device, reader, load_start, Qwen3_8_27B::target_key);
     }
+#endif
+#if NINFER_BUILD_QWEN3_6_35B_A3B
     if (identity.model_id == Qwen3_6_35BA3B::model_id) {
         return construct_registered<Qwen3_6_35BA3B, LoadedQwen3_6_35BA3B, Qwen3_6_35BA3BInstance>(
             options, device, reader, load_start, Qwen3_6_35BA3B::target_key);
     }
+#endif
     throw std::runtime_error("artifact identity '" + identity.model_id + "/" + identity.weights_id +
-                             "' has no registered target for this device");
+                             "' has no registered target in this NInfer build");
 }
 
 } // namespace ninfer::targets

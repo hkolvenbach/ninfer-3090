@@ -27,7 +27,7 @@ std::filesystem::path artifact_path(const char* environment, const char* filenam
     return std::filesystem::path(NINFER_SOURCE_DIR) / "out" / filename;
 }
 
-ninfer::targets::qwen3_6::StartupFeatures all_features() {
+ninfer::targets::qwen3_8::StartupFeatures all_features() {
     return {
         .vision        = true,
         .speculative   = ninfer::SpeculativeBackend::Mtp,
@@ -183,7 +183,7 @@ int verify_profile_mismatch_rejection() {
     auto sequence             = std::move(planner).finalize(pages);
     RuntimeModelView empty_model;
     try {
-        (void)ninfer::targets::qwen3_6::create_program<Variant>(empty_model, WeightsProfile::Nvfp4,
+        (void)ninfer::targets::qwen3_8::create_program<Variant>(empty_model, WeightsProfile::Nvfp4,
                                                                  std::move(sequence), device);
     } catch (const std::invalid_argument& error) {
         if (std::string(error.what()).find("weights profile") != std::string::npos) { return 0; }

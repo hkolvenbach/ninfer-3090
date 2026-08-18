@@ -12,4 +12,4 @@ def test_35b_uses_the_measured_27b_ranking() -> None:
     assert draft_head.DEFAULT_RANKING == Path(
         "tools/freq_corpus/fixtures/ranking/ranking.train.counts.i64"
     )
-    assert draft_head.RANKING_SOURCE_TARGET == "qwen3_6_27b"
+    assert draft_head.RANKING_SOURCE_TARGET == "qwen3_8_27b"

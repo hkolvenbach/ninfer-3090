@@ -340,9 +340,13 @@ add_library(ninfer_engine STATIC
 ninfer_internal_includes(ninfer_engine)
 target_include_directories(ninfer_engine PUBLIC ${PROJECT_SOURCE_DIR}/include)
 
-add_subdirectory(targets/qwen3_6)
-add_subdirectory(targets/qwen3_8_27b)
-add_subdirectory(targets/qwen3_6_35b_a3b)
+add_subdirectory(targets/qwen3_8)
+if(NINFER_BUILD_QWEN3_8_27B)
+  add_subdirectory(targets/qwen3_8_27b)
+endif()
+if(NINFER_BUILD_QWEN3_6_35B_A3B)
+  add_subdirectory(targets/qwen3_6_35b_a3b)
+endif()
 
 target_link_libraries(ninfer_engine
   PRIVATE

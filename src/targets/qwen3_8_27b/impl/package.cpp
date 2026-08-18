@@ -1,6 +1,6 @@
 #include <ninfer/targets/qwen3_8_27b/package.h>
-#include <ninfer/targets/qwen3_6/frontend_resources.h>
-#include <ninfer/targets/qwen3_6/prepared_prompt.h>
+#include <ninfer/targets/qwen3_8/frontend_resources.h>
+#include <ninfer/targets/qwen3_8/prepared_prompt.h>
 
 #include "artifact/reader.h"
 #include "targets/qwen3_8_27b/impl/load/bindings.h"
@@ -79,7 +79,7 @@ Package::LoadPlan Package::plan_load(artifact::Binder& binder, const EngineOptio
                                      WeightsProfile weights_profile) {
     return LoadPlan(std::make_unique<LoadPlan::Impl>(
         weights_profile,
-        detail::bind_artifact(binder, weights_profile, qwen3_6::startup_features(options))));
+        detail::bind_artifact(binder, weights_profile, qwen3_8::startup_features(options))));
 }
 
 std::unique_ptr<Package::LoadedModel>
@@ -94,7 +94,7 @@ Package::construct_loaded_model(LoadPlan&& plan, artifact::MaterializedArtifact&
 Package::Frontend Package::make_frontend(const LoadedModel& model,
                                          PrefixCheckpointPolicy prefix_checkpoint_policy) {
     if (model.impl_ == nullptr) { throw std::invalid_argument("loaded model is empty"); }
-    return qwen3_6::make_frontend(model.impl_->data.frontend,
+    return qwen3_8::make_frontend(model.impl_->data.frontend,
                                   model.impl_->data.runtime.features.vision,
                                   prefix_checkpoint_policy);
 }
@@ -102,13 +102,13 @@ Package::Frontend Package::make_frontend(const LoadedModel& model,
 Package::SequencePlanner Package::make_sequence_planner(DeviceContext& device,
                                                         const EngineOptions& options,
                                                         WeightsProfile weights_profile) {
-    return qwen3_6::make_sequence_planner<detail::Variant>(device, options, weights_profile);
+    return qwen3_8::make_sequence_planner<detail::Variant>(device, options, weights_profile);
 }
 
 std::unique_ptr<Package::Program>
 Package::create_program(const LoadedModel& model, SequencePlan&& plan, DeviceContext& device) {
     if (model.impl_ == nullptr) { throw std::invalid_argument("loaded model is empty"); }
-    return qwen3_6::create_program<detail::Variant>(
+    return qwen3_8::create_program<detail::Variant>(
         model.impl_->data.runtime, model.impl_->weights_profile, std::move(plan), device);
 }
 

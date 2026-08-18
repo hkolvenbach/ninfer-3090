@@ -62,7 +62,8 @@ ninfer_add_op_bench(ninfer_mtp_pack_bench SOURCES ops/mtp_pack_bench.cu)
 ninfer_add_op_bench(ninfer_proposal_remap_bench SOURCES ops/proposal_remap_bench.cu)
 
 # End-to-end product benchmark: public Engine API and native .ninfer artifacts only.
-add_executable(ninfer_bench targets/qwen3_8_27b/ninfer_bench.cpp targets/qwen3_8_27b/ninfer_bench_support.cpp)
+if(NINFER_BUILD_QWEN3_8_27B)
+  add_executable(ninfer_bench targets/qwen3_8_27b/ninfer_bench.cpp targets/qwen3_8_27b/ninfer_bench_support.cpp)
 target_include_directories(ninfer_bench PRIVATE
   ${CMAKE_CURRENT_SOURCE_DIR}
   ${PROJECT_SOURCE_DIR}/include
@@ -80,21 +81,24 @@ target_include_directories(ninfer_qwen3_8_27b_mtp_round_bench PRIVATE
   ${PROJECT_SOURCE_DIR}/src
   ${PROJECT_SOURCE_DIR}/third_party
   ${PROJECT_SOURCE_DIR}/src/targets/qwen3_8_27b/export
-  ${PROJECT_SOURCE_DIR}/src/targets/qwen3_6/export)
+  ${PROJECT_SOURCE_DIR}/src/targets/qwen3_8/export)
 target_link_libraries(ninfer_qwen3_8_27b_mtp_round_bench PRIVATE
   ninfer_engine ninfer_core)
+endif()
 
 # Complete production DFlash steady round: confirmed-context append, next proposal, target
 # verification/acceptance, and host publication over a real 35B artifact.
-add_executable(ninfer_qwen3_6_35b_a3b_dflash_round_bench
+if(NINFER_BUILD_QWEN3_6_35B_A3B)
+  add_executable(ninfer_qwen3_6_35b_a3b_dflash_round_bench
   targets/qwen3_6_35b_a3b/dflash_round_bench.cpp)
 target_include_directories(ninfer_qwen3_6_35b_a3b_dflash_round_bench PRIVATE
   ${PROJECT_SOURCE_DIR}/include
   ${PROJECT_SOURCE_DIR}/src
   ${PROJECT_SOURCE_DIR}/third_party
   ${PROJECT_SOURCE_DIR}/src/targets/qwen3_6_35b_a3b/export
-  ${PROJECT_SOURCE_DIR}/src/targets/qwen3_6/export)
+  ${PROJECT_SOURCE_DIR}/src/targets/qwen3_8/export)
 target_link_libraries(ninfer_qwen3_6_35b_a3b_dflash_round_bench PRIVATE
   ninfer_engine ninfer_core)
+endif()
 
 ninfer_add_op_bench(ninfer_q4_linear_swiglu_variants_bench SOURCES ops/q4_linear_swiglu_variants_bench.cu)
