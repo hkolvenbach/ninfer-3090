@@ -10,6 +10,8 @@
 #endif
 
 #include <memory>
+#include <span>
+#include <string_view>
 #include <variant>
 
 namespace ninfer {
@@ -44,7 +46,9 @@ struct Qwen3_8_27BInstance {
 
     Qwen3_8_27BInstance(std::unique_ptr<LoadedQwen3_8_27B> stable_loaded,
                         runtime::KvCapacityResolution resolution,
-                        Qwen3_8_27B::SequencePlan sequence_plan, DeviceContext& device);
+                         Qwen3_8_27B::SequencePlan sequence_plan, DeviceContext& device,
+                         std::string_view model_id, std::string_view weights_id,
+                         std::span<const std::uint8_t> artifact_fingerprint);
     ~Qwen3_8_27BInstance();
 
     Qwen3_8_27BInstance(const Qwen3_8_27BInstance&)            = delete;
@@ -78,7 +82,9 @@ struct Qwen3_6_35BA3BInstance {
 
     Qwen3_6_35BA3BInstance(std::unique_ptr<LoadedQwen3_6_35BA3B> stable_loaded,
                            runtime::KvCapacityResolution resolution,
-                           Qwen3_6_35BA3B::SequencePlan sequence_plan, DeviceContext& device);
+                           Qwen3_6_35BA3B::SequencePlan sequence_plan, DeviceContext& device,
+                            std::string_view model_id, std::string_view weights_id,
+                            std::span<const std::uint8_t> artifact_fingerprint);
     ~Qwen3_6_35BA3BInstance();
 
     Qwen3_6_35BA3BInstance(const Qwen3_6_35BA3BInstance&)            = delete;

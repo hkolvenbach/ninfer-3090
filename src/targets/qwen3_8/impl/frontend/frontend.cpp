@@ -185,7 +185,7 @@ void validate_tokenizer_config(const FrontendResources& resources) {
     if (tokenizer_config.value("add_bos_token", true) ||
         tokenizer_config.value("add_prefix_space", true)) {
         throw std::invalid_argument(
-            "tokenizer_config.json does not match Qwen3.6 tokenizer prefix semantics");
+            "tokenizer_config.json does not match Qwen3.8 tokenizer prefix semantics");
     }
     if (!tokenizer_config.contains("pad_token") || !tokenizer_config.at("pad_token").is_string() ||
         tokenizer_config.at("pad_token").get<std::string>() != "<|endoftext|>") {
@@ -214,7 +214,7 @@ fi::CompiledChatTemplate compile_chat_template(const FrontendResources& resource
     case fi::ProcessorErrorKind::BudgetExceeded:
         throw RequestError(RequestErrorKind::MediaBudgetExceeded, error.what());
     }
-    throw std::logic_error("unknown Qwen3.6 processor error kind");
+    throw std::logic_error("unknown Qwen3.8 processor error kind");
 }
 
 void validate_registered_tokenizer(const fi::Tokenizer& tokenizer) {
@@ -879,13 +879,25 @@ PreparedPrompt Frontend::prepare(PromptInput input) const {
         result.prepare.vision_tokens          = processed.stats.vision_tokens;
         result.prepare.attention_pairs        = processed.stats.attention_pairs;
         result.prepare.patch_bytes            = processed.stats.patch_bytes;
-        result.identity.turn_rewrite_boundary = processed.turn_rewrite_boundary;
+        result.identity.stable_prefix_boundary = processed.stable_prefix_boundary;
+        result.identity.turn_rewrite_boundary  = processed.turn_rewrite_boundary;
+        result.identity.checkpoint_hints.reserve(processed.checkpoint_hints.size());
+        for (const fi::ProcessedInput::CheckpointHint& hint : processed.checkpoint_hints) {
+            result.identity.checkpoint_hints.push_back(
+                {static_cast<PromptCheckpointKind>(hint.kind), hint.boundary});
+        }
     } else {
         const fi::RenderedChat rendered = impl_->chat_template.render(
             messages, render_options(options, impl_->prefix_checkpoint_policy));
         fi::EncodedChat encoded = fi::encode_rendered_chat(*impl_->tokenizer, rendered);
         result.token_ids        = std::move(encoded.input_ids);
+        result.identity.stable_prefix_boundary = encoded.stable_prefix_boundary;
         result.identity.turn_rewrite_boundary = encoded.turn_rewrite_boundary;
+        result.identity.checkpoint_hints.reserve(encoded.checkpoint_hints.size());
+        for (const fi::ProcessedInput::CheckpointHint& hint : encoded.checkpoint_hints) {
+            result.identity.checkpoint_hints.push_back(
+                {static_cast<PromptCheckpointKind>(hint.kind), hint.boundary});
+        }
         assign_text_positions(result);
     }
     (void)checked_token_count(result.token_ids.size());

@@ -182,9 +182,12 @@ int verify_profile_mismatch_rejection() {
     const std::uint32_t pages = planner.capacity_curve().minimum_main_page_groups;
     auto sequence             = std::move(planner).finalize(pages);
     RuntimeModelView empty_model;
+    const std::array<std::uint8_t, 32> artifact_fingerprint{};
     try {
         (void)ninfer::targets::qwen3_8::create_program<Variant>(empty_model, WeightsProfile::Nvfp4,
-                                                                 std::move(sequence), device);
+                                                                std::move(sequence), device,
+                                                                "test-model", "test-weights",
+                                                                artifact_fingerprint);
     } catch (const std::invalid_argument& error) {
         if (std::string(error.what()).find("weights profile") != std::string::npos) { return 0; }
     }

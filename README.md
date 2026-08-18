@@ -4,8 +4,9 @@ NInfer-4090 runs **Qwen3.8-27B** on one 24 GB NVIDIA GeForce RTX 4090. It is an 
 [NInfer-3090](https://github.com/Don-Chad/ninfer-3090), which derives from
 [Neroued/ninfer](https://github.com/Neroued/ninfer), a specialized C++20/CUDA inference engine.
 The engine loads the official groupwise `.ninfer` artifact, serves OpenAI- and
-Anthropic-compatible APIs, and supports paged KV, compatible-prefix reuse, CUDA Graphs, MTP
-speculative decoding, reasoning-effort control, and ReplaySSM state transactions.
+Anthropic-compatible APIs, and supports paged KV, compatible-prefix reuse, a tiered persistent
+continuation cache, CUDA Graphs, MTP speculative decoding, reasoning-effort control, and ReplaySSM
+state transactions.
 
 This fork targets `sm_89` and Linux. Blackwell-only NVFP4/W4A4 execution is unavailable; the
 engine uses the same groupwise-int path as the 3090 base. The Windows path and the
@@ -122,8 +123,16 @@ The E8 Conway-Sloane lattice KV mode (`rk4v4-e8`, ported from
 262,144-token context on 24 GB with 1.4 GiB to spare:
 
 ```bash
-docker run --rm --gpus all --publish 8080:8080 ninfer-4090:sm89
+docker run --rm --gpus all --publish 8080:8080 \
+  --volume ninfer-continuations:/var/cache/ninfer \
+  ninfer-4090:sm89
 ```
+
+The named volume preserves continuation state across container replacement. The image starts with
+`l1-l2-l3`, a 768 MiB retained-VRAM budget, 16 GiB host budget, 48 GiB disk budget, 4 GiB free-space
+reserve, and the `local` namespace below `/var/cache/ninfer`. Omit the volume only when an anonymous,
+container-managed cache is acceptable. The cache accelerates exact compatible prefixes; it is not a
+response/result cache.
 
 The image's default command is equivalent to:
 
@@ -136,6 +145,13 @@ ninfer-serve /opt/ninfer/models/qwen3_8_27b.ninfer \
   --prefill-chunk 1024 --kv-dtype rk4v4-e8 \
   --spec mtp --draft-tokens 3 --lm-head-draft \
   --prefix-checkpoint-policy rolling-tool \
+  --continuation-cache l1-l2-l3 \
+  --continuation-cache-dir /var/cache/ninfer \
+  --continuation-cache-namespace local \
+  --continuation-cache-l1-mib 768 \
+  --continuation-cache-l2-mib 16384 \
+  --continuation-cache-l3-mib 49152 \
+  --continuation-cache-filesystem-reserve-mib 4096 \
   --preserve-thinking
 ```
 
@@ -148,6 +164,7 @@ code-detail retrieval through 260K tokens.
 
 ```bash
 docker run --rm --gpus all --publish 8080:8080 \
+  --volume ninfer-continuations:/var/cache/ninfer \
   ninfer-4090:sm89 \
   ninfer-serve /opt/ninfer/models/qwen3_8_27b.ninfer \
   --host 0.0.0.0 --port 8080 \
@@ -155,6 +172,9 @@ docker run --rm --gpus all --publish 8080:8080 \
   --max-concurrency 1 --max-pending-requests 16 \
   --prefill-chunk 1024 --kv-dtype int8 \
   --spec mtp --draft-tokens 3 --lm-head-draft \
+  --continuation-cache l1-l2-l3 \
+  --continuation-cache-dir /var/cache/ninfer \
+  --continuation-cache-filesystem-reserve-mib 4096 \
   --preserve-thinking
 ```
 
@@ -162,6 +182,7 @@ docker run --rm --gpus all --publish 8080:8080 \
 
 ```bash
 docker run --rm --gpus all --publish 8080:8080 \
+  --volume ninfer-continuations:/var/cache/ninfer \
   ninfer-4090:sm89 \
   ninfer-serve /opt/ninfer/models/qwen3_8_27b.ninfer \
   --host 0.0.0.0 --port 8080 \
@@ -169,6 +190,9 @@ docker run --rm --gpus all --publish 8080:8080 \
   --max-concurrency 1 --max-pending-requests 16 \
   --prefill-chunk 1024 --kv-dtype int8 \
   --spec mtp --draft-tokens 3 --lm-head-draft \
+  --continuation-cache l1-l2-l3 \
+  --continuation-cache-dir /var/cache/ninfer \
+  --continuation-cache-filesystem-reserve-mib 4096 \
   --vision --preserve-thinking
 ```
 
@@ -222,7 +246,13 @@ The default build registers only Qwen3.8-27B. Enable the optional Qwen3.6-35B-A3
   `llamacpp:requests_processing`, `llamacpp:requests_deferred`), so existing scrapers read this
   server without changes. Prompt tokens count only computed prefill; prefix-cache hits are
   excluded, as in llama.cpp. Additional `ninfer:` series report request totals, prefix-cache
-  hits, and MTP draft/acceptance totals.
+  hits, MTP draft/acceptance totals, and continuation-cache lookup, restore, persistence, L1, L2,
+  and L3 occupancy/activity.
+- **Tiered continuation cache.** Complete Qwen state can move from retained GPU lanes to host RAM
+  and a restart-persistent local content-addressed store. `prompt_cache_key` routes session heads,
+  automatic exact stable-prefix aliases share fixed system/tool prefixes, and every restore remains
+  gated by full artifact/runtime and prepared-prefix identity. See
+  [Tiered continuation cache](docs/continuation-cache.md).
 - **`GET /slots`.** A llama.cpp-shaped slot table built from in-flight requests, for dashboards
   that poll slot state. Entries are HTTP-layer FIFO positions; per-slot cache detail is unknown
   mid-flight and reported as zero.
@@ -259,7 +289,10 @@ The default build registers only Qwen3.8-27B. Enable the optional Qwen3.6-35B-A3
 | Qwen3.8-27B | [official NInfer groupwise artifact](https://huggingface.co/neroued/Qwen3.8-27B-NInfer) | 16.96 GiB |
 
 The artifact is architecture-independent; the model card's RTX 5090 requirement describes the
-upstream engine, not the file. Verify the download against the SHA-256 published on the card.
+upstream engine, not the file. The published Qwen3.8 file SHA-256 is
+`eec39564993d6e9c7d5e383382a760f093465c9d163ec9a1bd6b80199514bf3e`, which the Docker build
+verifies. Continuation compatibility includes SHA-256 of the complete artifact, so modified or
+repacked artifact bytes safely miss existing entries even when model dimensions match.
 
 ## Reasoning effort
 

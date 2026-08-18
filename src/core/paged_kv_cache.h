@@ -12,6 +12,8 @@
 
 namespace ninfer {
 
+class PinnedTransferBuffer;
+
 inline constexpr std::int32_t kPagedKVPageSize = 64;
 
 /**
@@ -84,6 +86,20 @@ struct PagedKVPoolSpec {
     std::vector<PagedKVPlaneSpec> planes;
 };
 
+/**
+ * Pointer-free payload for one allocation in logical page order.
+ *
+ * Page-major planes are encoded as [logical_page][head][token][leading]. Head-major planes are
+ * encoded as [head][logical_page][token][leading]. Bytes outside valid_tokens in the final page
+ * are zero, so allocator history cannot affect identity or persistence.
+ */
+struct PagedKVLogicalImage {
+    std::uint32_t valid_tokens = 0;
+    PagedKVPlaneOrder plane_order = PagedKVPlaneOrder::PageMajor;
+    std::vector<PagedKVPlaneSpec> planes;
+    std::vector<std::vector<std::uint8_t>> payloads;
+};
+
 struct PagedKVPlaneLayout {
     PagedKVPlaneSpec spec;
     TensorRegion storage;
@@ -117,6 +133,8 @@ public:
     [[nodiscard]] std::uint32_t logical_page_capacity() const noexcept;
     [[nodiscard]] std::int32_t table_row_count() const noexcept;
     [[nodiscard]] std::size_t plane_count() const noexcept;
+    [[nodiscard]] PagedKVPlaneOrder plane_order() const noexcept;
+    [[nodiscard]] const PagedKVPlaneSpec& plane_spec(std::size_t index) const;
     [[nodiscard]] const Tensor& plane(std::size_t index) const;
     [[nodiscard]] const Tensor& block_tables() const noexcept;
     [[nodiscard]] Tensor block_table_row(std::int32_t row) const;
@@ -133,6 +151,18 @@ public:
 private:
     friend class PagedKVAllocation;
     friend void resize_paged_kv_bundle(std::span<const PagedKVResize> changes);
+    friend PagedKVLogicalImage export_paged_kv_logical(const PagedKVAllocation& allocation,
+                                                         std::uint32_t valid_tokens,
+                                                         cudaStream_t stream);
+    friend PagedKVLogicalImage export_paged_kv_logical(const PagedKVAllocation& allocation,
+                                                        std::uint32_t valid_tokens,
+                                                        PinnedTransferBuffer& transfer,
+                                                        cudaStream_t stream);
+    friend void import_paged_kv_logical(PagedKVAllocation& allocation,
+                                         const PagedKVLogicalImage& image, cudaStream_t stream);
+    friend void import_paged_kv_logical(PagedKVAllocation& allocation,
+                                         const PagedKVLogicalImage& image,
+                                         PinnedTransferBuffer& transfer, cudaStream_t stream);
 
     [[nodiscard]] bool can_replace_entitlement(std::uint32_t old_pages,
                                                std::uint32_t new_pages) const noexcept;
@@ -188,6 +218,18 @@ public:
 private:
     friend class PagedKVPool;
     friend void resize_paged_kv_bundle(std::span<const PagedKVResize> changes);
+    friend PagedKVLogicalImage export_paged_kv_logical(const PagedKVAllocation& allocation,
+                                                         std::uint32_t valid_tokens,
+                                                         cudaStream_t stream);
+    friend PagedKVLogicalImage export_paged_kv_logical(const PagedKVAllocation& allocation,
+                                                        std::uint32_t valid_tokens,
+                                                        PinnedTransferBuffer& transfer,
+                                                        cudaStream_t stream);
+    friend void import_paged_kv_logical(PagedKVAllocation& allocation,
+                                         const PagedKVLogicalImage& image, cudaStream_t stream);
+    friend void import_paged_kv_logical(PagedKVAllocation& allocation,
+                                         const PagedKVLogicalImage& image,
+                                         PinnedTransferBuffer& transfer, cudaStream_t stream);
 
     PagedKVAllocation(PagedKVPool& pool, std::uint32_t page_entitlement);
     void publish_range(std::uint32_t first_page, std::uint32_t page_count,
@@ -198,6 +240,19 @@ private:
     std::uint32_t page_entitlement_ = 0;
     std::int32_t bound_row_         = -1;
 };
+
+// These synchronous boundary operations never serialize physical page IDs. Import materializes
+// fresh pages as needed but does not bind a block-table row.
+[[nodiscard]] PagedKVLogicalImage
+export_paged_kv_logical(const PagedKVAllocation& allocation, std::uint32_t valid_tokens,
+                         cudaStream_t stream = nullptr);
+[[nodiscard]] PagedKVLogicalImage
+export_paged_kv_logical(const PagedKVAllocation& allocation, std::uint32_t valid_tokens,
+                        PinnedTransferBuffer& transfer, cudaStream_t stream = nullptr);
+void import_paged_kv_logical(PagedKVAllocation& allocation, const PagedKVLogicalImage& image,
+                              cudaStream_t stream = nullptr);
+void import_paged_kv_logical(PagedKVAllocation& allocation, const PagedKVLogicalImage& image,
+                             PinnedTransferBuffer& transfer, cudaStream_t stream = nullptr);
 
 struct PagedKVReservation {
     PagedKVPool* pool              = nullptr;

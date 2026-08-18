@@ -209,8 +209,65 @@ bool Program<Variant>::has_retained_lane(std::uint32_t lane) const noexcept {
 }
 
 template <>
+std::size_t Program<Variant>::retained_lane_resident_bytes(std::uint32_t lane) const noexcept {
+    return impl_->retained_lane_resident_bytes(lane);
+}
+
+template <>
+std::size_t Program<Variant>::retained_lane_reused_bytes(
+    std::uint32_t lane, const RequestPlan<Variant>& plan) const noexcept {
+    return plan.impl_ == nullptr ? 0 : impl_->retained_lane_reused_bytes(lane, *plan.impl_);
+}
+
+template <>
 void Program<Variant>::evict_retained_lane(std::uint32_t lane) noexcept {
     impl_->evict_retained_lane(lane);
+}
+
+template <>
+cache::ContinuationImage Program<Variant>::export_continuation_lane(std::uint32_t lane) const {
+    return impl_->export_continuation_lane(lane);
+}
+
+template <>
+std::optional<std::string>
+Program<Variant>::stable_prefix_alias(const PreparedPrompt& prompt) const {
+    return impl_->stable_prefix_alias(PreparedPromptAccess::view(prompt));
+}
+
+template <>
+std::optional<cache::ContinuationImage>
+Program<Variant>::take_stable_continuation_lane(std::uint32_t lane) {
+    return impl_->take_stable_continuation_lane(lane);
+}
+
+template <>
+std::uint32_t
+Program<Variant>::preflight_continuation_metadata(
+    const cache::SessionCandidateDescriptor& candidate,
+    const PreparedPrompt& prompt) const noexcept {
+    try {
+        return impl_->preflight_continuation_metadata(candidate,
+                                                      PreparedPromptAccess::view(prompt));
+    } catch (...) { return 0; }
+}
+
+template <>
+std::uint32_t
+Program<Variant>::preflight_continuation(const cache::ContinuationImage& image,
+                                         const PreparedPrompt& prompt) const noexcept {
+    try {
+        return impl_->preflight_continuation(image, PreparedPromptAccess::view(prompt));
+    } catch (...) { return 0; }
+}
+
+template <>
+bool Program<Variant>::import_continuation_lane(std::uint32_t lane,
+                                                const cache::ContinuationImage& image,
+                                                const PreparedPrompt& prompt) noexcept {
+    try {
+        return impl_->import_continuation_lane(lane, image, PreparedPromptAccess::view(prompt));
+    } catch (...) { return false; }
 }
 
 template <>
@@ -244,13 +301,16 @@ SequencePlanner<Variant> make_sequence_planner<Variant>(DeviceContext& device,
 template <>
 std::unique_ptr<Program<Variant>>
 create_program<Variant>(const Variant::ModelView& model, Variant::WeightsProfile weights_profile,
-                        SequencePlan<Variant>&& plan, DeviceContext& device) {
+                          SequencePlan<Variant>&& plan, DeviceContext& device,
+                          std::string_view model_id, std::string_view weights_id,
+                          std::span<const std::uint8_t> artifact_fingerprint) {
     if (plan.impl_ == nullptr) { throw std::invalid_argument("sequence plan is empty"); }
     if (plan.impl_->weights_profile != weights_profile) {
         throw std::invalid_argument(
             "loaded model weights profile does not match the sequence plan");
     }
-    auto impl = std::make_unique<detail::ProgramImpl<Variant>>(model, *plan.impl_, device);
+    auto impl = std::make_unique<detail::ProgramImpl<Variant>>(model, *plan.impl_, device, model_id,
+                                                                weights_id, artifact_fingerprint);
     plan.impl_.reset();
     return std::unique_ptr<Program<Variant>>(new Program<Variant>(std::move(impl)));
 }

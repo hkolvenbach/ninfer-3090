@@ -173,6 +173,7 @@ struct GenerationRequest {
     std::string reasoning_effort_param = "reasoning_effort";
     std::optional<bool> preserve_thinking;
     bool preserve_thinking_semantic_change = false;
+    std::optional<std::string> prompt_cache_routing_hint;
     SamplingParams sampling;
 
     [[nodiscard]] bool uses_tools() const noexcept {

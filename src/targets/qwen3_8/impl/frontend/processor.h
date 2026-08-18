@@ -96,7 +96,13 @@ struct ProcessedInput {
     // Row-major [sum(raw_patches), 1536], in the exact merger-friendly order.
     std::vector<float> patches;
     std::vector<VisionItem> vision_items;
+    std::optional<std::uint32_t> stable_prefix_boundary;
     std::optional<std::uint32_t> turn_rewrite_boundary;
+    struct CheckpointHint {
+        SemanticCheckpointKind kind = SemanticCheckpointKind::StablePrefix;
+        std::uint32_t boundary      = 0;
+    };
+    std::vector<CheckpointHint> checkpoint_hints;
     PreprocessStats stats;
 
     [[nodiscard]] std::span<const std::int32_t> position_axis(int axis) const;
@@ -104,8 +110,14 @@ struct ProcessedInput {
 
 struct EncodedChat {
     std::vector<int> input_ids;
+    std::optional<std::uint32_t> stable_prefix_boundary;
     std::optional<std::uint32_t> turn_rewrite_boundary;
+    std::vector<ProcessedInput::CheckpointHint> checkpoint_hints;
 };
+
+void adjust_rendered_boundaries_for_replacement(RenderedChat& rendered, std::size_t position,
+                                                std::size_t needle_size,
+                                                std::size_t replacement_size);
 
 EncodedChat encode_rendered_chat(const Tokenizer& tokenizer, const RenderedChat& rendered);
 

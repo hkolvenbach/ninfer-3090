@@ -3,6 +3,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <filesystem>
+#include <functional>
 #include <memory>
 #include <span>
 #include <stdexcept>
@@ -10,6 +11,8 @@
 #include <string_view>
 #include <variant>
 #include <vector>
+
+#include "artifact/sha256.h"
 
 namespace ninfer::artifact {
 
@@ -114,11 +117,27 @@ struct ArtifactIdentity {
     bool operator==(const ArtifactIdentity&) const = default;
 };
 
+enum class FingerprintProgressPhase {
+    Scan,
+    CacheHit,
+};
+
+using FingerprintProgress = std::function<void(FingerprintProgressPhase phase,
+                                               std::uint64_t completed_bytes,
+                                               std::uint64_t total_bytes)>;
+
+struct FingerprintCacheOptions {
+    std::filesystem::path directory;
+    std::string cache_namespace;
+};
+
 class Reader {
 public:
     static constexpr std::size_t direct_io_alignment = 4096;
 
-    explicit Reader(const std::filesystem::path& path);
+    explicit Reader(const std::filesystem::path& path,
+                    FingerprintCacheOptions fingerprint_cache = {},
+                    FingerprintProgress fingerprint_progress = {});
     ~Reader();
 
     Reader(Reader&&) noexcept;
@@ -132,6 +151,7 @@ public:
 
     std::uint64_t file_bytes() const noexcept;
     std::uint64_t payload_offset() const noexcept;
+    const Sha256Digest& content_fingerprint() const noexcept;
     PayloadSpan payload(const ObjectDescriptor& object) const;
     PayloadSpan payload(std::string_view name) const;
     std::size_t read_direct(std::uint64_t absolute_offset, std::span<std::byte> destination) const;

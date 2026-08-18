@@ -21,6 +21,7 @@ std::map<std::string, double> parse(const std::string& body) {
     std::istringstream lines(body);
     std::string line;
     while (std::getline(lines, line)) {
+        if (line.starts_with('#')) { continue; }
         const auto space = line.find(' ');
         if (space == std::string::npos) { continue; }
         values[line.substr(0, space)] = std::stod(line.substr(space + 1));
@@ -31,13 +32,13 @@ std::map<std::string, double> parse(const std::string& body) {
 GenerationOutcome outcome(int prompt, std::uint32_t cached, int completion, double prefill_s,
                           double decode_s, std::uint64_t drafted, std::uint64_t accepted) {
     GenerationOutcome out;
-    out.prompt_tokens                        = prompt;
-    out.completion_tokens                    = completion;
-    out.metrics.prefix_cache_hit_tokens      = cached;
-    out.metrics.prefill_seconds              = prefill_s;
-    out.metrics.decode_seconds               = decode_s;
-    out.metrics.speculative_draft_tokens     = drafted;
-    out.metrics.speculative_accepted_tokens  = accepted;
+    out.prompt_tokens                       = prompt;
+    out.completion_tokens                   = completion;
+    out.metrics.prefix_cache_hit_tokens     = cached;
+    out.metrics.prefill_seconds             = prefill_s;
+    out.metrics.decode_seconds              = decode_s;
+    out.metrics.speculative_draft_tokens    = drafted;
+    out.metrics.speculative_accepted_tokens = accepted;
     return out;
 }
 
@@ -85,16 +86,100 @@ int main() {
     failures += check(warm.prompt_tokens == 1200 && warm.cached_tokens == 900,
                       "last completed after warm request");
 
-    const auto values = parse(metrics.render(1));
+    ninfer::RuntimeStats runtime;
+    runtime.continuation_lookup_hits           = 7;
+    runtime.continuation_lookup_misses         = 3;
+    runtime.continuation_preflight_rejections  = 2;
+    runtime.continuation_restore_successes     = 5;
+    runtime.continuation_restore_failures      = 1;
+    runtime.continuation_publication_successes = 4;
+    runtime.continuation_publication_failures  = 2;
+    runtime.continuation_publication_superseded = 3;
+    runtime.continuation_restored_tokens       = 123;
+    runtime.continuation_restored_bytes        = 456;
+    runtime.continuation_persistence_queued    = 12;
+    runtime.continuation_persistence_coalesced = 5;
+    runtime.continuation_persistence_successes = 6;
+    runtime.continuation_persistence_failures  = 1;
+    runtime.continuation_l2_entries            = 3;
+    runtime.continuation_l2_bytes              = 1000;
+    runtime.continuation_l3_entries            = 4;
+    runtime.continuation_l3_bytes              = 2000;
+    runtime.l1_evictions                        = 8;
+    runtime.l1_demotions                        = 6;
+    runtime.l1_resident_entries                 = 2;
+    runtime.l1_resident_bytes                   = 789;
+    runtime.continuation_l1_restore_successes   = 2;
+    runtime.continuation_l2_restore_successes   = 3;
+    runtime.continuation_l3_restore_successes   = 4;
+    runtime.continuation_miss_disabled          = 5;
+    runtime.continuation_miss_no_alias          = 6;
+    runtime.continuation_miss_entry_unavailable_or_corrupt = 7;
+    runtime.continuation_miss_not_deeper        = 8;
+    runtime.continuation_miss_preflight_rejected = 9;
+    runtime.continuation_miss_rollback_conflict = 10;
+    runtime.continuation_miss_no_lane           = 11;
+    runtime.continuation_miss_restore_failed    = 6;
+    runtime.continuation_l2_lookup_microseconds = 700;
+    runtime.continuation_l3_lookup_operations   = 8;
+    runtime.continuation_l2_admission_microseconds = 900;
+    runtime.continuation_l3_persistence_operations = 10;
+    const auto values                          = parse(metrics.render(1, runtime));
+    const std::string rendered                 = metrics.render(1, runtime);
+    failures += check(rendered.find("# TYPE ninfer:continuation_restore_successes_total counter") !=
+                              std::string::npos &&
+                          rendered.find("# TYPE ninfer:continuation_l2_bytes gauge") !=
+                              std::string::npos &&
+                          rendered.find("# TYPE ninfer:l1_resident_entries gauge") !=
+                              std::string::npos,
+                      "Prometheus counter and gauge types rendered");
     failures += check(values.at("llamacpp:prompt_tokens_total") == 1300.0, "computed prefill sum");
     failures += check(values.at("llamacpp:prompt_seconds_total") == 0.6, "prefill seconds sum");
     failures += check(values.at("llamacpp:tokens_predicted_total") == 300.0, "decode tokens sum");
-    failures += check(values.at("llamacpp:tokens_predicted_seconds_total") == 6.0,
-                      "decode seconds sum");
+    failures +=
+        check(values.at("llamacpp:tokens_predicted_seconds_total") == 6.0, "decode seconds sum");
     failures += check(values.at("ninfer:requests_total") == 2.0, "request count");
     failures += check(values.at("ninfer:prefix_cache_hit_tokens_total") == 900.0, "cache hits");
     failures += check(values.at("ninfer:draft_tokens_total") == 450.0, "draft tokens");
     failures += check(values.at("ninfer:draft_accepted_tokens_total") == 225.0, "accepted tokens");
+    failures += check(values.at("ninfer:continuation_lookup_hits_total") == 7.0 &&
+                          values.at("ninfer:continuation_lookup_misses_total") == 3.0 &&
+                          values.at("ninfer:continuation_restore_successes_total") == 5.0 &&
+                            values.at("ninfer:continuation_publication_failures_total") == 2.0 &&
+                            values.at("ninfer:continuation_publication_superseded_total") == 3.0 &&
+                           values.at("ninfer:continuation_restored_tokens_total") == 123.0 &&
+                            values.at("ninfer:continuation_restored_bytes_total") == 456.0 &&
+                            values.at("ninfer:continuation_persistence_queued_total") == 12.0 &&
+                            values.at("ninfer:continuation_persistence_coalesced_total") == 5.0 &&
+                            values.at("ninfer:continuation_persistence_successes_total") == 6.0 &&
+                            values.at("ninfer:continuation_persistence_failures_total") == 1.0 &&
+                            values.at("ninfer:continuation_l2_entries") == 3.0 &&
+                            values.at("ninfer:continuation_l2_bytes") == 1000.0 &&
+                            values.at("ninfer:continuation_l3_entries") == 4.0 &&
+                            values.at("ninfer:continuation_l3_bytes") == 2000.0 &&
+                           values.at("ninfer:l1_evictions_total") == 8.0 &&
+                           values.at("ninfer:l1_demotions_total") == 6.0 &&
+                           values.at("ninfer:l1_resident_entries") == 2.0 &&
+                            values.at("ninfer:l1_resident_bytes") == 789.0,
+                       "continuation runtime counters rendered");
+    failures += check(values.at("ninfer:continuation_l1_restore_successes_total") == 2.0 &&
+                          values.at("ninfer:continuation_l2_restore_successes_total") == 3.0 &&
+                           values.at("ninfer:continuation_l3_restore_successes_total") == 4.0 &&
+                           values.at("ninfer:continuation_miss_disabled_total") == 5.0 &&
+                           values.at("ninfer:continuation_miss_no_alias_total") == 6.0 &&
+                           values.at(
+                               "ninfer:continuation_miss_entry_unavailable_or_corrupt_total") ==
+                               7.0 &&
+                           values.at("ninfer:continuation_miss_not_deeper_total") == 8.0 &&
+                           values.at("ninfer:continuation_miss_preflight_rejected_total") == 9.0 &&
+                           values.at("ninfer:continuation_miss_rollback_conflict_total") == 10.0 &&
+                           values.at("ninfer:continuation_miss_no_lane_total") == 11.0 &&
+                           values.at("ninfer:continuation_miss_restore_failed_total") == 6.0 &&
+                          values.at("ninfer:continuation_l2_lookup_microseconds_total") == 700.0 &&
+                          values.at("ninfer:continuation_l3_lookup_operations_total") == 8.0 &&
+                          values.at("ninfer:continuation_l2_admission_microseconds_total") == 900.0 &&
+                          values.at("ninfer:continuation_l3_persistence_operations_total") == 10.0,
+                      "stable tier, reason, latency, and persistence metric names rendered");
 
     // A cache hit reported larger than the prompt must clamp, not underflow.
     metrics.record(outcome(10, 50, 1, 0.0, 0.1, 0, 0));

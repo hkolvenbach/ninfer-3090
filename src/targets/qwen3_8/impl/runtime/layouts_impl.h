@@ -603,7 +603,7 @@ void validate_target_options(DeviceContext& device, const EngineOptions& options
         break;
     }
     if (device.sm() != 89) {
-        throw std::invalid_argument("Qwen3.6 family runtime requires compute capability 8.9");
+        throw std::invalid_argument("Qwen3.8 family runtime requires compute capability 8.9");
     }
 }
 
@@ -762,7 +762,7 @@ make_sequence_planner_impl(DeviceContext& device, const EngineOptions& options,
     if (minimum_pages < maximum_pages) {
         auto adjacent = build_sequence_candidate(inputs, minimum_pages + 1U);
         if (adjacent->device_reservation_bytes <= planner->minimum->device_reservation_bytes) {
-            throw std::logic_error("Qwen3.6 sequence layout has a nonpositive KV capacity stride");
+            throw std::logic_error("Qwen3.8 sequence layout has a nonpositive KV capacity stride");
         }
         planner->curve.bytes_per_additional_main_page_group =
             adjacent->device_reservation_bytes - planner->minimum->device_reservation_bytes;
@@ -774,7 +774,7 @@ std::unique_ptr<SequencePlanImpl>
 finalize_sequence_plan_impl(std::unique_ptr<qwen3_8::detail::SequencePlannerImpl<Variant>> planner,
                             std::uint32_t main_page_groups) {
     if (planner == nullptr || planner->minimum == nullptr) {
-        throw std::invalid_argument("Qwen3.6 sequence planner is empty");
+        throw std::invalid_argument("Qwen3.8 sequence planner is empty");
     }
     const std::size_t expected = planner->curve.reservation_bytes(main_page_groups);
     std::unique_ptr<SequencePlanImpl> plan;
@@ -785,7 +785,7 @@ finalize_sequence_plan_impl(std::unique_ptr<qwen3_8::detail::SequencePlannerImpl
     }
     if (plan->device_reservation_bytes != expected) {
         throw std::logic_error(
-            "Qwen3.6 physical sequence layout is not affine in Main KV page capacity");
+            "Qwen3.8 physical sequence layout is not affine in Main KV page capacity");
     }
     return plan;
 }

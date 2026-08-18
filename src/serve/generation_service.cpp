@@ -260,6 +260,7 @@ GenerationService::GenerationService(ServeOptions options, LoadProgress load_pro
     engine_options.prefill_chunk        = options_.prefill_chunk;
     engine_options.kv_cache             = options_.kv_cache;
     engine_options.prefix_checkpoint_policy = options_.prefix_checkpoint_policy;
+    engine_options.continuation_cache   = options_.continuation_cache;
     engine_options.enable_vision        = options_.enable_vision;
     engine_options.use_cuda_graph       = options_.use_cuda_graph;
     engine_options.speculative          = options_.speculative;
@@ -341,6 +342,7 @@ PreparedRequest GenerationService::prepare(const GenerationRequest& request,
     prepared.enable_thinking                   = semantics.enable_thinking;
     prepared.preserve_thinking                 = semantics.preserve_thinking;
     prepared.preserve_thinking_semantic_change = request.preserve_thinking_semantic_change;
+    prepared.prompt_cache_routing_hint         = request.prompt_cache_routing_hint;
     const std::size_t media_items              = media_item_count(request);
     const bool request_has_media               = media_items != 0;
     if (request_has_media && !options_.enable_vision) {
@@ -451,6 +453,7 @@ GenerationOutcome GenerationService::run(PreparedRequest& prepared, const Stream
         std::max(0.0, result.timings.total_seconds - result.timings.prepare_seconds);
     outcome.metrics.prefix_cache_hit_tokens     = result.reused_prompt_tokens;
     outcome.metrics.prefix_reuse_path           = result.prefix_reuse_path;
+    outcome.metrics.continuation                = result.continuation;
     outcome.metrics.speculative_backend         = result.speculative.backend;
     outcome.metrics.speculative_draft_window    = result.speculative.draft_window;
     outcome.metrics.speculative_rounds          = result.speculative.rounds;

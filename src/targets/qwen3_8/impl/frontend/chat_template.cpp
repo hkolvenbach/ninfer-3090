@@ -82,7 +82,7 @@ std::string rstrip_newlines(std::string text) {
     return text.substr(0, end);
 }
 
-// Split an assistant turn into (reasoning, content) exactly as the Qwen3.6 jinja
+// Split an assistant turn into (reasoning, content) exactly as the Qwen3.8 jinja
 // does when reasoning_content is not provided: reasoning is the text between the
 // last <think> and the first </think>; content is everything after the last
 // </think>. When there is no </think> the whole thing is content and reasoning is
@@ -342,6 +342,13 @@ RenderedChat CompiledChatTemplate::render(const std::vector<ChatMessage>& messag
         rendered += reasoning_instructions;
         rendered += "<|im_end|>\n";
     }
+    const std::optional<std::size_t> stable_prefix_byte_offset =
+        rendered.empty() ? std::nullopt : std::optional<std::size_t>(rendered.size());
+    std::vector<SemanticCheckpointByteHint> checkpoint_hints;
+    if (stable_prefix_byte_offset) {
+        checkpoint_hints.push_back(
+            {SemanticCheckpointKind::StablePrefix, *stable_prefix_byte_offset});
+    }
 
     const long last_query_index = last_real_user_query(messages);
     std::optional<std::size_t> stable_turn_byte_offset;
@@ -375,7 +382,9 @@ RenderedChat CompiledChatTemplate::render(const std::vector<ChatMessage>& messag
             rendered += "\n<tool_response>\n";
             rendered += content;
             rendered += "\n</tool_response>";
-            if (closes_group) { rendered += "<|im_end|>\n"; }
+            if (closes_group) {
+                rendered += "<|im_end|>\n";
+            }
             continue;
         }
 
@@ -396,6 +405,10 @@ RenderedChat CompiledChatTemplate::render(const std::vector<ChatMessage>& messag
         rendered += "<|im_start|>assistant\n";
         if (!stable_turn_byte_offset && static_cast<long>(i) > last_query_index) {
             stable_turn_byte_offset = rendered.size();
+            checkpoint_hints.push_back(
+                {SemanticCheckpointKind::StableTurn, *stable_turn_byte_offset});
+        } else if (static_cast<long>(i) > last_query_index && has_completed_tool_history) {
+            checkpoint_hints.push_back({SemanticCheckpointKind::Rolling, rendered.size()});
         }
         if (keep_thinking) {
             rendered += "<think>\n";
@@ -420,7 +433,14 @@ RenderedChat CompiledChatTemplate::render(const std::vector<ChatMessage>& messag
     if (options.add_generation_prompt) {
         rendered += "<|im_start|>assistant\n";
         rolling_tool_byte_offset = rendered.size();
-        if (!stable_turn_byte_offset) { stable_turn_byte_offset = rolling_tool_byte_offset; }
+        if (!stable_turn_byte_offset) {
+            stable_turn_byte_offset = rolling_tool_byte_offset;
+            checkpoint_hints.push_back(
+                {SemanticCheckpointKind::StableTurn, *stable_turn_byte_offset});
+        } else if (has_completed_tool_history) {
+            checkpoint_hints.push_back(
+                {SemanticCheckpointKind::Rolling, *rolling_tool_byte_offset});
+        }
         if (options.enable_thinking) {
             rendered += "<think>\n";
         } else {
@@ -432,8 +452,11 @@ RenderedChat CompiledChatTemplate::render(const std::vector<ChatMessage>& messag
                 has_completed_tool_history && rolling_tool_byte_offset
             ? rolling_tool_byte_offset
             : stable_turn_byte_offset;
-    return RenderedChat{.text                     = std::move(rendered),
-                        .turn_rewrite_byte_offset = turn_rewrite_byte_offset};
+    return RenderedChat{
+        .text                              = std::move(rendered),
+        .stable_prefix_byte_offset         = stable_prefix_byte_offset,
+        .turn_rewrite_byte_offset          = turn_rewrite_byte_offset,
+        .checkpoint_hints                  = std::move(checkpoint_hints)};
 }
 
 } // namespace ninfer::targets::qwen3_8::frontend_internal

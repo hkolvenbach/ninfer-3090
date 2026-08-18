@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <limits>
 #include <stdexcept>
+#include <utility>
 
 namespace ninfer::targets::qwen3_8::detail {
 namespace {
@@ -112,6 +113,36 @@ void ResidentPrefixIdentity::truncate(std::size_t tokens) {
     vision_items_.resize(retained_items);
 }
 
+ResidentPrefixIdentitySnapshot ResidentPrefixIdentity::export_prefix(std::size_t tokens) const {
+    if (tokens > size()) {
+        throw std::out_of_range("cannot export beyond resident prefix identity");
+    }
+
+    ResidentPrefixIdentitySnapshot snapshot;
+    snapshot.token_types.assign(token_types_.begin(),
+                                token_types_.begin() + static_cast<std::ptrdiff_t>(tokens));
+    for (std::size_t axis = 0; axis < positions_.size(); ++axis) {
+        snapshot.positions[axis].assign(positions_[axis].begin(),
+                                        positions_[axis].begin() +
+                                            static_cast<std::ptrdiff_t>(tokens));
+    }
+    // Keep complete items, including suffix and frontier-crossing items. prefix_matches uses them
+    // to decide whether a frontier is reusable, so pruning here would duplicate that policy.
+    snapshot.vision_items = vision_items_;
+    return snapshot;
+}
+
+void ResidentPrefixIdentity::restore(ResidentPrefixIdentitySnapshot snapshot) {
+    for (const auto& axis : snapshot.positions) {
+        if (axis.size() != snapshot.token_types.size()) {
+            throw std::invalid_argument("resident prefix identity snapshot has an invalid shape");
+        }
+    }
+    token_types_  = std::move(snapshot.token_types);
+    positions_    = std::move(snapshot.positions);
+    vision_items_ = std::move(snapshot.vision_items);
+}
+
 bool ResidentPrefixIdentity::matches(const PreparedPromptData& prompt, std::size_t count) const {
     const std::size_t prompt_tokens = prompt.token_ids.size();
     if (count > prompt_tokens || count > size() || prompt.token_types.size() != prompt_tokens ||
@@ -152,6 +183,25 @@ bool prefix_matches(const PreparedPromptData& prompt, const std::vector<TokenId>
                       prompt.token_ids.begin() + static_cast<std::ptrdiff_t>(count),
                       resident_tokens.begin()) &&
            resident_identity.matches(prompt, count);
+}
+
+std::uint32_t continuation_reuse_depth(
+    const PreparedPromptData& prompt, const std::vector<TokenId>& resident_tokens,
+    const ResidentPrefixIdentity& resident_identity, std::uint32_t frontier,
+    std::optional<std::uint32_t> boundary) {
+    const bool frontier_matches =
+        prefix_matches(prompt, resident_tokens, resident_identity, frontier);
+    const bool boundary_matches =
+        boundary && *boundary < prompt.token_ids.size() &&
+        prefix_matches(prompt, resident_tokens, resident_identity, *boundary);
+    if (!frontier_matches && !boundary_matches) return 0;
+
+    const std::uint32_t depth = frontier_matches ? frontier : *boundary;
+    const auto desired        = prompt.identity.turn_rewrite_boundary;
+    const bool can_keep_checkpoint =
+        desired && boundary && *boundary == *desired &&
+        prefix_matches(prompt, resident_tokens, resident_identity, *desired);
+    return desired && *desired <= depth && !can_keep_checkpoint ? 0 : depth;
 }
 
 } // namespace ninfer::targets::qwen3_8::detail

@@ -28,6 +28,15 @@ constexpr std::int32_t kDenseRows         = 2304;
 constexpr std::int32_t kDenseD            = 1152;
 constexpr std::int32_t kQ6Group           = 64;
 constexpr std::int32_t kW8Group           = 32;
+constexpr std::size_t kGuardBytes         = 256;
+
+constexpr std::size_t quantized_peak_device_bytes() {
+    const std::size_t table = static_cast<std::size_t>(kVocab) * kW8TextD +
+                              static_cast<std::size_t>(kVocab) * (kW8TextD / kW8Group) * 2;
+    const std::size_t ids    = 1024 * sizeof(std::int32_t);
+    const std::size_t output = static_cast<std::size_t>(kW8TextD) * 1024 * sizeof(std::uint16_t);
+    return table + ids + output + 3 * 2 * kGuardBytes;
+}
 
 std::size_t align_up(std::size_t value, std::size_t alignment) {
     return ((value + alignment - 1) / alignment) * alignment;
@@ -495,6 +504,7 @@ int main() {
         std::cout << "SKIP: no usable CUDA device\n";
         return 77;
     }
+    if (insufficient_cuda_memory(quantized_peak_device_bytes())) { return 77; }
 
     int failures = 0;
     try {

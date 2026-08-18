@@ -3,12 +3,16 @@
 #include "ninfer/types.h"
 #include "runtime/contract/transient_region.h"
 #include "runtime/contract/types.h"
+#include "runtime/cache/continuation_cache.h"
 #include <ninfer/targets/qwen3_8/prepared_prompt.h>
 
 #include <cstddef>
 #include <cstdint>
 #include <memory>
+#include <optional>
 #include <span>
+#include <string>
+#include <string_view>
 
 namespace ninfer {
 struct DeviceContext;
@@ -170,7 +174,28 @@ public:
                                std::span<const std::uint8_t> cancelled);
     void abort_lane(std::uint32_t lane) noexcept;
     [[nodiscard]] bool has_retained_lane(std::uint32_t lane) const noexcept;
+    [[nodiscard]] std::size_t retained_lane_resident_bytes(std::uint32_t lane) const noexcept;
+    [[nodiscard]] std::size_t retained_lane_reused_bytes(
+        std::uint32_t lane, const RequestPlan<Variant>& plan) const noexcept;
     void evict_retained_lane(std::uint32_t lane) noexcept;
+    [[nodiscard]] cache::ContinuationImage export_continuation_lane(std::uint32_t lane) const;
+    [[nodiscard]] std::optional<std::string>
+    stable_prefix_alias(const PreparedPrompt& prompt) const;
+    [[nodiscard]] std::optional<cache::ContinuationImage>
+    take_stable_continuation_lane(std::uint32_t lane);
+    // Metadata preflight is a negative filter and upper bound only. A nonzero result never
+    // authorizes import without resolving and exactly preflighting the complete image.
+    [[nodiscard]] std::uint32_t preflight_continuation_metadata(
+        const cache::SessionCandidateDescriptor& candidate,
+        const PreparedPrompt& prompt) const noexcept;
+    // Returns the deepest exactly matching reusable frontier: the execution frontier, a saved
+    // turn-checkpoint boundary, or zero when the image cannot be reused safely.
+    [[nodiscard]] std::uint32_t
+    preflight_continuation(const cache::ContinuationImage& image,
+                           const PreparedPrompt& prompt) const noexcept;
+    [[nodiscard]] bool import_continuation_lane(std::uint32_t lane,
+                                                const cache::ContinuationImage& image,
+                                                const PreparedPrompt& prompt) noexcept;
     [[nodiscard]] GenerationTimings generation_timings_lane(std::uint32_t lane) const noexcept;
     [[nodiscard]] SpeculativeStats speculative_stats_lane(std::uint32_t lane) const noexcept;
 
@@ -183,8 +208,10 @@ private:
 
     template <class V>
     friend std::unique_ptr<Program<V>> create_program(const typename V::ModelView&,
-                                                      typename V::WeightsProfile, SequencePlan<V>&&,
-                                                      DeviceContext&);
+                                                       typename V::WeightsProfile, SequencePlan<V>&&,
+                                                       DeviceContext&, std::string_view,
+                                                       std::string_view,
+                                                       std::span<const std::uint8_t>);
 };
 
 template <class Variant>
@@ -195,7 +222,8 @@ make_sequence_planner(DeviceContext& device, const EngineOptions& options,
 template <class Variant>
 [[nodiscard]] std::unique_ptr<Program<Variant>>
 create_program(const typename Variant::ModelView& model,
-               typename Variant::WeightsProfile weights_profile, SequencePlan<Variant>&& plan,
-               DeviceContext& device);
+                 typename Variant::WeightsProfile weights_profile, SequencePlan<Variant>&& plan,
+                 DeviceContext& device, std::string_view model_id, std::string_view weights_id,
+                 std::span<const std::uint8_t> artifact_fingerprint);
 
 } // namespace ninfer::targets::qwen3_8

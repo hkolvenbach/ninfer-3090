@@ -1,7 +1,6 @@
 #pragma once
 
-// Cumulative counters behind GET /metrics, in the flat `name value` subset of
-// the Prometheus text format.
+// Counters and gauges behind GET /metrics, with Prometheus TYPE declarations.
 //
 // The four llamacpp:-prefixed counters reproduce llama.cpp's --metrics
 // semantics - computed prefill tokens (prefix-cache hits excluded) billed
@@ -48,12 +47,14 @@ public:
         int prompt_tokens = 0;
         int cached_tokens = 0;
     };
+
     [[nodiscard]] LastCompleted last_completed() const;
 
     // One complete Prometheus text body, without HTTP framing. In-flight
     // requests are split into processing/deferred against `max_concurrency`,
     // matching the FIFO scheduler's work-conserving behavior.
-    [[nodiscard]] std::string render(std::uint32_t max_concurrency) const;
+    [[nodiscard]] std::string render(std::uint32_t max_concurrency,
+                                     const RuntimeStats& runtime = {}) const;
 
 private:
     mutable std::mutex mutex_;

@@ -76,6 +76,34 @@ enum class PrefixCheckpointPolicy : std::uint8_t {
     RollingTool,
 };
 
+enum class ContinuationCacheTiers : std::uint8_t {
+    Off,
+    L1,
+    L1L2,
+    L1L2L3,
+};
+
+enum class ContinuationCachePolicy : std::uint8_t {
+    Adaptive,
+};
+
+struct ContinuationCacheOptions {
+    ContinuationCacheTiers tiers   = ContinuationCacheTiers::L1L2;
+    ContinuationCachePolicy policy = ContinuationCachePolicy::Adaptive;
+    std::size_t l1_capacity_mib    = 768;
+    std::size_t l2_capacity_mib    = 16384;
+    std::size_t l3_capacity_mib    = 49152;
+    std::filesystem::path directory;
+    std::string cache_namespace             = "local";
+    std::uint32_t l1_idle_ttl_seconds       = 600;
+    std::uint32_t l2_idle_ttl_seconds       = 7200;
+    std::uint32_t l3_idle_ttl_seconds       = 86400;
+    std::uint32_t persist_interval_seconds  = 60;
+    std::uint32_t persist_min_tokens        = 8192;
+    std::size_t filesystem_reserve_mib      = 0;
+    std::uint32_t prefix_checkpoint_history = 4;
+};
+
 struct EngineOptions {
     std::filesystem::path artifact_path;
     int device                         = 0;
@@ -88,6 +116,7 @@ struct EngineOptions {
     KvCacheStorage kv_cache            = KvCacheStorage::BFloat16;
     SpeculativeOptions speculative;
     PrefixCheckpointPolicy prefix_checkpoint_policy = PrefixCheckpointPolicy::RollingTool;
+    ContinuationCacheOptions continuation_cache;
     bool enable_vision  = false;
     bool use_cuda_graph = true;
     LoadProgress load_progress;
@@ -161,6 +190,8 @@ struct StopPolicy {
 
 struct ExecutionOptions {
     SamplingOverrides sampling;
+    // Client-provided routing hint only; exact prepared-prefix identity must authorize reuse.
+    std::optional<std::string> routing_hint;
     std::uint32_t requested_output_tokens = 0;
     bool allow_prefix_reuse               = true;
 };
@@ -361,6 +392,70 @@ enum class PrefixReusePath : std::uint8_t {
     RestoreTurnCheckpoint,
 };
 
+enum class ContinuationSource : std::uint8_t { None, L1, L2, L3 };
+enum class ContinuationAliasKind : std::uint8_t { None, Session, StablePrefix };
+enum class ContinuationMissReason : std::uint8_t {
+    None,
+    Disabled,
+    NoAlias,
+    EntryUnavailableOrCorrupt,
+    NotDeeper,
+    PreflightRejected,
+    RollbackConflict,
+    NoLane,
+    RestoreFailed,
+};
+
+[[nodiscard]] constexpr std::string_view continuation_source_name(ContinuationSource value) {
+    switch (value) {
+    case ContinuationSource::None: return "none";
+    case ContinuationSource::L1: return "l1";
+    case ContinuationSource::L2: return "l2";
+    case ContinuationSource::L3: return "l3";
+    }
+    return "none";
+}
+
+[[nodiscard]] constexpr std::string_view continuation_alias_kind_name(
+    ContinuationAliasKind value) {
+    switch (value) {
+    case ContinuationAliasKind::None: return "none";
+    case ContinuationAliasKind::Session: return "routed_session";
+    case ContinuationAliasKind::StablePrefix: return "stable_prefix";
+    }
+    return "none";
+}
+
+[[nodiscard]] constexpr std::string_view continuation_miss_reason_name(
+    ContinuationMissReason value) {
+    switch (value) {
+    case ContinuationMissReason::None: return "none";
+    case ContinuationMissReason::Disabled: return "disabled";
+    case ContinuationMissReason::NoAlias: return "no_alias";
+    case ContinuationMissReason::EntryUnavailableOrCorrupt:
+        return "entry_unavailable_or_corrupt";
+    case ContinuationMissReason::NotDeeper: return "not_deeper";
+    case ContinuationMissReason::PreflightRejected: return "preflight_rejected";
+    case ContinuationMissReason::RollbackConflict: return "rollback_conflict";
+    case ContinuationMissReason::NoLane: return "no_lane";
+    case ContinuationMissReason::RestoreFailed: return "restore_failed";
+    }
+    return "none";
+}
+
+struct ContinuationDiagnostics {
+    ContinuationSource source                 = ContinuationSource::None;
+    ContinuationAliasKind alias_kind         = ContinuationAliasKind::None;
+    ContinuationMissReason final_miss_reason = ContinuationMissReason::NoAlias;
+    std::uint64_t lookup_microseconds         = 0;
+    std::uint64_t preflight_microseconds      = 0;
+    std::uint64_t restore_microseconds        = 0;
+    std::uint64_t restored_tokens             = 0;
+    std::uint64_t restored_bytes              = 0;
+    bool destructive_rollback                 = false;
+    bool completion_publication_queued        = false;
+};
+
 struct GenerationResult {
     PromptSummary prompt;
     std::vector<TokenId> generated_token_ids;
@@ -372,6 +467,7 @@ struct GenerationResult {
     PrefixReusePath prefix_reuse_path  = PrefixReusePath::FullReset;
     GenerationTimings timings;
     SpeculativeStats speculative;
+    ContinuationDiagnostics continuation;
 };
 
 struct ArenaMemorySummary {
@@ -413,12 +509,68 @@ struct RuntimeStats {
     // Tokens committed by decode rounds; the first token emitted by prefill is excluded.
     std::uint64_t committed_decode_tokens = 0;
     // Decode batch executions and the sum of their batch sizes.
-    std::uint64_t decode_rounds         = 0;
-    std::uint64_t decode_row_rounds     = 0;
-    std::uint32_t running_requests      = 0;
-    std::uint32_t prefilling_requests   = 0;
-    std::uint32_t decode_ready_requests = 0;
-    std::uint32_t waiting_requests      = 0;
+    std::uint64_t decode_rounds                      = 0;
+    std::uint64_t decode_row_rounds                  = 0;
+    std::uint64_t continuation_lookup_hits           = 0;
+    std::uint64_t continuation_lookup_misses         = 0;
+    std::uint64_t continuation_preflight_rejections  = 0;
+    // Aggregate useful restores. These equal the corresponding L1 + L2 + L3 tier totals.
+    std::uint64_t continuation_restore_successes     = 0;
+    std::uint64_t continuation_restore_failures      = 0;
+    std::uint64_t continuation_publication_successes = 0;
+    std::uint64_t continuation_publication_failures  = 0;
+    std::uint64_t continuation_publication_superseded = 0;
+    std::uint64_t continuation_restored_tokens       = 0;
+    std::uint64_t continuation_restored_bytes        = 0;
+    std::uint64_t continuation_l1_restore_successes   = 0;
+    std::uint64_t continuation_l2_restore_successes   = 0;
+    std::uint64_t continuation_l3_restore_successes   = 0;
+    std::uint64_t continuation_l1_restored_tokens     = 0;
+    std::uint64_t continuation_l2_restored_tokens     = 0;
+    std::uint64_t continuation_l3_restored_tokens     = 0;
+    std::uint64_t continuation_l1_restored_bytes      = 0;
+    std::uint64_t continuation_l2_restored_bytes      = 0;
+    std::uint64_t continuation_l3_restored_bytes      = 0;
+    std::uint64_t continuation_session_restores       = 0;
+    std::uint64_t continuation_stable_prefix_restores = 0;
+    std::uint64_t continuation_miss_disabled          = 0;
+    std::uint64_t continuation_miss_no_alias          = 0;
+    std::uint64_t continuation_miss_entry_unavailable_or_corrupt = 0;
+    std::uint64_t continuation_miss_not_deeper        = 0;
+    std::uint64_t continuation_miss_preflight_rejected = 0;
+    std::uint64_t continuation_miss_rollback_conflict = 0;
+    std::uint64_t continuation_miss_no_lane           = 0;
+    std::uint64_t continuation_miss_restore_failed    = 0;
+    std::uint64_t continuation_l2_lookup_microseconds = 0;
+    std::uint64_t continuation_l2_lookup_operations   = 0;
+    std::uint64_t continuation_l3_lookup_microseconds = 0;
+    std::uint64_t continuation_l3_lookup_operations   = 0;
+    std::uint64_t continuation_preflight_microseconds = 0;
+    std::uint64_t continuation_preflight_operations   = 0;
+    std::uint64_t continuation_l2_restore_microseconds = 0;
+    std::uint64_t continuation_l2_restore_operations  = 0;
+    std::uint64_t continuation_l3_restore_microseconds = 0;
+    std::uint64_t continuation_l3_restore_operations  = 0;
+    std::uint64_t continuation_l2_admission_microseconds = 0;
+    std::uint64_t continuation_l2_admission_operations = 0;
+    std::uint64_t continuation_l3_persistence_microseconds = 0;
+    std::uint64_t continuation_l3_persistence_operations = 0;
+    std::uint64_t continuation_persistence_queued    = 0;
+    std::uint64_t continuation_persistence_coalesced = 0;
+    std::uint64_t continuation_persistence_successes = 0;
+    std::uint64_t continuation_persistence_failures  = 0;
+    std::uint64_t continuation_l2_bytes              = 0;
+    std::uint64_t continuation_l3_bytes              = 0;
+    std::uint32_t continuation_l2_entries            = 0;
+    std::uint32_t continuation_l3_entries            = 0;
+    std::uint64_t l1_evictions                        = 0;
+    std::uint64_t l1_demotions                        = 0;
+    std::uint64_t l1_resident_bytes                   = 0;
+    std::uint32_t l1_resident_entries                 = 0;
+    std::uint32_t running_requests                   = 0;
+    std::uint32_t prefilling_requests                = 0;
+    std::uint32_t decode_ready_requests              = 0;
+    std::uint32_t waiting_requests                   = 0;
 };
 
 struct LoadSummary {

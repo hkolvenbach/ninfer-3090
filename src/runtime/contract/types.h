@@ -4,7 +4,9 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <optional>
 #include <span>
+#include <string>
 
 namespace ninfer::runtime {
 
@@ -27,6 +29,8 @@ struct ResolvedExecutionOptions {
 
 struct ResolvedRequestOptions {
     ResolvedExecutionOptions execution;
+    // Untrusted scheduler/cache alias. Targets must still verify exact prepared-prefix identity.
+    std::optional<std::string> routing_hint;
     StopPolicy stop;
     OutputOptions output;
 };

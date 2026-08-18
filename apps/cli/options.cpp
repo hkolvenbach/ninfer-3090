@@ -75,6 +75,36 @@ ReasoningEffort parse_reasoning_effort(std::string_view text) {
     throw std::invalid_argument("invalid reasoning-effort: " + std::string(text));
 }
 
+ContinuationCacheTiers parse_continuation_cache_tiers(std::string_view text) {
+    if (text == "off") { return ContinuationCacheTiers::Off; }
+    if (text == "l1") { return ContinuationCacheTiers::L1; }
+    if (text == "l1-l2") { return ContinuationCacheTiers::L1L2; }
+    if (text == "l1-l2-l3") { return ContinuationCacheTiers::L1L2L3; }
+    throw std::invalid_argument("invalid continuation-cache: " + std::string(text));
+}
+
+ContinuationCachePolicy parse_continuation_cache_policy(std::string_view text) {
+    if (text == "adaptive") { return ContinuationCachePolicy::Adaptive; }
+    throw std::invalid_argument("invalid continuation-cache-policy: " + std::string(text));
+}
+
+std::size_t parse_cache_mib(const char* text, std::string_view label) {
+    const std::uint64_t value = parse_u64(text, label);
+    if (value == 0 || value > std::numeric_limits<std::size_t>::max()) {
+        throw std::invalid_argument("invalid " + std::string(label) + ": " + text);
+    }
+    return static_cast<std::size_t>(value);
+}
+
+std::size_t parse_cache_reserve_mib(const char* text) {
+    const std::uint64_t value = parse_u64(text, "continuation-cache-filesystem-reserve-mib");
+    if (value > std::numeric_limits<std::size_t>::max()) {
+        throw std::invalid_argument("invalid continuation-cache-filesystem-reserve-mib: " +
+                                    std::string(text));
+    }
+    return static_cast<std::size_t>(value);
+}
+
 } // namespace
 
 std::string usage_text(const char* argv0) {
@@ -91,6 +121,17 @@ std::string usage_text(const char* argv0) {
            "       [--raw-output] [--print-token-ids] [--no-thinking]\n"
            "       [--reasoning-effort low|medium|xhigh] [--vision]\n"
            "       [--no-cuda-graph] [--prefix-checkpoint-policy stable-turn|rolling-tool]\n"
+           "       [--continuation-cache off|l1|l1-l2|l1-l2-l3] "
+           "[--continuation-cache-policy adaptive]\n"
+           "       [--continuation-cache-dir DIR] [--continuation-cache-namespace NAME]\n"
+           "       [--continuation-cache-l1-mib N] [--continuation-cache-l2-mib N] "
+           "[--continuation-cache-l3-mib N]\n"
+           "       [--continuation-cache-l1-idle-seconds N] "
+           "[--continuation-cache-l2-idle-seconds N] "
+           "[--continuation-cache-l3-ttl-seconds N]\n"
+           "       [--continuation-cache-persist-interval-seconds N] "
+           "[--continuation-cache-persist-min-tokens N] "
+           "[--continuation-cache-filesystem-reserve-mib N] [--prefix-checkpoint-history N]\n"
            "\n"
            "Streams answer content to stdout and reasoning plus diagnostics to stderr.\n"
            "Structured message content accepts text, image/image_url, and video/video_url parts;\n"
@@ -100,6 +141,15 @@ std::string usage_text(const char* argv0) {
            std::to_string(kDefaultKvCapacityHeadroomBytes / (1024ULL * 1024ULL)) +
            " MiB of sizing headroom.\n"
            "--prefix-checkpoint-policy defaults to rolling-tool.\n"
+            "Continuation cache defaults to off for one-shot inference. Explicit cache tuning "
+            "enables l1-l2, or l1-l2-l3 when --continuation-cache-dir is set.\n"
+           "L1/L2/L3 capacities default to 768/16384/49152 MiB; adaptive policy and namespace "
+           "local are defaults.\n"
+            "L1/L2/L3 idle TTLs default to 600/7200/86400 seconds (0 means no expiry).\n"
+            "Persistence defaults to 60 seconds or 8192 tokens; interval 0 disables only the "
+            "timer trigger; token growth and orderly shutdown still persist.\n"
+            "Persist minimum 0 makes every publication due; filesystem reserve defaults to 0 "
+            "MiB; checkpoint history defaults to 4.\n"
            "Sampling defaults come from the loaded model and thinking mode; flags override "
            "individual fields.\n";
 }
@@ -113,9 +163,14 @@ Options parse_options(int argc, char** argv) {
     if (argc < 2) { throw std::invalid_argument(".ninfer model path is required"); }
     options.artifact_path     = argv[1];
     bool kv_capacity_explicit = false;
+    bool continuation_tiers_explicit = false;
+    bool continuation_config_explicit = false;
 
     for (int i = 2; i < argc; ++i) {
         const std::string_view arg(argv[i]);
+        if (arg.starts_with("--continuation-cache-") || arg == "--prefix-checkpoint-history") {
+            continuation_config_explicit = true;
+        }
         const auto value = [&](std::string_view flag) -> const char* {
             if (++i >= argc) { throw std::invalid_argument(std::string(flag) + " needs a value"); }
             return argv[i];
@@ -158,6 +213,50 @@ Options parse_options(int argc, char** argv) {
             options.use_cuda_graph = false;
         } else if (arg == "--prefix-checkpoint-policy") {
             options.prefix_checkpoint_policy = product::parse_prefix_checkpoint_policy(value(arg));
+        } else if (arg == "--continuation-cache") {
+            options.continuation_cache.tiers = parse_continuation_cache_tiers(value(arg));
+            continuation_tiers_explicit = true;
+        } else if (arg == "--continuation-cache-policy") {
+            options.continuation_cache.policy = parse_continuation_cache_policy(value(arg));
+        } else if (arg == "--continuation-cache-dir") {
+            options.continuation_cache.directory = value(arg);
+            if (options.continuation_cache.directory.empty()) {
+                throw std::invalid_argument("--continuation-cache-dir must not be empty");
+            }
+        } else if (arg == "--continuation-cache-namespace") {
+            options.continuation_cache.cache_namespace = value(arg);
+            if (options.continuation_cache.cache_namespace.empty()) {
+                throw std::invalid_argument("--continuation-cache-namespace must not be empty");
+            }
+        } else if (arg == "--continuation-cache-l1-mib") {
+            options.continuation_cache.l1_capacity_mib =
+                parse_cache_mib(value(arg), "continuation-cache-l1-mib");
+        } else if (arg == "--continuation-cache-l2-mib") {
+            options.continuation_cache.l2_capacity_mib =
+                parse_cache_mib(value(arg), "continuation-cache-l2-mib");
+        } else if (arg == "--continuation-cache-l3-mib") {
+            options.continuation_cache.l3_capacity_mib =
+                parse_cache_mib(value(arg), "continuation-cache-l3-mib");
+        } else if (arg == "--continuation-cache-l1-idle-seconds") {
+            options.continuation_cache.l1_idle_ttl_seconds =
+                parse_u32(value(arg), "continuation-cache-l1-idle-seconds", true);
+        } else if (arg == "--continuation-cache-l2-idle-seconds") {
+            options.continuation_cache.l2_idle_ttl_seconds =
+                parse_u32(value(arg), "continuation-cache-l2-idle-seconds", true);
+        } else if (arg == "--continuation-cache-l3-ttl-seconds") {
+            options.continuation_cache.l3_idle_ttl_seconds =
+                parse_u32(value(arg), "continuation-cache-l3-ttl-seconds", true);
+        } else if (arg == "--continuation-cache-persist-interval-seconds") {
+            options.continuation_cache.persist_interval_seconds =
+                parse_u32(value(arg), "continuation-cache-persist-interval-seconds", true);
+        } else if (arg == "--continuation-cache-persist-min-tokens") {
+            options.continuation_cache.persist_min_tokens =
+                parse_u32(value(arg), "continuation-cache-persist-min-tokens", true);
+        } else if (arg == "--continuation-cache-filesystem-reserve-mib") {
+            options.continuation_cache.filesystem_reserve_mib = parse_cache_reserve_mib(value(arg));
+        } else if (arg == "--prefix-checkpoint-history") {
+            options.continuation_cache.prefix_checkpoint_history =
+                parse_u32(value(arg), "prefix-checkpoint-history", true);
         } else if (arg == "--stop-token-id") {
             const std::uint32_t token = parse_u32(value(arg), "stop-token-id", true);
             if (token > static_cast<std::uint32_t>(std::numeric_limits<TokenId>::max())) {
@@ -202,6 +301,18 @@ Options parse_options(int argc, char** argv) {
 
     if (!kv_capacity_explicit) {
         options.kv_capacity = KvCapacityPolicy::explicit_capacity(options.max_context);
+    }
+    if (!continuation_tiers_explicit) {
+        if (!options.continuation_cache.directory.empty()) {
+            options.continuation_cache.tiers = ContinuationCacheTiers::L1L2L3;
+        } else if (continuation_config_explicit) {
+            options.continuation_cache.tiers = ContinuationCacheTiers::L1L2;
+        }
+    }
+    // L1 and L2 are memory tiers; only L3 has a filesystem dependency.
+    if (options.continuation_cache.tiers == ContinuationCacheTiers::L1L2L3 &&
+        options.continuation_cache.directory.empty()) {
+        throw std::invalid_argument("--continuation-cache-dir is required for l1-l2-l3");
     }
 
     const bool has_prompt   = !options.prompt.empty();

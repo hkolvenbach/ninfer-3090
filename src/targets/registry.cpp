@@ -111,7 +111,9 @@ ConstructedTarget construct_registered(const EngineOptions& options, DeviceConte
     }
     auto loaded   = std::make_unique<Loaded>(std::move(model), options.prefix_checkpoint_policy);
     auto instance = std::make_unique<Instance>(std::move(loaded), capacity_resolution,
-                                               std::move(sequence_plan), device);
+                                                 std::move(sequence_plan), device, identity.model_id,
+                                                 identity.weights_id,
+                                                 reader.content_fingerprint());
     device.synchronize();
     instance->kv_capacity_resolution.available_after_startup_bytes = current_free_device_bytes();
 
@@ -143,12 +145,15 @@ LoadedQwen3_8_27B::~LoadedQwen3_8_27B() = default;
 
 Qwen3_8_27BInstance::Qwen3_8_27BInstance(std::unique_ptr<LoadedQwen3_8_27B> stable_loaded,
                                           runtime::KvCapacityResolution resolution,
-                                         Qwen3_8_27B::SequencePlan sequence_plan,
-                                         DeviceContext& device)
+                                          Qwen3_8_27B::SequencePlan sequence_plan,
+                                          DeviceContext& device, std::string_view model_id,
+                                          std::string_view weights_id,
+                                          std::span<const std::uint8_t> artifact_fingerprint)
     : loaded(std::move(stable_loaded)), kv_capacity_resolution(resolution),
       request_memory(device, sequence_plan.request_transient_capacity_bytes()),
       capacity(sequence_plan.capacity()),
-      program(Qwen3_8_27B::create_program(*loaded->model, std::move(sequence_plan), device)) {}
+       program(Qwen3_8_27B::create_program(*loaded->model, std::move(sequence_plan), device,
+                                           model_id, weights_id, artifact_fingerprint)) {}
 
 Qwen3_8_27BInstance::~Qwen3_8_27BInstance() = default;
 #endif
@@ -165,11 +170,14 @@ LoadedQwen3_6_35BA3B::~LoadedQwen3_6_35BA3B() = default;
 Qwen3_6_35BA3BInstance::Qwen3_6_35BA3BInstance(std::unique_ptr<LoadedQwen3_6_35BA3B> stable_loaded,
                                                runtime::KvCapacityResolution resolution,
                                                Qwen3_6_35BA3B::SequencePlan sequence_plan,
-                                               DeviceContext& device)
+                                               DeviceContext& device, std::string_view model_id,
+                                               std::string_view weights_id,
+                                               std::span<const std::uint8_t> artifact_fingerprint)
     : loaded(std::move(stable_loaded)), kv_capacity_resolution(resolution),
       request_memory(device, sequence_plan.request_transient_capacity_bytes()),
       capacity(sequence_plan.capacity()),
-      program(Qwen3_6_35BA3B::create_program(*loaded->model, std::move(sequence_plan), device)) {}
+       program(Qwen3_6_35BA3B::create_program(*loaded->model, std::move(sequence_plan), device,
+                                              model_id, weights_id, artifact_fingerprint)) {}
 
 Qwen3_6_35BA3BInstance::~Qwen3_6_35BA3BInstance() = default;
 #endif
@@ -178,7 +186,19 @@ ConstructedTarget construct_target(const EngineOptions& options, DeviceContext& 
     validate_options(options);
     const auto load_start = Clock::now();
 
-    artifact::Reader reader(options.artifact_path);
+    artifact::Reader reader(
+        options.artifact_path,
+        artifact::FingerprintCacheOptions{.directory = options.continuation_cache.directory,
+                                          .cache_namespace =
+                                              options.continuation_cache.cache_namespace},
+        [&](artifact::FingerprintProgressPhase phase, std::uint64_t done, std::uint64_t total) {
+            if (options.load_progress.callback) {
+                options.load_progress.callback(
+                    phase == artifact::FingerprintProgressPhase::CacheHit ? "fingerprint-cache"
+                                                                          : "fingerprint",
+                    done, total);
+            }
+        });
     const auto& identity = reader.identity();
 #if NINFER_BUILD_QWEN3_8_27B
     if (identity.model_id == Qwen3_8_27B::model_id) {

@@ -1,8 +1,10 @@
 #include "core/device.h"
 #include "core/linear_attention_state.h"
+#include "core/pinned_transfer.h"
 
 #include <cuda_runtime.h>
 
+#include <algorithm>
 #include <cstdint>
 #include <iostream>
 #include <utility>
@@ -73,6 +75,41 @@ int expect_device_byte(const ninfer::Tensor& tensor, unsigned char expected, con
     return 0;
 }
 
+int expect_host_byte(const std::vector<std::uint8_t>& bytes, std::uint8_t expected,
+                     const char* label) {
+    for (const std::uint8_t value : bytes) {
+        if (value != expected) {
+            std::cerr << label << " contains an unexpected byte\n";
+            return 1;
+        }
+    }
+    return 0;
+}
+
+int expect_tiny_pinned_transfer(cudaStream_t stream) {
+    constexpr std::size_t kBytes = 31;
+    ninfer::PinnedTransferBuffer transfer(14); // Two 7-byte slots force several boundaries.
+    ninfer::DeviceBuffer device(kBytes);
+    std::vector<std::uint8_t> source(kBytes + 6, 0);
+    for (std::size_t i = 0; i < kBytes; ++i) {
+        source[i + 3] = static_cast<std::uint8_t>((i * 17U + 5U) % 251U);
+    }
+    transfer.copy_host_to_device(device.p, source, kBytes, stream, 3);
+
+    std::vector<std::uint8_t> destination(kBytes + 10, 0xa5);
+    transfer.copy_device_to_host(destination, device.p, kBytes, stream, 5);
+    if (!std::equal(source.begin() + 3, source.begin() + 3 + kBytes,
+                    destination.begin() + 5) ||
+        !std::all_of(destination.begin(), destination.begin() + 5,
+                     [](std::uint8_t value) { return value == 0xa5; }) ||
+        !std::all_of(destination.begin() + 5 + kBytes, destination.end(),
+                     [](std::uint8_t value) { return value == 0xa5; })) {
+        std::cerr << "tiny pinned H2D/D2H transfer crossed an owning-vector boundary\n";
+        return 1;
+    }
+    return 0;
+}
+
 } // namespace
 
 int main() {
@@ -93,9 +130,11 @@ int main() {
 
     int failures = 0;
     ninfer::DeviceContext ctx(0);
+    failures += expect_tiny_pinned_transfer(ctx.stream);
     auto state_plan = plan_state(3, 10, 3, 4, 5, 6);
     ninfer::DeviceArena state_arena(state_plan.bytes);
-    CUDA_CHECK(cudaMemset(state_arena.base(), 0x4a, state_arena.capacity()));
+    CUDA_CHECK(cudaMemsetAsync(state_arena.base(), 0x4a, state_arena.capacity(), ctx.stream));
+    ctx.synchronize();
     ninfer::LinearAttentionStatePool state({state_arena.base(), state_arena.capacity()},
                                            state_plan.layout);
 
@@ -143,7 +182,7 @@ int main() {
 
     auto slotted_plan = plan_state(2, 10, 3, 4, 5, 6, 3);
     ninfer::DeviceArena slotted_arena(slotted_plan.bytes);
-    CUDA_CHECK(cudaMemset(slotted_arena.base(), 0, slotted_arena.capacity()));
+    CUDA_CHECK(cudaMemsetAsync(slotted_arena.base(), 0, slotted_arena.capacity(), ctx.stream));
     ninfer::LinearAttentionStatePool slotted({slotted_arena.base(), slotted_arena.capacity()},
                                              slotted_plan.layout);
     failures += expect_size(slotted.slot_count(), 3, "slotted.slot_count");
@@ -158,12 +197,13 @@ int main() {
     ninfer::Tensor recurrent1        = slotted.recurrent_slot(0, 1);
     ninfer::Tensor conv1_layer1      = slotted.conv_slot(1, 1);
     ninfer::Tensor recurrent1_layer1 = slotted.recurrent_slot(1, 1);
-    CUDA_CHECK(cudaMemset(conv0.data, 0x7a, conv0.bytes()));
-    CUDA_CHECK(cudaMemset(conv1.data, 0x6b, conv1.bytes()));
-    CUDA_CHECK(cudaMemset(recurrent0.data, 0x5c, recurrent0.bytes()));
-    CUDA_CHECK(cudaMemset(recurrent1.data, 0x4d, recurrent1.bytes()));
-    CUDA_CHECK(cudaMemset(conv1_layer1.data, 0x3c, conv1_layer1.bytes()));
-    CUDA_CHECK(cudaMemset(recurrent1_layer1.data, 0x2d, recurrent1_layer1.bytes()));
+    CUDA_CHECK(cudaMemsetAsync(conv0.data, 0x7a, conv0.bytes(), ctx.stream));
+    CUDA_CHECK(cudaMemsetAsync(conv1.data, 0x6b, conv1.bytes(), ctx.stream));
+    CUDA_CHECK(cudaMemsetAsync(recurrent0.data, 0x5c, recurrent0.bytes(), ctx.stream));
+    CUDA_CHECK(cudaMemsetAsync(recurrent1.data, 0x4d, recurrent1.bytes(), ctx.stream));
+    CUDA_CHECK(cudaMemsetAsync(conv1_layer1.data, 0x3c, conv1_layer1.bytes(), ctx.stream));
+    CUDA_CHECK(
+        cudaMemsetAsync(recurrent1_layer1.data, 0x2d, recurrent1_layer1.bytes(), ctx.stream));
 
     slotted.copy_slot(1, 2, ctx.stream);
     ctx.synchronize();
@@ -171,6 +211,26 @@ int main() {
     failures += expect_device_byte(slotted.recurrent_slot(0, 2), 0x4d, "copied recurrent slot");
     failures += expect_device_byte(slotted.conv_slot(1, 2), 0x3c, "copied conv layer1");
     failures += expect_device_byte(slotted.recurrent_slot(1, 2), 0x2d, "copied recurrent layer1");
+
+    ninfer::PinnedTransferBuffer tiny_transfer(14);
+    const ninfer::LinearAttentionStateImage slot_image =
+        ninfer::export_linear_attention_state(slotted, 1, tiny_transfer, ctx.stream);
+    failures += expect_size(slot_image.layers, 2, "exported state layers");
+    failures += expect_size(slot_image.conv.size(), 2, "exported conv inventory");
+    failures += expect_size(slot_image.recurrent.size(), 2, "exported recurrent inventory");
+    failures += expect_host_byte(slot_image.conv[0], 0x6b, "exported conv layer0");
+    failures += expect_host_byte(slot_image.conv[1], 0x3c, "exported conv layer1");
+    failures += expect_host_byte(slot_image.recurrent[0], 0x4d, "exported recurrent layer0");
+    failures += expect_host_byte(slot_image.recurrent[1], 0x2d, "exported recurrent layer1");
+    slotted.zero_slot(2, ctx.stream);
+    ctx.synchronize();
+    ninfer::import_linear_attention_state(slotted, 2, slot_image, tiny_transfer, ctx.stream);
+    failures += expect_device_byte(slotted.conv_slot(0, 2), 0x6b, "imported conv layer0");
+    failures += expect_device_byte(slotted.conv_slot(1, 2), 0x3c, "imported conv layer1");
+    failures +=
+        expect_device_byte(slotted.recurrent_slot(0, 2), 0x4d, "imported recurrent layer0");
+    failures +=
+        expect_device_byte(slotted.recurrent_slot(1, 2), 0x2d, "imported recurrent layer1");
 
     slotted.zero_slot(0, ctx.stream);
     ctx.synchronize();

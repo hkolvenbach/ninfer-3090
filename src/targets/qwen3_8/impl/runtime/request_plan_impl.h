@@ -152,9 +152,27 @@ ProgramImplCore::plan_request_base(const PreparedPromptData& prompt,
         }
         base->turn_rewrite_boundary = candidate;
     }
+    if (prompt.identity.stable_prefix_boundary) {
+        const std::uint32_t candidate = *prompt.identity.stable_prefix_boundary;
+        if (candidate == 0 || candidate > base->summary.prompt_tokens) {
+            throw std::invalid_argument("stable prefix boundary must lie inside the prompt");
+        }
+        qwen3_8::detail::ResidentPrefixIdentity stable_identity;
+        stable_identity.assign(prompt);
+        stable_identity.truncate(candidate);
+        base->stable_prefix_boundary = candidate;
+    }
+    if (base->stable_prefix_boundary && base->turn_rewrite_boundary &&
+        *base->stable_prefix_boundary > *base->turn_rewrite_boundary) {
+        throw std::invalid_argument("stable prefix boundary must not follow the rewrite boundary");
+    }
     const std::size_t cold_prefill_splits =
         (base->vision_control != nullptr ? base->vision_control->items.size() : 0ULL) +
-        (base->turn_rewrite_boundary ? 1ULL : 0ULL);
+        (base->turn_rewrite_boundary ? 1ULL : 0ULL) +
+        (base->stable_prefix_boundary &&
+                 base->stable_prefix_boundary != base->turn_rewrite_boundary
+             ? 1ULL
+             : 0ULL);
     base->summary.service_work_quanta =
         projected_service_work(base->summary, 0, prefill_chunk, cold_prefill_splits);
     return RequestBasePlan(std::move(base));
@@ -220,6 +238,10 @@ RequestPlan ProgramImplCore::plan_request_for_lane(std::uint32_t lane,
         plan->reuse_base = 0;
     }
 
+    if (base.stable_prefix_boundary && *base.stable_prefix_boundary > plan->reuse_base) {
+        plan->stable_checkpoint_capture_frontier = base.stable_prefix_boundary;
+    }
+
     const std::optional<std::uint32_t> desired = base.turn_rewrite_boundary;
     const bool can_keep                        = desired && plan->reuse != ReusePath::FullReset &&
                           sequence.turn_checkpoint.valid &&
@@ -274,8 +296,14 @@ RequestPlan ProgramImplCore::plan_request_for_lane(std::uint32_t lane,
         }
     }
 
-    const std::size_t prefill_splits = (plan->vision ? plan->vision->uses.size() : 0ULL) +
-                                       (plan->turn_checkpoint_capture_frontier ? 1ULL : 0ULL);
+    const std::size_t prefill_splits =
+        (plan->vision ? plan->vision->uses.size() : 0ULL) +
+        (plan->turn_checkpoint_capture_frontier ? 1ULL : 0ULL) +
+        (plan->stable_checkpoint_capture_frontier &&
+                 plan->stable_checkpoint_capture_frontier !=
+                     plan->turn_checkpoint_capture_frontier
+             ? 1ULL
+             : 0ULL);
     plan->summary.service_work_quanta =
         projected_service_work(plan->summary, plan->reuse_base, prefill_chunk, prefill_splits);
     return RequestPlan(std::move(plan));

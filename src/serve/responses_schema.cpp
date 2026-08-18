@@ -850,6 +850,7 @@ ResponsesRequest parse_request_impl(const Json& body, const RequestLimits& limit
     out.generation.stream = out.stream;
     if (body.contains("prompt_cache_key") && !body.at("prompt_cache_key").is_null()) {
         out.prompt_cache_key = body.at("prompt_cache_key").get<std::string>();
+        out.generation.prompt_cache_routing_hint = out.prompt_cache_key;
     }
     if (body.contains("include") && !body.at("include").is_null()) {
         if (!body.at("include").is_array()) { bad_request("include must be an array", "include"); }

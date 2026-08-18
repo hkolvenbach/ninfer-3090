@@ -87,6 +87,28 @@ const char* finish_reason_name(ninfer::FinishReason reason) {
     return "unknown";
 }
 
+const char* continuation_cache_tiers_name(ContinuationCacheTiers tiers) {
+    switch (tiers) {
+    case ContinuationCacheTiers::Off:
+        return "off";
+    case ContinuationCacheTiers::L1:
+        return "l1";
+    case ContinuationCacheTiers::L1L2:
+        return "l1-l2";
+    case ContinuationCacheTiers::L1L2L3:
+        return "l1-l2-l3";
+    }
+    return "unknown";
+}
+
+const char* continuation_cache_policy_name(ContinuationCachePolicy policy) {
+    switch (policy) {
+    case ContinuationCachePolicy::Adaptive:
+        return "adaptive";
+    }
+    return "unknown";
+}
+
 std::string tool_choice_name(const ToolChoice& choice) {
     switch (choice.mode) {
     case ToolChoiceMode::Auto:
@@ -103,18 +125,10 @@ std::string tool_choice_name(const ToolChoice& choice) {
 
 const char* kv_cache_name(ninfer::KvCacheStorage storage) {
     if (storage == ninfer::KvCacheStorage::BFloat16) { return "bf16"; }
-    if (storage == ninfer::KvCacheStorage::RotatedInt8KeyInt4ValueGroup64) {
-        return "rk8v4";
-    }
-    if (storage == ninfer::KvCacheStorage::RotatedInt4KeyInt4ValueGroup64) {
-        return "rk4v4";
-    }
-    if (storage == ninfer::KvCacheStorage::RK4V4E8) {
-        return "rk4v4-e8";
-    }
-    if (storage == ninfer::KvCacheStorage::RK2V4E8) {
-        return "rk2v4-e8";
-    }
+    if (storage == ninfer::KvCacheStorage::RotatedInt8KeyInt4ValueGroup64) { return "rk8v4"; }
+    if (storage == ninfer::KvCacheStorage::RotatedInt4KeyInt4ValueGroup64) { return "rk4v4"; }
+    if (storage == ninfer::KvCacheStorage::RK4V4E8) { return "rk4v4-e8"; }
+    if (storage == ninfer::KvCacheStorage::RK2V4E8) { return "rk2v4-e8"; }
     return "int8-group64";
 }
 
@@ -216,6 +230,20 @@ Json speculative_json(const GenerationMetrics& metrics) {
                 {"accepted_tokens", metrics.speculative_accepted_tokens},
                 {"fallback_steps", metrics.speculative_fallback_steps},
                 {"accepted_per_position", metrics.speculative_accepted_per_position}};
+}
+
+Json continuation_json(const GenerationMetrics& metrics) {
+    const auto& value = metrics.continuation;
+    return Json{{"source", continuation_source_name(value.source)},
+                {"alias_kind", continuation_alias_kind_name(value.alias_kind)},
+                {"final_miss_reason", continuation_miss_reason_name(value.final_miss_reason)},
+                {"lookup_microseconds", value.lookup_microseconds},
+                {"preflight_microseconds", value.preflight_microseconds},
+                {"restore_microseconds", value.restore_microseconds},
+                {"restored_tokens", value.restored_tokens},
+                {"restored_bytes", value.restored_bytes},
+                {"destructive_rollback", value.destructive_rollback},
+                {"completion_publication_queued", value.completion_publication_queued}};
 }
 
 // Tokens/second with fixed precision, or "n/a" when the interval is degenerate.
@@ -330,7 +358,21 @@ std::string format_request_done(const RequestLogContext& context,
         << " prefill=" << rate(computed_prefill_tokens, metrics.prefill_seconds)
         << " decode=" << rate(decode_tokens, metrics.decode_seconds)
         << " wall=" << seconds_str(metrics.total_seconds)
-        << " speculative=" << speculative_str(metrics);
+        << " speculative=" << speculative_str(metrics)
+        << " cache_source=" << continuation_source_name(metrics.continuation.source)
+        << " cache_alias=" << continuation_alias_kind_name(metrics.continuation.alias_kind)
+        << " cache_miss=" << continuation_miss_reason_name(metrics.continuation.final_miss_reason)
+        << " cache_lookup=" << std::setprecision(3)
+        << static_cast<double>(metrics.continuation.lookup_microseconds) / 1000.0 << "ms"
+        << " cache_preflight="
+        << static_cast<double>(metrics.continuation.preflight_microseconds) / 1000.0 << "ms"
+        << " cache_restore="
+        << static_cast<double>(metrics.continuation.restore_microseconds) / 1000.0 << "ms"
+        << " cache_tokens=" << metrics.continuation.restored_tokens
+        << " cache_bytes=" << metrics.continuation.restored_bytes
+        << " cache_rollback=" << (metrics.continuation.destructive_rollback ? "yes" : "no")
+        << " cache_publish_queued="
+        << (metrics.continuation.completion_publication_queued ? "yes" : "no");
     return out.str();
 }
 
@@ -356,7 +398,14 @@ std::string format_throughput(const ThroughputReport& report) {
         << "tok/s running=" << report.scheduler.running_requests
         << " prefilling=" << report.scheduler.prefilling_requests
         << " decode_ready=" << report.scheduler.decode_ready_requests
-        << " waiting=" << report.scheduler.waiting_requests << " avg_decode_batch=";
+        << " waiting=" << report.scheduler.waiting_requests
+        << " continuation_lookup=" << report.scheduler.continuation_lookup_hits << '/'
+        << report.scheduler.continuation_lookup_misses
+        << " continuation_restore=" << report.scheduler.continuation_restore_successes << '/'
+        << report.scheduler.continuation_restore_failures
+        << " continuation_publish=" << report.scheduler.continuation_publication_successes << '/'
+        << report.scheduler.continuation_publication_failures << '/'
+        << report.scheduler.continuation_publication_superseded << " avg_decode_batch=";
     if (report.decode_rounds == 0) {
         out << "n/a";
     } else {
@@ -364,6 +413,33 @@ std::string format_throughput(const ThroughputReport& report) {
             << static_cast<double>(report.decode_row_rounds) /
                    static_cast<double>(report.decode_rounds);
     }
+    out << " cache_tier_delta=" << report.continuation_delta.continuation_l1_restore_successes
+        << '/' << report.continuation_delta.continuation_l2_restore_successes << '/'
+        << report.continuation_delta.continuation_l3_restore_successes
+        << " cache_tier_total=" << report.scheduler.continuation_l1_restore_successes << '/'
+        << report.scheduler.continuation_l2_restore_successes << '/'
+        << report.scheduler.continuation_l3_restore_successes
+        << " cache_lookup_us_delta="
+        << report.continuation_delta.continuation_l2_lookup_microseconds << '/'
+        << report.continuation_delta.continuation_l3_lookup_microseconds
+        << " cache_restore_us_delta="
+        << report.continuation_delta.continuation_l2_restore_microseconds << '/'
+        << report.continuation_delta.continuation_l3_restore_microseconds
+        << " cache_publish_us_delta="
+        << report.continuation_delta.continuation_l2_admission_microseconds << '/'
+        << report.continuation_delta.continuation_l3_persistence_microseconds
+        << " cache_ops_delta=" << report.continuation_delta.continuation_l2_lookup_operations << '/'
+        << report.continuation_delta.continuation_l3_lookup_operations << '/'
+        << report.continuation_delta.continuation_l2_restore_operations << '/'
+        << report.continuation_delta.continuation_l3_restore_operations;
+    out << " cache_tokens_delta="
+        << report.continuation_delta.continuation_l1_restored_tokens << '/'
+        << report.continuation_delta.continuation_l2_restored_tokens << '/'
+        << report.continuation_delta.continuation_l3_restored_tokens
+        << " cache_bytes_delta="
+        << report.continuation_delta.continuation_l1_restored_bytes << '/'
+        << report.continuation_delta.continuation_l2_restored_bytes << '/'
+        << report.continuation_delta.continuation_l3_restored_bytes;
     return out.str();
 }
 
@@ -418,7 +494,23 @@ std::string format_server_start_json(
            product::prefix_checkpoint_policy_name(options.prefix_checkpoint_policy)},
           {"speculative_backend", product::speculative_backend_name(options.speculative.backend)},
           {"speculative_draft_window", options.speculative.draft_tokens},
-          {"proposal_head", proposal_head_name(options.speculative.proposal_head)}};
+          {"proposal_head", proposal_head_name(options.speculative.proposal_head)},
+          {"continuation_cache",
+           Json{
+               {"tiers", continuation_cache_tiers_name(options.continuation_cache.tiers)},
+               {"policy", continuation_cache_policy_name(options.continuation_cache.policy)},
+               {"l1_capacity_mib", options.continuation_cache.l1_capacity_mib},
+               {"l2_capacity_mib", options.continuation_cache.l2_capacity_mib},
+               {"l3_capacity_mib", options.continuation_cache.l3_capacity_mib},
+               {"directory", options.continuation_cache.directory.string()},
+               {"namespace", options.continuation_cache.cache_namespace},
+               {"l1_idle_ttl_seconds", options.continuation_cache.l1_idle_ttl_seconds},
+               {"l2_idle_ttl_seconds", options.continuation_cache.l2_idle_ttl_seconds},
+               {"l3_idle_ttl_seconds", options.continuation_cache.l3_idle_ttl_seconds},
+               {"persist_interval_seconds", options.continuation_cache.persist_interval_seconds},
+               {"persist_min_tokens", options.continuation_cache.persist_min_tokens},
+               {"filesystem_reserve_mib", options.continuation_cache.filesystem_reserve_mib},
+               {"prefix_checkpoint_history", options.continuation_cache.prefix_checkpoint_history}}}};
     record["sampling_defaults"] =
         Json{{"thinking", preset_json(sampling_defaults.thinking)},
              {"non_thinking", preset_json(sampling_defaults.non_thinking)},
@@ -481,6 +573,7 @@ std::string format_request_done_json(const std::string& server_instance_id, std:
         {"vision", outcome.metrics.vision_seconds},   {"prefill", outcome.metrics.prefill_seconds},
         {"decode", outcome.metrics.decode_seconds},   {"total", outcome.metrics.total_seconds}};
     record["speculative"] = speculative_json(outcome.metrics);
+    record["continuation_cache"] = continuation_json(outcome.metrics);
     return record.dump();
 }
 
@@ -514,10 +607,162 @@ std::string format_throughput_json(const std::string& server_instance_id, std::u
                                       {"committed_decode", report.committed_decode_tokens}};
     record["throughput_tokens_per_second"] =
         Json{{"prefill", prefill_rate}, {"decode", decode_rate}};
-    record["scheduler"]    = Json{{"running", report.scheduler.running_requests},
-                                  {"prefilling", report.scheduler.prefilling_requests},
-                                  {"decode_ready", report.scheduler.decode_ready_requests},
-                                  {"waiting", report.scheduler.waiting_requests}};
+    record["scheduler"] = Json{{"running", report.scheduler.running_requests},
+                               {"prefilling", report.scheduler.prefilling_requests},
+                               {"decode_ready", report.scheduler.decode_ready_requests},
+                               {"waiting", report.scheduler.waiting_requests}};
+    record["continuation_cache"] =
+        Json{{"lookup_hits", report.scheduler.continuation_lookup_hits},
+              {"lookup_misses", report.scheduler.continuation_lookup_misses},
+              {"preflight_rejections", report.scheduler.continuation_preflight_rejections},
+              {"restore_successes", report.scheduler.continuation_restore_successes},
+              {"restore_failures", report.scheduler.continuation_restore_failures},
+              {"delta_lookup_hits", report.continuation_delta.continuation_lookup_hits},
+              {"delta_lookup_misses", report.continuation_delta.continuation_lookup_misses},
+              {"delta_preflight_rejections",
+               report.continuation_delta.continuation_preflight_rejections},
+              {"delta_restore_failures",
+               report.continuation_delta.continuation_restore_failures},
+              {"delta_restore_successes",
+               report.continuation_delta.continuation_restore_successes},
+              {"delta_restored_tokens", report.continuation_delta.continuation_restored_tokens},
+              {"delta_restored_bytes", report.continuation_delta.continuation_restored_bytes},
+              {"publication_successes", report.scheduler.continuation_publication_successes},
+              {"publication_failures", report.scheduler.continuation_publication_failures},
+              {"publication_superseded", report.scheduler.continuation_publication_superseded},
+              {"delta_publication_successes",
+               report.continuation_delta.continuation_publication_successes},
+              {"delta_publication_failures",
+               report.continuation_delta.continuation_publication_failures},
+              {"delta_publication_superseded",
+               report.continuation_delta.continuation_publication_superseded},
+             {"restored_tokens", report.scheduler.continuation_restored_tokens},
+              {"restored_bytes", report.scheduler.continuation_restored_bytes}};
+    record["continuation_cache"]["tiers"] =
+        Json{{"l1_restore_successes", report.scheduler.continuation_l1_restore_successes},
+             {"l2_restore_successes", report.scheduler.continuation_l2_restore_successes},
+             {"l3_restore_successes", report.scheduler.continuation_l3_restore_successes},
+             {"delta_l1_restore_successes",
+              report.continuation_delta.continuation_l1_restore_successes},
+             {"delta_l2_restore_successes",
+              report.continuation_delta.continuation_l2_restore_successes},
+              {"delta_l3_restore_successes",
+               report.continuation_delta.continuation_l3_restore_successes},
+              {"l1_restored_tokens", report.scheduler.continuation_l1_restored_tokens},
+              {"l2_restored_tokens", report.scheduler.continuation_l2_restored_tokens},
+              {"l3_restored_tokens", report.scheduler.continuation_l3_restored_tokens},
+              {"delta_l1_restored_tokens",
+               report.continuation_delta.continuation_l1_restored_tokens},
+              {"delta_l2_restored_tokens",
+               report.continuation_delta.continuation_l2_restored_tokens},
+              {"delta_l3_restored_tokens",
+               report.continuation_delta.continuation_l3_restored_tokens},
+              {"l1_restored_bytes", report.scheduler.continuation_l1_restored_bytes},
+              {"l2_restored_bytes", report.scheduler.continuation_l2_restored_bytes},
+              {"l3_restored_bytes", report.scheduler.continuation_l3_restored_bytes},
+              {"delta_l1_restored_bytes",
+               report.continuation_delta.continuation_l1_restored_bytes},
+              {"delta_l2_restored_bytes",
+               report.continuation_delta.continuation_l2_restored_bytes},
+              {"delta_l3_restored_bytes",
+               report.continuation_delta.continuation_l3_restored_bytes}};
+    record["continuation_cache"]["aliases"] =
+        Json{{"routed_session_restores", report.scheduler.continuation_session_restores},
+             {"stable_prefix_restores", report.scheduler.continuation_stable_prefix_restores},
+             {"delta_routed_session_restores",
+              report.continuation_delta.continuation_session_restores},
+             {"delta_stable_prefix_restores",
+              report.continuation_delta.continuation_stable_prefix_restores}};
+    record["continuation_cache"]["miss_reasons"] =
+        Json{{"disabled", report.scheduler.continuation_miss_disabled},
+             {"no_alias", report.scheduler.continuation_miss_no_alias},
+             {"entry_unavailable_or_corrupt",
+              report.scheduler.continuation_miss_entry_unavailable_or_corrupt},
+             {"not_deeper", report.scheduler.continuation_miss_not_deeper},
+             {"preflight_rejected", report.scheduler.continuation_miss_preflight_rejected},
+             {"rollback_conflict", report.scheduler.continuation_miss_rollback_conflict},
+             {"no_lane", report.scheduler.continuation_miss_no_lane},
+             {"restore_failed", report.scheduler.continuation_miss_restore_failed},
+             {"delta_disabled", report.continuation_delta.continuation_miss_disabled},
+             {"delta_no_alias", report.continuation_delta.continuation_miss_no_alias},
+             {"delta_entry_unavailable_or_corrupt",
+              report.continuation_delta.continuation_miss_entry_unavailable_or_corrupt},
+             {"delta_not_deeper", report.continuation_delta.continuation_miss_not_deeper},
+             {"delta_preflight_rejected",
+              report.continuation_delta.continuation_miss_preflight_rejected},
+             {"delta_rollback_conflict",
+              report.continuation_delta.continuation_miss_rollback_conflict},
+             {"delta_no_lane", report.continuation_delta.continuation_miss_no_lane},
+             {"delta_restore_failed",
+              report.continuation_delta.continuation_miss_restore_failed}};
+    record["continuation_cache"]["latency_microseconds"] =
+        Json{{"l2_lookup_total", report.scheduler.continuation_l2_lookup_microseconds},
+             {"l3_lookup_total", report.scheduler.continuation_l3_lookup_microseconds},
+              {"l2_restore_total", report.scheduler.continuation_l2_restore_microseconds},
+              {"l3_restore_total", report.scheduler.continuation_l3_restore_microseconds},
+              {"preflight_total", report.scheduler.continuation_preflight_microseconds},
+             {"l2_lookup_delta", report.continuation_delta.continuation_l2_lookup_microseconds},
+             {"l3_lookup_delta", report.continuation_delta.continuation_l3_lookup_microseconds},
+             {"l2_restore_delta", report.continuation_delta.continuation_l2_restore_microseconds},
+              {"l3_restore_delta", report.continuation_delta.continuation_l3_restore_microseconds},
+              {"preflight_delta",
+               report.continuation_delta.continuation_preflight_microseconds},
+             {"l2_admission_total", report.scheduler.continuation_l2_admission_microseconds},
+             {"l3_persistence_total",
+              report.scheduler.continuation_l3_persistence_microseconds},
+             {"l2_admission_delta",
+              report.continuation_delta.continuation_l2_admission_microseconds},
+             {"l3_persistence_delta",
+              report.continuation_delta.continuation_l3_persistence_microseconds},
+             {"l2_lookup_operations_total",
+              report.scheduler.continuation_l2_lookup_operations},
+             {"l3_lookup_operations_total",
+              report.scheduler.continuation_l3_lookup_operations},
+             {"l2_restore_operations_total",
+              report.scheduler.continuation_l2_restore_operations},
+              {"l3_restore_operations_total",
+               report.scheduler.continuation_l3_restore_operations},
+              {"preflight_operations_total",
+               report.scheduler.continuation_preflight_operations},
+              {"l2_admission_operations_total",
+               report.scheduler.continuation_l2_admission_operations},
+              {"l3_persistence_operations_total",
+               report.scheduler.continuation_l3_persistence_operations},
+             {"l2_lookup_operations_delta",
+              report.continuation_delta.continuation_l2_lookup_operations},
+             {"l3_lookup_operations_delta",
+              report.continuation_delta.continuation_l3_lookup_operations},
+              {"l2_restore_operations_delta",
+               report.continuation_delta.continuation_l2_restore_operations},
+              {"l3_restore_operations_delta",
+               report.continuation_delta.continuation_l3_restore_operations},
+              {"preflight_operations_delta",
+               report.continuation_delta.continuation_preflight_operations},
+              {"l2_admission_operations_delta",
+               report.continuation_delta.continuation_l2_admission_operations},
+               {"l3_persistence_operations_delta",
+                report.continuation_delta.continuation_l3_persistence_operations}};
+    record["continuation_cache"]["occupancy"] =
+        Json{{"l1_entries", report.scheduler.l1_resident_entries},
+             {"l1_bytes", report.scheduler.l1_resident_bytes},
+             {"l2_entries", report.scheduler.continuation_l2_entries},
+             {"l2_bytes", report.scheduler.continuation_l2_bytes},
+             {"l3_entries", report.scheduler.continuation_l3_entries},
+              {"l3_bytes", report.scheduler.continuation_l3_bytes},
+              {"l1_evictions", report.scheduler.l1_evictions},
+              {"l1_demotions", report.scheduler.l1_demotions},
+              {"delta_l1_evictions", report.continuation_delta.l1_evictions},
+              {"delta_l1_demotions", report.continuation_delta.l1_demotions}};
+    record["continuation_cache"]["persistence_delta"] =
+        Json{{"queued", report.continuation_delta.continuation_persistence_queued},
+             {"coalesced", report.continuation_delta.continuation_persistence_coalesced},
+              {"successes", report.continuation_delta.continuation_persistence_successes},
+              {"failures", report.continuation_delta.continuation_persistence_failures}};
+    record["continuation_cache"]["persistence_total"] =
+        Json{{"queued", report.scheduler.continuation_persistence_queued},
+             {"coalesced", report.scheduler.continuation_persistence_coalesced},
+             {"successes", report.scheduler.continuation_persistence_successes},
+             {"failures", report.scheduler.continuation_persistence_failures}};
     record["decode_batch"] = Json{{"rounds", report.decode_rounds},
                                   {"row_rounds", report.decode_row_rounds},
                                   {"average_size", std::move(average_batch)}};

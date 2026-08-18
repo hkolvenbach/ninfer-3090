@@ -19,6 +19,25 @@
 #include <vector>
 
 namespace ninfer::targets::qwen3_8::frontend_internal {
+
+void adjust_rendered_boundaries_for_replacement(RenderedChat& rendered, std::size_t position,
+                                                std::size_t needle_size,
+                                                std::size_t replacement_size) {
+    const auto adjust = [=](std::size_t& boundary) {
+        const std::size_t end = position + needle_size;
+        // A semantic frontier may surround a media item, but it cannot describe partial media.
+        if (position < boundary && boundary < end) {
+            throw std::logic_error("prompt boundary intersects a media placeholder");
+        }
+        if (end <= boundary) { boundary = boundary - needle_size + replacement_size; }
+    };
+    if (rendered.stable_prefix_byte_offset) { adjust(*rendered.stable_prefix_byte_offset); }
+    if (rendered.turn_rewrite_byte_offset) { adjust(*rendered.turn_rewrite_byte_offset); }
+    for (SemanticCheckpointByteHint& hint : rendered.checkpoint_hints) {
+        adjust(hint.byte_offset);
+    }
+}
+
 namespace {
 
 constexpr int kPatch                    = 16;
@@ -359,16 +378,8 @@ RenderedChat expand_placeholders(RenderedChat rendered, const std::vector<Vision
             throw std::invalid_argument("chat media order does not match rendered placeholders");
         }
         const std::string replacement = placeholder(item);
-        if (rendered.turn_rewrite_byte_offset) {
-            const std::size_t boundary = *rendered.turn_rewrite_byte_offset;
-            const std::size_t end      = position + needle.size();
-            if (position < boundary && boundary < end) {
-                throw std::logic_error("turn rewrite boundary intersects a media placeholder");
-            }
-            if (end <= boundary) {
-                *rendered.turn_rewrite_byte_offset = boundary - needle.size() + replacement.size();
-            }
-        }
+        adjust_rendered_boundaries_for_replacement(rendered, position, needle.size(),
+                                                   replacement.size());
         rendered.text.replace(position, needle.size(), replacement);
         search = position + replacement.size();
     }
@@ -500,7 +511,7 @@ void validate_special_token(const Tokenizer& tokenizer, std::string_view text, i
     const std::vector<int> ids = tokenizer.encode(text);
     if (ids.size() != 1 || ids.front() != expected) {
         throw std::invalid_argument(
-            "Qwen3.6 tokenizer vision token IDs do not match model contract");
+            "Qwen3.8 tokenizer vision token IDs do not match model contract");
     }
 }
 
@@ -525,20 +536,50 @@ std::span<const std::int32_t> ProcessedInput::position_axis(int axis) const {
 EncodedChat encode_rendered_chat(const Tokenizer& tokenizer, const RenderedChat& rendered) {
     EncodedChat encoded;
     encoded.input_ids = tokenizer.encode(rendered.text);
-    if (!rendered.turn_rewrite_byte_offset) { return encoded; }
-    if (*rendered.turn_rewrite_byte_offset > rendered.text.size()) {
-        throw std::logic_error("turn rewrite byte offset exceeds rendered chat");
+    const auto encode_boundary = [&](std::size_t byte_offset, bool allow_full_prompt,
+                                     std::string_view name) {
+        if (byte_offset > rendered.text.size()) {
+            throw std::logic_error(std::string(name) + " byte offset exceeds rendered chat");
+        }
+        // Tokenizers can merge across a byte cut. Re-tokenizing each prefix and comparing it
+        // against the complete encoding is what makes a byte frontier safe as model-state identity.
+        std::vector<int> prefix;
+        try {
+            prefix = tokenizer.encode(std::string_view(rendered.text).substr(0, byte_offset));
+        } catch (const std::exception&) {
+            throw std::logic_error(std::string(name) + " cannot be tokenized independently");
+        }
+        if (prefix.empty() || (!allow_full_prompt && prefix.size() >= encoded.input_ids.size()) ||
+            prefix.size() > encoded.input_ids.size() ||
+            !std::equal(prefix.begin(), prefix.end(), encoded.input_ids.begin())) {
+            throw std::logic_error(std::string(name) + " is not an exact token prefix");
+        }
+        if (prefix.size() > std::numeric_limits<std::uint32_t>::max()) {
+            throw std::overflow_error(std::string(name) + " token boundary exceeds uint32");
+        }
+        return static_cast<std::uint32_t>(prefix.size());
+    };
+    if (rendered.stable_prefix_byte_offset) {
+        encoded.stable_prefix_boundary =
+            encode_boundary(*rendered.stable_prefix_byte_offset, true, "stable prefix");
     }
-    const std::vector<int> prefix = tokenizer.encode(
-        std::string_view(rendered.text).substr(0, *rendered.turn_rewrite_byte_offset));
-    if (prefix.empty() || prefix.size() >= encoded.input_ids.size() ||
-        !std::equal(prefix.begin(), prefix.end(), encoded.input_ids.begin())) {
-        throw std::logic_error("turn rewrite prefix is not an exact token prefix");
+    if (rendered.turn_rewrite_byte_offset) {
+        encoded.turn_rewrite_boundary =
+            encode_boundary(*rendered.turn_rewrite_byte_offset, false, "turn rewrite prefix");
     }
-    if (prefix.size() > std::numeric_limits<std::uint32_t>::max()) {
-        throw std::overflow_error("turn rewrite token boundary exceeds uint32");
+    encoded.checkpoint_hints.reserve(rendered.checkpoint_hints.size());
+    std::optional<std::uint32_t> previous;
+    for (const SemanticCheckpointByteHint& hint : rendered.checkpoint_hints) {
+        // Do not derive one boundary from another: every semantic byte cut must independently
+        // satisfy tokenizer prefix stability.
+        const std::uint32_t boundary =
+            encode_boundary(hint.byte_offset, true, "semantic checkpoint prefix");
+        if (previous && boundary < *previous) {
+            throw std::logic_error("semantic checkpoint boundaries are not ordered");
+        }
+        encoded.checkpoint_hints.push_back({hint.kind, boundary});
+        previous = boundary;
     }
-    encoded.turn_rewrite_boundary = static_cast<std::uint32_t>(prefix.size());
     return encoded;
 }
 
@@ -608,7 +649,9 @@ ProcessedInput Processor::process(const std::vector<ChatMessage>& messages,
     rendered                     = expand_placeholders(std::move(rendered), items);
     EncodedChat encoded          = encode_rendered_chat(tokenizer_, rendered);
     output.input_ids             = std::move(encoded.input_ids);
+    output.stable_prefix_boundary = encoded.stable_prefix_boundary;
     output.turn_rewrite_boundary = encoded.turn_rewrite_boundary;
+    output.checkpoint_hints = std::move(encoded.checkpoint_hints);
     output.token_types.resize(output.input_ids.size(), 0);
     for (std::size_t i = 0; i < output.input_ids.size(); ++i) {
         if (output.input_ids[i] == kImageToken) {

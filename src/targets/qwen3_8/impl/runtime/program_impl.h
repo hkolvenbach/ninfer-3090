@@ -2,15 +2,18 @@
 #include "targets/qwen3_8/impl/runtime/program.h"
 
 #include "targets/qwen3_8/impl/runtime/schedule.h"
+#include "targets/qwen3_8/impl/runtime/continuation_image.h"
 #include "ninfer/ops/gdn_replay.h"
 #include "ninfer/ops/prepare_ragged_prefix.h"
 #include "ninfer/ops/scatter.h"
 #include "ninfer/ops/speculative_round.h"
+#include "runtime/engine/l1_reuse_accounting.h"
 
 #include <cuda_runtime.h>
 
 #include <algorithm>
 #include <array>
+#include <set>
 #include <chrono>
 #include <cstring>
 #include <limits>
@@ -22,6 +25,88 @@ namespace ninfer::targets::qwen3_8::detail::NINFER_QWEN38_RUNTIME_NS {
 namespace {
 
 using Clock = std::chrono::steady_clock;
+namespace image = qwen3_8::detail::continuation;
+
+void write_paged_layout(image::Writer& out, const qwen3_8::PagedKVCacheLayout& layout) {
+    out.u32(layout.layers);
+    out.u32(layout.max_context);
+    out.i32(layout.kv_heads);
+    out.i32(layout.head_dim);
+    out.u8(static_cast<std::uint8_t>(layout.dtype));
+    out.i32(layout.quant_group);
+    out.u8(layout.packed_v);
+    out.u8(layout.rotate_k);
+    out.u8(layout.rotate_v);
+    out.u8(layout.packed_k);
+    out.u8(layout.e8_lattice);
+    out.u8(layout.e8_root);
+    out.u8(static_cast<std::uint8_t>(layout.pool.spec.plane_order));
+    out.u32(layout.pool.spec.logical_page_capacity);
+    out.u64(layout.pool.spec.planes.size());
+    for (const auto& plane : layout.pool.spec.planes) { image::write_plane_spec(out, plane); }
+}
+
+cache::Bytes make_compatibility_key(const SequencePlanImpl& plan, std::string_view model_id,
+                                     std::string_view weights_id,
+                                     std::span<const std::uint8_t> artifact_fingerprint) {
+    if (model_id.empty() || weights_id.empty() || artifact_fingerprint.size() != 32) {
+        throw std::invalid_argument("continuation compatibility requires artifact identity");
+    }
+    image::Writer out;
+    image::write_header(out, "qwen-continuation-abi");
+    out.string(model_id);
+    out.string(weights_id);
+    out.raw(artifact_fingerprint);
+    out.u32(static_cast<std::uint32_t>(plan.weights_profile));
+    out.u32(plan.capacity);
+    out.u32(plan.draft_window);
+    out.u8(static_cast<std::uint8_t>(plan.speculative_backend));
+    out.u8(static_cast<std::uint8_t>(plan.proposal_head));
+    out.u8(plan.features.vision);
+    write_paged_layout(out, plan.persistent.decoder.text_kv);
+    out.u8(plan.persistent.decoder.mtp_kv.has_value());
+    if (plan.persistent.decoder.mtp_kv) { write_paged_layout(out, *plan.persistent.decoder.mtp_kv); }
+    const auto& linear = plan.persistent.decoder.linear_attention.spec;
+    out.u32(linear.layers);
+    out.i32(linear.conv_channels);
+    out.i32(linear.conv_width);
+    out.i32(linear.value_heads);
+    out.i32(linear.value_head_dim);
+    out.i32(linear.key_head_dim);
+    out.u8(static_cast<std::uint8_t>(linear.conv_dtype));
+    out.u8(plan.persistent.dflash.has_value());
+    if (plan.persistent.dflash) {
+        const auto write_cyclic = [&out](const CyclicKVCacheLayout& layout) {
+            out.u32(static_cast<std::uint32_t>(layout.k.size()));
+            out.u32(layout.capacity);
+            out.u32(layout.padded_capacity);
+            out.i32(layout.num_kv_heads);
+            out.i32(layout.head_dim);
+        };
+        write_cyclic(plan.persistent.dflash->local);
+        write_cyclic(plan.persistent.dflash->turn_checkpoint_local);
+        write_paged_layout(out, plan.persistent.dflash->full);
+    }
+    out.u64(plan.persistent.tail_hidden.region.bytes);
+    out.u64(plan.persistent.turn_checkpoint_hidden.region.bytes);
+    return std::move(out).finish();
+}
+
+cache::Bytes copy_tensor_to_host(const Tensor& tensor, PinnedTransferBuffer& transfer,
+                                 cudaStream_t stream) {
+    if (!tensor.is_contiguous()) { throw std::logic_error("continuation tensor is not contiguous"); }
+    cache::Bytes bytes(tensor.bytes());
+    transfer.copy_device_to_host(bytes, tensor.data, bytes.size(), stream);
+    return bytes;
+}
+
+void copy_tensor_to_device(const Tensor& tensor, const cache::Bytes& bytes,
+                           PinnedTransferBuffer& transfer, cudaStream_t stream) {
+    if (!tensor.is_contiguous() || bytes.size() != tensor.bytes()) {
+        throw std::invalid_argument("continuation tensor does not match its destination");
+    }
+    transfer.copy_host_to_device(tensor.data, bytes, bytes.size(), stream);
+}
 
 std::int32_t checked_i32(std::uint32_t value, const char* label) {
     if (value > static_cast<std::uint32_t>(std::numeric_limits<std::int32_t>::max())) {
@@ -179,7 +264,9 @@ void instantiate_graph_family(DecodeGraphFamily& family, const char* label, Devi
 } // namespace
 
 ProgramImplCore::ProgramImplCore(const LoadedModelData& model_in, const SequencePlanImpl& plan,
-                                 DeviceContext& device_in)
+                                   DeviceContext& device_in, std::string_view model_id,
+                                   std::string_view weights_id,
+                                   std::span<const std::uint8_t> artifact_fingerprint)
     : model(model_in), device(device_in), capacity(plan.capacity), kv_capacity(plan.kv_capacity),
       max_concurrency(plan.max_concurrency), prefill_chunk(plan.prefill_chunk),
       draft_window(plan.draft_window), speculative_backend(plan.speculative_backend),
@@ -189,10 +276,12 @@ ProgramImplCore::ProgramImplCore(const LoadedModelData& model_in, const Sequence
       proposal_head(plan.proposal_head),
       vision_enabled(plan.features.vision),
       use_cuda_graph(plan.use_cuda_graph), kv_payload_bytes(plan.persistent.kv_payload_bytes),
-      graph_allowance_bytes(plan.graph_allowance_bytes), workspace_plan(plan.workspace),
+       graph_allowance_bytes(plan.graph_allowance_bytes), workspace_plan(plan.workspace),
+       continuation_compatibility_key(
+           make_compatibility_key(plan, model_id, weights_id, artifact_fingerprint)),
       persistent(plan.persistent.bytes), workspace_storage(plan.workspace.capacity),
       work(DeviceSpan{workspace_storage.base(), workspace_storage.capacity()}),
-      round_host(sizeof(TokenId)),
+      round_host(sizeof(TokenId)), continuation_transfer(16U * 1024U * 1024U),
       ordinary_host(
           plan.speculative_backend == SpeculativeBackend::None
               ? std::make_optional<PinnedHostBuffer>(sizeof(qwen3_8::OrdinaryDecodeIngress) +
@@ -207,14 +296,14 @@ ProgramImplCore::ProgramImplCore(const LoadedModelData& model_in, const Sequence
                                                              sizeof(qwen3_8::DFlashDecodeEgress))
                       : std::nullopt) {
     if (model.weights_arena == nullptr) {
-        throw std::invalid_argument("Qwen3.6 model view has no owning weight arena");
+        throw std::invalid_argument("Qwen3.8 model view has no owning weight arena");
     }
     if (model.features != plan.features || model.mtp.has_value() != plan.features.mtp() ||
         model.dflash.has_value() != plan.features.dflash() ||
         model.optimized_proposal.has_value() != plan.features.optimized_proposal() ||
         model.vision.has_value() != plan.features.vision) {
         throw std::invalid_argument(
-            "Qwen3.6 loaded weights do not match the frozen startup features");
+            "Qwen3.8 loaded weights do not match the frozen startup features");
     }
     if (model.mtp.has_value() && model.dflash.has_value()) {
         throw std::invalid_argument("MTP and DFlash model views are mutually exclusive");
@@ -445,6 +534,11 @@ runtime::PrefillStepResult ProgramImplCore::start_prefill_lane(std::uint32_t lan
          *request_plan.turn_checkpoint_capture_frontier >= prompt_tokens)) {
         throw std::logic_error("planned turn checkpoint capture frontier is invalid");
     }
+    if (request_plan.stable_checkpoint_capture_frontier &&
+        (*request_plan.stable_checkpoint_capture_frontier <= request_plan.reuse_base ||
+         *request_plan.stable_checkpoint_capture_frontier > prompt_tokens)) {
+        throw std::logic_error("planned stable checkpoint capture frontier is invalid");
+    }
 
     const auto started       = Clock::now();
     const std::uint32_t base = request_plan.reuse_base;
@@ -458,6 +552,7 @@ runtime::PrefillStepResult ProgramImplCore::start_prefill_lane(std::uint32_t lan
             : 0U;
     request.lifecycle = Lifecycle::Empty;
     sequence.retained = false;
+    sequence.stable_continuation.reset();
     try {
         if (request_plan.reuse == ReusePath::FullReset) {
             sequence.kv.reset();
@@ -563,6 +658,8 @@ runtime::PrefillStepResult ProgramImplCore::start_prefill_lane(std::uint32_t lan
             .vision                           = nullptr,
             .transient                        = transient,
             .turn_checkpoint_capture_frontier = request_plan.turn_checkpoint_capture_frontier,
+            .stable_checkpoint_capture_frontier =
+                request_plan.stable_checkpoint_capture_frontier,
             .base                             = base,
             .cursor                           = base,
             .prompt_tokens                    = prompt_tokens,
@@ -812,9 +909,768 @@ bool ProgramImplCore::has_retained_lane(std::uint32_t lane) const noexcept {
     return lane < max_concurrency && sequences[lane].retained;
 }
 
+std::size_t ProgramImplCore::retained_lane_resident_bytes(std::uint32_t lane) const noexcept {
+    if (lane >= max_concurrency) { return 0; }
+    const SequenceState& sequence = sequences[lane];
+    const RequestControl& request = requests[lane];
+    if (!sequence.retained || request.lifecycle != Lifecycle::Complete || request.prefill ||
+        request.pending.kind != PendingKind::None || !sequence.kv || !sequence.tail_hidden_valid ||
+        !sequence.kv->text.valid() ||
+        !sequence.kv->text.belongs_to(decoder->text_kv.pool())) {
+        return 0;
+    }
+
+    std::size_t total = 0;
+    const auto add = [&total](std::size_t bytes) {
+        if (bytes > std::numeric_limits<std::size_t>::max() - total) { return false; }
+        total += bytes;
+        return true;
+    };
+    const auto paged_bytes = [](const PagedKVAllocation& allocation,
+                                const PagedKVPool& pool) -> std::optional<std::size_t> {
+        std::size_t bytes = 0;
+        const std::uint32_t physical_pages = pool.page_group_count();
+        if (physical_pages == 0) { return std::nullopt; }
+        for (std::size_t plane = 0; plane < pool.plane_count(); ++plane) {
+            const std::size_t plane_bytes = pool.plane(plane).bytes();
+            if (plane_bytes % physical_pages != 0) { return std::nullopt; }
+            const std::size_t page_bytes = plane_bytes / physical_pages;
+            if (allocation.mapped_page_count() != 0 &&
+                page_bytes > std::numeric_limits<std::size_t>::max() /
+                                 allocation.mapped_page_count()) {
+                return std::nullopt;
+            }
+            const std::size_t mapped = page_bytes * allocation.mapped_page_count();
+            if (mapped > std::numeric_limits<std::size_t>::max() - bytes) { return std::nullopt; }
+            bytes += mapped;
+        }
+        return bytes;
+    };
+    const auto linear_slot_bytes = [&]() -> std::optional<std::size_t> {
+        std::size_t bytes = 0;
+        const auto& linear = decoder->linear_attention;
+        for (std::uint32_t layer = 0; layer < linear.layer_count(); ++layer) {
+            for (const Tensor tensor : {linear.conv_slot(layer, 0), linear.recurrent_slot(layer, 0)}) {
+                if (tensor.bytes() > std::numeric_limits<std::size_t>::max() - bytes) {
+                    return std::nullopt;
+                }
+                bytes += tensor.bytes();
+            }
+        }
+        return bytes;
+    };
+    const auto cyclic_lane_bytes = [](const CyclicKVCache& cache) -> std::optional<std::size_t> {
+        if (cache.lane_capacity() <= 0) { return std::nullopt; }
+        std::size_t bytes = 0;
+        for (std::uint32_t layer = 0; layer < cache.layer_count(); ++layer) {
+            const CyclicKVCacheLayerView view = cache.layer_view(layer);
+            for (const Tensor tensor : {view.k, view.v}) {
+                const std::size_t lanes = static_cast<std::size_t>(cache.lane_capacity());
+                if (tensor.bytes() % lanes != 0 || tensor.bytes() / lanes >
+                                                       std::numeric_limits<std::size_t>::max() - bytes) {
+                    return std::nullopt;
+                }
+                bytes += tensor.bytes() / lanes;
+            }
+        }
+        return bytes;
+    };
+
+    const auto text = paged_bytes(sequence.kv->text, decoder->text_kv.pool());
+    const auto linear = linear_slot_bytes();
+    if (!text || !linear || !add(*text) || !add(*linear) || !add(sequence.tail_hidden.bytes())) {
+        return 0;
+    }
+    if (sequence.turn_checkpoint.valid &&
+        (!add(*linear) || !add(sequence.turn_checkpoint_hidden.bytes()))) {
+        return 0;
+    }
+    if (sequence.kv->backend) {
+        const qwen3_8::PagedKVCache* backend = backend_kv_cache();
+        if (backend == nullptr || !sequence.kv->backend->valid() ||
+            !sequence.kv->backend->belongs_to(backend->pool())) {
+            return 0;
+        }
+        const auto bytes = paged_bytes(*sequence.kv->backend, backend->pool());
+        if (!bytes || !add(*bytes)) { return 0; }
+    }
+    if (speculative_backend == SpeculativeBackend::DFlash) {
+        if (!dflash) { return 0; }
+        const auto local = cyclic_lane_bytes(dflash->local);
+        if (!local || !add(*local)) { return 0; }
+        if (sequence.turn_checkpoint.valid) {
+            const auto checkpoint = cyclic_lane_bytes(dflash->turn_checkpoint_local);
+            if (!checkpoint || !add(*checkpoint)) { return 0; }
+        }
+    }
+    return total;
+}
+
+std::size_t ProgramImplCore::retained_lane_reused_bytes(
+    std::uint32_t lane, const RequestPlanImpl& plan) const noexcept {
+    if (lane >= max_concurrency || plan.reuse == ReusePath::FullReset || plan.reuse_base == 0) {
+        return 0;
+    }
+    const SequenceState& sequence = sequences[lane];
+    if (!sequence.retained || !sequence.kv || !sequence.kv->text.valid() ||
+        !sequence.kv->text.belongs_to(decoder->text_kv.pool())) {
+        return 0;
+    }
+    const bool checkpoint = plan.reuse == ReusePath::RestoreTurnCheckpoint;
+    if (checkpoint &&
+        (!sequence.turn_checkpoint.valid || sequence.turn_checkpoint.frontier != plan.reuse_base)) {
+        return 0;
+    }
+
+    const auto page_bytes = [](const PagedKVPool& pool) -> std::optional<std::size_t> {
+        if (pool.page_group_count() == 0) return std::nullopt;
+        std::size_t total = 0;
+        for (std::size_t plane = 0; plane < pool.plane_count(); ++plane) {
+            if (pool.plane(plane).bytes() % pool.page_group_count() != 0) return std::nullopt;
+            const std::size_t bytes = pool.plane(plane).bytes() / pool.page_group_count();
+            if (bytes > std::numeric_limits<std::size_t>::max() - total) return std::nullopt;
+            total += bytes;
+        }
+        return total;
+    };
+    const auto linear_bytes = [&]() -> std::optional<std::size_t> {
+        std::size_t total = 0;
+        for (std::uint32_t layer = 0; layer < decoder->linear_attention.layer_count(); ++layer) {
+            for (const Tensor tensor : {decoder->linear_attention.conv_slot(layer, 0),
+                                        decoder->linear_attention.recurrent_slot(layer, 0)}) {
+                if (tensor.bytes() > std::numeric_limits<std::size_t>::max() - total) {
+                    return std::nullopt;
+                }
+                total += tensor.bytes();
+            }
+        }
+        return total;
+    };
+    const auto cyclic_bytes = [](const CyclicKVCache& cache) -> std::optional<std::size_t> {
+        if (cache.lane_capacity() <= 0) return std::nullopt;
+        std::size_t total = 0;
+        for (std::uint32_t layer = 0; layer < cache.layer_count(); ++layer) {
+            const auto view = cache.layer_view(layer);
+            for (const Tensor tensor : {view.k, view.v}) {
+                const std::size_t lanes = static_cast<std::size_t>(cache.lane_capacity());
+                if (tensor.bytes() % lanes != 0 ||
+                    tensor.bytes() / lanes > std::numeric_limits<std::size_t>::max() - total) {
+                    return std::nullopt;
+                }
+                total += tensor.bytes() / lanes;
+            }
+        }
+        return total;
+    };
+    const auto add = [](std::size_t left, std::size_t right) -> std::optional<std::size_t> {
+        if (right > std::numeric_limits<std::size_t>::max() - left) return std::nullopt;
+        return left + right;
+    };
+
+    const auto main_page = page_bytes(decoder->text_kv.pool());
+    const auto linear = linear_bytes();
+    if (!main_page || !linear) return 0;
+    auto current_state = add(*linear, sequence.tail_hidden.bytes());
+    auto checkpoint_state = add(*linear, sequence.turn_checkpoint_hidden.bytes());
+    if (!current_state || !checkpoint_state) return 0;
+
+    std::uint32_t backend_tokens = 0;
+    std::size_t backend_page_bytes = 0;
+    if (speculative_backend == SpeculativeBackend::Mtp) {
+        backend_tokens = plan.reuse_base - 1U;
+    } else if (speculative_backend == SpeculativeBackend::DFlash) {
+        backend_tokens = plan.reuse_base;
+        if (!dflash) return 0;
+        const auto current_local = cyclic_bytes(dflash->local);
+        const auto checkpoint_local = cyclic_bytes(dflash->turn_checkpoint_local);
+        if (!current_local || !checkpoint_local) return 0;
+        current_state = add(*current_state, *current_local);
+        checkpoint_state = add(*checkpoint_state, *checkpoint_local);
+        if (!current_state || !checkpoint_state) return 0;
+    }
+    if (backend_tokens != 0) {
+        const qwen3_8::PagedKVCache* backend = backend_kv_cache();
+        if (backend == nullptr || !sequence.kv->backend || !sequence.kv->backend->valid() ||
+            !sequence.kv->backend->belongs_to(backend->pool())) {
+            return 0;
+        }
+        const auto bytes = page_bytes(backend->pool());
+        if (!bytes) return 0;
+        backend_page_bytes = *bytes;
+    }
+
+    const std::size_t main_pages =
+        (static_cast<std::size_t>(plan.reuse_base) + kPagedKVPageSize - 1U) / kPagedKVPageSize;
+    const std::size_t backend_pages =
+        (static_cast<std::size_t>(backend_tokens) + kPagedKVPageSize - 1U) / kPagedKVPageSize;
+    if (main_pages > sequence.kv->text.mapped_page_count() ||
+        (backend_pages != 0 && backend_pages > sequence.kv->backend->mapped_page_count())) {
+        return 0;
+    }
+    return runtime::l1_reused_bytes_at_frontier(
+               runtime::L1ReuseByteLayout{.main_page_bytes = *main_page,
+                                          .backend_page_bytes = backend_page_bytes,
+                                          .current_state_bytes = *current_state,
+                                          .checkpoint_state_bytes = *checkpoint_state},
+               plan.reuse_base, backend_tokens, kPagedKVPageSize, checkpoint)
+        .value_or(0);
+}
+
 void ProgramImplCore::evict_retained_lane(std::uint32_t lane) noexcept {
     if (!has_retained_lane(lane)) { return; }
     clear_lane(sequences[lane], requests[lane]);
+}
+
+std::optional<std::string>
+ProgramImplCore::stable_prefix_alias(const PreparedPromptData& prompt) const {
+    try {
+        return image::stable_alias(continuation_compatibility_key, prompt);
+    } catch (...) { return std::nullopt; }
+}
+
+std::optional<cache::ContinuationImage>
+ProgramImplCore::take_stable_continuation_lane(std::uint32_t lane) {
+    if (lane >= max_concurrency) return std::nullopt;
+    return std::exchange(sequences[lane].stable_continuation, std::nullopt);
+}
+
+cache::ContinuationImage ProgramImplCore::export_stable_continuation(
+    const SequenceState& sequence, const PreparedPromptData& prompt,
+    std::uint32_t frontier) const {
+    if (frontier == 0 || frontier > prompt.token_ids.size() || !sequence.kv ||
+        sequence.text_kv_valid < frontier ||
+        (speculative_backend == SpeculativeBackend::Mtp && sequence.mtp_kv_valid < frontier) ||
+        (speculative_backend == SpeculativeBackend::DFlash &&
+         sequence.dflash_context_frontier < frontier)) {
+        throw std::logic_error("stable prefix state is incomplete");
+    }
+
+    ResidentPrefixIdentity identity;
+    identity.assign(prompt);
+    identity.truncate(frontier);
+    std::vector<TokenId> ledger(prompt.token_ids.begin(),
+                                prompt.token_ids.begin() + static_cast<std::ptrdiff_t>(frontier));
+    const bool mtp_backend    = speculative_backend == SpeculativeBackend::Mtp;
+    const bool dflash_backend = speculative_backend == SpeculativeBackend::DFlash;
+
+    cache::ContinuationImage out;
+    out.format_version    = image::kTargetImageVersion;
+    out.compatibility_key = continuation_compatibility_key;
+    out.frontier_tokens   = frontier;
+    out.frontier_prefix_digest = image::prefix_filter_digest(prompt, frontier);
+    out.prefix_identity   = image::encode_prefix(ledger, identity.export_prefix(frontier));
+    out.frontier_metadata = image::encode_frontier(image::FrontierMetadata{
+        .execution_frontier = frontier,
+        .ledger_frontier = frontier,
+        .rope_delta = prompt.rope_delta,
+        .text_kv_valid = frontier,
+        .backend_kv_valid = mtp_backend || dflash_backend ? frontier : 0U,
+    });
+    out.boundary_metadata =
+        image::encode_boundary(image::BoundaryMetadata{.valid = false, .frontier = 0});
+    out.segments.emplace(
+        "main.text_kv",
+        image::encode_paged(export_paged_kv_logical(sequence.kv->text, frontier,
+                                                    continuation_transfer, device.stream)));
+    out.segments.emplace(
+        "main.gdn",
+        image::encode_linear(export_linear_attention_state(
+            decoder->linear_attention,
+            LinearStateSlots::turn_checkpoint_state_slot(sequence.lane, max_concurrency),
+            continuation_transfer, device.stream)));
+    out.segments.emplace(
+        "main.tail_hidden",
+        image::encode_tensor(copy_tensor_to_host(sequence.turn_checkpoint_hidden,
+                                                 continuation_transfer, device.stream)));
+    if (mtp_backend) {
+        out.segments.emplace(
+            "mtp.kv", image::encode_paged(export_paged_kv_logical(
+                           *sequence.kv->backend, frontier, continuation_transfer,
+                           device.stream)));
+    }
+    if (dflash_backend) {
+        if (!dflash || !sequence.kv->backend) {
+            throw std::logic_error("stable DFlash state is incomplete");
+        }
+        out.segments.emplace(
+            "dflash.full_kv", image::encode_paged(export_paged_kv_logical(
+                                   *sequence.kv->backend, frontier, continuation_transfer,
+                                   device.stream)));
+        out.segments.emplace(
+            "dflash.local",
+            image::encode_cyclic(export_cyclic_kv_lane(
+                dflash->turn_checkpoint_local, static_cast<std::int32_t>(sequence.lane),
+                continuation_transfer, device.stream)));
+    }
+    return out;
+}
+
+cache::ContinuationImage ProgramImplCore::export_continuation_lane(std::uint32_t lane) const {
+    if (lane >= max_concurrency) { throw std::out_of_range("continuation lane is out of range"); }
+    const SequenceState& sequence = sequences[lane];
+    const RequestControl& request = requests[lane];
+    if (!sequence.retained || request.lifecycle != Lifecycle::Complete || request.prefill ||
+        request.pending.kind != PendingKind::None || !sequence.kv ||
+        sequence.kv->text.bound_row() >= 0 ||
+        (sequence.kv->backend && sequence.kv->backend->bound_row() >= 0) ||
+        !sequence.tail_hidden_valid || sequence.execution_frontier == 0 ||
+        sequence.execution_frontier > capacity ||
+        sequence.ledger_frontier != sequence.execution_frontier + 1U ||
+        sequence.ledger.size() != sequence.ledger_frontier ||
+        sequence.prefix_identity.size() != sequence.ledger_frontier ||
+        sequence.text_kv_valid != sequence.execution_frontier) {
+        throw std::logic_error("lane is not a complete exportable continuation");
+    }
+    if (sequence.turn_checkpoint.valid &&
+        (sequence.turn_checkpoint.frontier == 0 ||
+         sequence.turn_checkpoint.frontier > sequence.execution_frontier)) {
+        throw std::logic_error("continuation turn checkpoint is outside the execution frontier");
+    }
+
+    const bool mtp_backend    = speculative_backend == SpeculativeBackend::Mtp;
+    const bool dflash_backend = speculative_backend == SpeculativeBackend::DFlash;
+    const std::uint32_t backend_valid = backend_kv_valid(sequence);
+    if ((!mtp_backend && !dflash_backend && (sequence.kv->backend || backend_valid != 0)) ||
+        ((mtp_backend || dflash_backend) &&
+         (!sequence.kv->backend || backend_valid != sequence.execution_frontier)) ||
+        (!mtp_backend && sequence.mtp_draft_count != 0) ||
+        sequence.mtp_draft_count > sequence.mtp_drafts.size()) {
+        throw std::logic_error("continuation backend state has inconsistent valid extents");
+    }
+
+    cache::ContinuationImage out;
+    out.format_version     = image::kTargetImageVersion;
+    out.compatibility_key  = continuation_compatibility_key;
+    out.frontier_tokens    = sequence.execution_frontier;
+    out.boundary_tokens    = sequence.turn_checkpoint.valid ? sequence.turn_checkpoint.frontier : 0;
+    out.prefix_identity    = image::encode_prefix(
+        sequence.ledger, sequence.prefix_identity.export_prefix(sequence.ledger_frontier));
+    const auto prefix_snapshot = sequence.prefix_identity.export_prefix(sequence.ledger_frontier);
+    out.frontier_prefix_digest =
+        image::prefix_filter_digest(sequence.ledger, prefix_snapshot, sequence.execution_frontier);
+    if (sequence.turn_checkpoint.valid) {
+        out.boundary_prefix_digest = image::prefix_filter_digest(
+            sequence.ledger, prefix_snapshot, sequence.turn_checkpoint.frontier);
+    }
+    out.frontier_metadata = image::encode_frontier(image::FrontierMetadata{
+        .execution_frontier = sequence.execution_frontier,
+        .ledger_frontier = sequence.ledger_frontier,
+        .rope_delta = sequence.rope_delta,
+        .text_kv_valid = sequence.text_kv_valid,
+        .backend_kv_valid = backend_valid,
+        .mtp_drafts = std::vector<TokenId>(sequence.mtp_drafts.begin(),
+                                           sequence.mtp_drafts.begin() + sequence.mtp_draft_count),
+    });
+    out.boundary_metadata = image::encode_boundary(image::BoundaryMetadata{
+        .valid = sequence.turn_checkpoint.valid,
+        .frontier = sequence.turn_checkpoint.frontier,
+    });
+
+    out.segments.emplace(
+        "main.text_kv",
+        image::encode_paged(export_paged_kv_logical(sequence.kv->text, sequence.text_kv_valid,
+                                                     continuation_transfer, device.stream)));
+    out.segments.emplace(
+        "main.gdn",
+        image::encode_linear(export_linear_attention_state(
+            decoder->linear_attention,
+            LinearStateSlots::current_state_slot(sequence.lane, max_concurrency),
+            continuation_transfer, device.stream)));
+    out.segments.emplace("main.tail_hidden",
+                          image::encode_tensor(copy_tensor_to_host(
+                              sequence.tail_hidden, continuation_transfer, device.stream)));
+    if (sequence.turn_checkpoint.valid) {
+        out.segments.emplace(
+            "checkpoint.gdn",
+            image::encode_linear(export_linear_attention_state(
+                decoder->linear_attention,
+                LinearStateSlots::turn_checkpoint_state_slot(sequence.lane, max_concurrency),
+                continuation_transfer, device.stream)));
+        out.segments.emplace(
+            "checkpoint.hidden",
+            image::encode_tensor(copy_tensor_to_host(
+                sequence.turn_checkpoint_hidden, continuation_transfer, device.stream)));
+    }
+    if (mtp_backend) {
+        out.segments.emplace(
+            "mtp.kv", image::encode_paged(export_paged_kv_logical(
+                           *sequence.kv->backend, sequence.mtp_kv_valid, continuation_transfer,
+                           device.stream)));
+    }
+    if (dflash_backend) {
+        if (!dflash) { throw std::logic_error("DFlash continuation has no persistent state"); }
+        out.segments.emplace(
+            "dflash.full_kv", image::encode_paged(export_paged_kv_logical(
+                                   *sequence.kv->backend, sequence.dflash_context_frontier,
+                                   continuation_transfer, device.stream)));
+        out.segments.emplace(
+            "dflash.local",
+            image::encode_cyclic(export_cyclic_kv_lane(dflash->local,
+                                                        static_cast<std::int32_t>(sequence.lane),
+                                                        continuation_transfer, device.stream)));
+        if (sequence.turn_checkpoint.valid) {
+            out.segments.emplace(
+                "dflash.checkpoint_local",
+                image::encode_cyclic(export_cyclic_kv_lane(
+                    dflash->turn_checkpoint_local, static_cast<std::int32_t>(sequence.lane),
+                    continuation_transfer, device.stream)));
+        }
+    }
+    return out;
+}
+
+std::uint32_t
+ProgramImplCore::preflight_continuation_metadata(
+    const cache::SessionCandidateDescriptor& candidate,
+    const PreparedPromptData& prompt) const noexcept {
+    try {
+        if (candidate.status != cache::CacheLookupStatus::Hit ||
+            candidate.image_format_version != image::kTargetImageVersion ||
+            candidate.compatibility_key != continuation_compatibility_key ||
+            candidate.frontier_tokens == 0 || candidate.frontier_tokens > capacity ||
+            candidate.frontier_tokens > std::numeric_limits<std::uint32_t>::max() ||
+            candidate.frontier_prefix_digest.size() != artifact::Sha256Digest{}.size() ||
+            candidate.boundary_tokens > candidate.frontier_tokens ||
+            ((candidate.boundary_tokens == 0) != candidate.boundary_prefix_digest.empty()) ||
+            (!candidate.boundary_prefix_digest.empty() &&
+             candidate.boundary_prefix_digest.size() != artifact::Sha256Digest{}.size())) {
+            return 0;
+        }
+        const auto frontier = static_cast<std::uint32_t>(candidate.frontier_tokens);
+        if (frontier <= prompt.token_ids.size() &&
+            image::prefix_filter_digest(prompt, frontier) == candidate.frontier_prefix_digest) {
+            return frontier;
+        }
+        if (candidate.boundary_tokens == 0 ||
+            candidate.boundary_tokens > std::numeric_limits<std::uint32_t>::max()) {
+            return 0;
+        }
+        const auto boundary = static_cast<std::uint32_t>(candidate.boundary_tokens);
+        return boundary < prompt.token_ids.size() &&
+                       image::prefix_filter_digest(prompt, boundary) ==
+                           candidate.boundary_prefix_digest
+                   ? boundary
+                   : 0;
+    } catch (...) { return 0; }
+}
+
+std::uint32_t
+ProgramImplCore::preflight_continuation(const cache::ContinuationImage& candidate,
+                                        const PreparedPromptData& prompt) const noexcept {
+    try {
+        if (candidate.format_version != image::kTargetImageVersion ||
+            candidate.compatibility_key != continuation_compatibility_key) {
+            return 0;
+        }
+
+        const image::FrontierMetadata metadata =
+            image::decode_frontier(candidate.frontier_metadata);
+        const image::BoundaryMetadata boundary =
+            image::decode_boundary(candidate.boundary_metadata);
+        const std::uint32_t frontier = metadata.execution_frontier;
+        const bool prefix_only = metadata.ledger_frontier == frontier;
+        if (frontier == 0 || frontier > capacity || candidate.frontier_tokens != frontier ||
+            !image::valid_ledger_frontier(frontier, metadata.ledger_frontier) ||
+            metadata.text_kv_valid != frontier ||
+            candidate.boundary_tokens != (boundary.valid ? boundary.frontier : 0U) ||
+            (boundary.valid && (boundary.frontier == 0 || boundary.frontier > frontier))) {
+            return 0;
+        }
+
+        image::PrefixData prefix =
+            image::decode_prefix(candidate.prefix_identity, metadata.ledger_frontier);
+        if (prefix.ledger.size() != metadata.ledger_frontier ||
+            image::prefix_filter_digest(prefix.ledger, prefix.identity, frontier) !=
+                candidate.frontier_prefix_digest ||
+            (boundary.valid &&
+             image::prefix_filter_digest(prefix.ledger, prefix.identity, boundary.frontier) !=
+                 candidate.boundary_prefix_digest) ||
+            (!boundary.valid && !candidate.boundary_prefix_digest.empty())) {
+            return 0;
+        }
+        if (!prefix_only) {
+            const std::int64_t generated_position =
+                static_cast<std::int64_t>(frontier) + metadata.rope_delta;
+            if (generated_position < std::numeric_limits<std::int32_t>::min() ||
+                generated_position > std::numeric_limits<std::int32_t>::max() ||
+                prefix.identity.token_types[frontier] != 0 ||
+                std::any_of(prefix.identity.positions.begin(), prefix.identity.positions.end(),
+                            [&](const auto& axis) {
+                                return axis[frontier] !=
+                                       static_cast<std::int32_t>(generated_position);
+                            })) {
+                return 0;
+            }
+        }
+        ResidentPrefixIdentity resident_identity;
+        resident_identity.restore(std::move(prefix.identity));
+        const std::uint32_t reusable_depth = qwen3_8::detail::continuation_reuse_depth(
+            prompt, prefix.ledger, resident_identity, frontier,
+            boundary.valid ? std::optional<std::uint32_t>(boundary.frontier) : std::nullopt);
+        if (reusable_depth == 0) { return 0; }
+
+        const bool mtp_backend    = speculative_backend == SpeculativeBackend::Mtp;
+        const bool dflash_backend = speculative_backend == SpeculativeBackend::DFlash;
+        if ((prefix_only && !metadata.mtp_drafts.empty()) ||
+            (!mtp_backend && !metadata.mtp_drafts.empty()) ||
+            metadata.mtp_drafts.size() > qwen3_8::kMtpDecodeMaximumDrafts ||
+            ((!mtp_backend && !dflash_backend) != (metadata.backend_kv_valid == 0)) ||
+            ((mtp_backend || dflash_backend) && metadata.backend_kv_valid != frontier)) {
+            return 0;
+        }
+
+        std::set<std::string> expected{"main.gdn", "main.tail_hidden", "main.text_kv"};
+        if (boundary.valid) {
+            expected.emplace("checkpoint.gdn");
+            expected.emplace("checkpoint.hidden");
+        }
+        if (mtp_backend) { expected.emplace("mtp.kv"); }
+        if (dflash_backend) {
+            expected.emplace("dflash.full_kv");
+            expected.emplace("dflash.local");
+            if (boundary.valid) { expected.emplace("dflash.checkpoint_local"); }
+        }
+        std::set<std::string> actual;
+        for (const auto& [name, unused] : candidate.segments) {
+            (void)unused;
+            actual.emplace(name);
+        }
+        if (actual != expected) { return 0; }
+
+        (void)image::decode_paged(candidate.segments.at("main.text_kv"), decoder->text_kv.pool(),
+                                  metadata.text_kv_valid);
+        (void)image::decode_linear(candidate.segments.at("main.gdn"), decoder->linear_attention);
+        (void)image::decode_tensor(candidate.segments.at("main.tail_hidden"),
+                                   sequences[0].tail_hidden.bytes());
+        if (boundary.valid) {
+            (void)image::decode_linear(candidate.segments.at("checkpoint.gdn"),
+                                       decoder->linear_attention);
+            (void)image::decode_tensor(candidate.segments.at("checkpoint.hidden"),
+                                       sequences[0].turn_checkpoint_hidden.bytes());
+        }
+        if (mtp_backend) {
+            (void)image::decode_paged(candidate.segments.at("mtp.kv"), backend_kv_cache()->pool(),
+                                      metadata.backend_kv_valid);
+        } else if (dflash_backend) {
+            if (!dflash) { return 0; }
+            (void)image::decode_paged(candidate.segments.at("dflash.full_kv"),
+                                      backend_kv_cache()->pool(), metadata.backend_kv_valid);
+            (void)image::decode_cyclic(candidate.segments.at("dflash.local"), dflash->local);
+            if (boundary.valid) {
+                (void)image::decode_cyclic(candidate.segments.at("dflash.checkpoint_local"),
+                                           dflash->turn_checkpoint_local);
+            }
+        }
+        return reusable_depth;
+    } catch (...) { return 0; }
+}
+
+bool ProgramImplCore::import_continuation_lane(std::uint32_t lane,
+                                                 const cache::ContinuationImage& candidate,
+                                                 const PreparedPromptData& prompt) noexcept {
+    if (lane >= max_concurrency) { return false; }
+    SequenceState& sequence = sequences[lane];
+    RequestControl& request = requests[lane];
+    if (request.lifecycle != Lifecycle::Empty || request.prefill ||
+        request.pending.kind != PendingKind::None || sequence.retained || sequence.kv) {
+        return false;
+    }
+
+    const std::uint32_t reusable_depth = preflight_continuation(candidate, prompt);
+    if (reusable_depth == 0) { return false; }
+
+    try {
+        if (candidate.format_version != image::kTargetImageVersion ||
+            candidate.compatibility_key != continuation_compatibility_key) {
+            return false;
+        }
+
+        const image::FrontierMetadata metadata =
+            image::decode_frontier(candidate.frontier_metadata);
+        const image::BoundaryMetadata boundary =
+            image::decode_boundary(candidate.boundary_metadata);
+        const std::uint32_t frontier = metadata.execution_frontier;
+        const bool prefix_only = metadata.ledger_frontier == frontier;
+        if (frontier == 0 || frontier > capacity || candidate.frontier_tokens != frontier ||
+            !image::valid_ledger_frontier(frontier, metadata.ledger_frontier) ||
+            metadata.text_kv_valid != frontier ||
+            candidate.boundary_tokens != (boundary.valid ? boundary.frontier : 0U) ||
+            (boundary.valid && (boundary.frontier == 0 || boundary.frontier > frontier))) {
+            return false;
+        }
+        image::PrefixData prefix =
+            image::decode_prefix(candidate.prefix_identity, metadata.ledger_frontier);
+        if (prefix.ledger.size() != metadata.ledger_frontier) { return false; }
+
+        if (!prefix_only) {
+            const std::int64_t generated_position =
+                static_cast<std::int64_t>(frontier) + metadata.rope_delta;
+            if (generated_position < std::numeric_limits<std::int32_t>::min() ||
+                generated_position > std::numeric_limits<std::int32_t>::max() ||
+                prefix.identity.token_types[frontier] != 0 ||
+                std::any_of(prefix.identity.positions.begin(), prefix.identity.positions.end(),
+                            [&](const auto& axis) {
+                                return axis[frontier] !=
+                                       static_cast<std::int32_t>(generated_position);
+                            })) {
+                return false;
+            }
+        }
+
+        ResidentPrefixIdentity resident_identity;
+        resident_identity.restore(std::move(prefix.identity));
+        const bool frontier_matches = qwen3_8::detail::prefix_matches(
+            prompt, prefix.ledger, resident_identity, frontier);
+        const bool boundary_matches =
+            boundary.valid && boundary.frontier < prompt.token_ids.size() &&
+            qwen3_8::detail::prefix_matches(
+                prompt, prefix.ledger, resident_identity, boundary.frontier);
+        std::uint32_t verified_depth = 0;
+        if (frontier_matches) {
+            verified_depth = frontier;
+        } else if (boundary_matches) {
+            verified_depth = boundary.frontier;
+        }
+        if (verified_depth != reusable_depth) {
+            return false;
+        }
+
+        const bool mtp_backend    = speculative_backend == SpeculativeBackend::Mtp;
+        const bool dflash_backend = speculative_backend == SpeculativeBackend::DFlash;
+        if ((prefix_only && !metadata.mtp_drafts.empty()) ||
+            (!mtp_backend && !metadata.mtp_drafts.empty()) ||
+            metadata.mtp_drafts.size() > qwen3_8::kMtpDecodeMaximumDrafts ||
+            ((!mtp_backend && !dflash_backend) != (metadata.backend_kv_valid == 0)) ||
+            ((mtp_backend || dflash_backend) && metadata.backend_kv_valid != frontier)) {
+            return false;
+        }
+
+        std::set<std::string> expected{"main.gdn", "main.tail_hidden", "main.text_kv"};
+        if (boundary.valid) {
+            expected.emplace("checkpoint.gdn");
+            expected.emplace("checkpoint.hidden");
+        }
+        if (mtp_backend) { expected.emplace("mtp.kv"); }
+        if (dflash_backend) {
+            expected.emplace("dflash.full_kv");
+            expected.emplace("dflash.local");
+            if (boundary.valid) { expected.emplace("dflash.checkpoint_local"); }
+        }
+        std::set<std::string> actual;
+        for (const auto& [name, unused] : candidate.segments) {
+            (void)unused;
+            actual.emplace(name);
+        }
+        if (actual != expected) { return false; }
+
+        const PagedKVLogicalImage text_kv =
+            image::decode_paged(candidate.segments.at("main.text_kv"), decoder->text_kv.pool(),
+                                metadata.text_kv_valid);
+        const LinearAttentionStateImage current_gdn =
+            image::decode_linear(candidate.segments.at("main.gdn"), decoder->linear_attention);
+        const cache::Bytes tail_hidden = image::decode_tensor(
+            candidate.segments.at("main.tail_hidden"), sequence.tail_hidden.bytes());
+        if (text_kv.valid_tokens != frontier) { return false; }
+
+        std::optional<LinearAttentionStateImage> checkpoint_gdn;
+        std::optional<cache::Bytes> checkpoint_hidden;
+        if (boundary.valid) {
+            checkpoint_gdn.emplace(
+                image::decode_linear(candidate.segments.at("checkpoint.gdn"),
+                                     decoder->linear_attention));
+            checkpoint_hidden.emplace(image::decode_tensor(
+                candidate.segments.at("checkpoint.hidden"),
+                sequence.turn_checkpoint_hidden.bytes()));
+        }
+
+        std::optional<PagedKVLogicalImage> backend_kv;
+        std::optional<CyclicKVCacheImage> dflash_local;
+        std::optional<CyclicKVCacheImage> dflash_checkpoint_local;
+        if (mtp_backend) {
+            backend_kv.emplace(image::decode_paged(candidate.segments.at("mtp.kv"),
+                                                   backend_kv_cache()->pool(),
+                                                   metadata.backend_kv_valid));
+        } else if (dflash_backend) {
+            backend_kv.emplace(image::decode_paged(candidate.segments.at("dflash.full_kv"),
+                                                   backend_kv_cache()->pool(),
+                                                   metadata.backend_kv_valid));
+            dflash_local.emplace(
+                image::decode_cyclic(candidate.segments.at("dflash.local"), dflash->local));
+            if (boundary.valid) {
+                dflash_checkpoint_local.emplace(image::decode_cyclic(
+                    candidate.segments.at("dflash.checkpoint_local"),
+                    dflash->turn_checkpoint_local));
+            }
+        }
+        if (backend_kv && backend_kv->valid_tokens != metadata.backend_kv_valid) { return false; }
+
+        const std::uint32_t text_pages =
+            (metadata.text_kv_valid + static_cast<std::uint32_t>(kPagedKVPageSize) - 1U) /
+            static_cast<std::uint32_t>(kPagedKVPageSize);
+        const std::uint32_t backend_pages =
+            metadata.backend_kv_valid == 0
+                ? 0U
+                : (metadata.backend_kv_valid + static_cast<std::uint32_t>(kPagedKVPageSize) - 1U) /
+                      static_cast<std::uint32_t>(kPagedKVPageSize);
+        reserve_sequence_kv(sequence, text_pages, backend_pages);
+        import_paged_kv_logical(sequence.kv->text, text_kv, continuation_transfer, device.stream);
+        if (backend_kv) {
+            import_paged_kv_logical(*sequence.kv->backend, *backend_kv, continuation_transfer,
+                                    device.stream);
+        }
+        import_linear_attention_state(
+            decoder->linear_attention,
+            LinearStateSlots::current_state_slot(sequence.lane, max_concurrency), current_gdn,
+            continuation_transfer, device.stream);
+        copy_tensor_to_device(sequence.tail_hidden, tail_hidden, continuation_transfer,
+                              device.stream);
+        if (boundary.valid) {
+            import_linear_attention_state(
+                decoder->linear_attention,
+                LinearStateSlots::turn_checkpoint_state_slot(sequence.lane, max_concurrency),
+                *checkpoint_gdn, continuation_transfer, device.stream);
+            copy_tensor_to_device(sequence.turn_checkpoint_hidden, *checkpoint_hidden,
+                                  continuation_transfer, device.stream);
+        }
+        if (dflash_backend) {
+            if (!dflash || !dflash_local) {
+                throw std::invalid_argument("DFlash continuation state is incomplete");
+            }
+            import_cyclic_kv_lane(dflash->local, static_cast<std::int32_t>(sequence.lane),
+                                   *dflash_local, continuation_transfer, device.stream);
+            if (boundary.valid) {
+                import_cyclic_kv_lane(dflash->turn_checkpoint_local,
+                                      static_cast<std::int32_t>(sequence.lane),
+                                       *dflash_checkpoint_local, continuation_transfer,
+                                       device.stream);
+            }
+        }
+        device.synchronize();
+
+        sequence.execution_frontier      = frontier;
+        sequence.ledger_frontier         = metadata.ledger_frontier;
+        sequence.ledger                  = std::move(prefix.ledger);
+        sequence.prefix_identity         = std::move(resident_identity);
+        sequence.rope_delta              = metadata.rope_delta;
+        sequence.text_kv_valid           = metadata.text_kv_valid;
+        sequence.mtp_kv_valid            = mtp_backend ? metadata.backend_kv_valid : 0;
+        sequence.dflash_context_frontier = dflash_backend ? metadata.backend_kv_valid : 0;
+        sequence.mtp_draft_count = static_cast<std::uint32_t>(metadata.mtp_drafts.size());
+        std::copy(metadata.mtp_drafts.begin(), metadata.mtp_drafts.end(),
+                  sequence.mtp_drafts.begin());
+        sequence.tail_hidden_valid = true;
+        sequence.turn_checkpoint =
+            TurnCheckpoint{.valid = boundary.valid, .frontier = boundary.frontier};
+        sequence.retained = true;
+        request.lifecycle = Lifecycle::Complete;
+        return true;
+    } catch (...) {
+        try {
+            device.synchronize();
+        } catch (...) {}
+        clear_lane(sequence, request);
+        return false;
+    }
 }
 
 GenerationTimings ProgramImplCore::generation_timings_lane(std::uint32_t lane) const noexcept {
@@ -840,6 +1696,7 @@ void ProgramImplCore::clear_lane(SequenceState& sequence, RequestControl& reques
     sequence.tail_hidden_valid       = false;
     sequence.retained                = false;
     sequence.turn_checkpoint         = {};
+    sequence.stable_continuation.reset();
     request.pending                  = {};
 }
 
@@ -1538,15 +2395,19 @@ runtime::PrefillStepResult ProgramImplCore::advance_prefill(SequenceState& seque
                 mark_workspace_usage(workspace_plan.dflash_context);
             }
             schedule::PrefillChunkResult result;
+            const std::optional<std::uint32_t> capture_frontier =
+                image::next_prefill_checkpoint(staged.cursor,
+                                               staged.stable_checkpoint_capture_frontier,
+                                               staged.turn_checkpoint_capture_frontier);
             if (staged.vision) {
                 mark_workspace_usage(workspace_plan.vision_encode);
                 result = schedule::prefill_multimodal_chunk(
                     schedule_state, staged.prompt, *staged.vision, nominal,
-                    staged.turn_checkpoint_capture_frontier, final_candidate);
+                    capture_frontier, final_candidate);
             } else {
                 result = schedule::prefill_text_chunk(
                     schedule_state, std::span<const TokenId>(staged.prompt.token_ids), nominal,
-                    staged.turn_checkpoint_capture_frontier, final_candidate);
+                    capture_frontier, final_candidate);
             }
             if (result.processed_tokens == 0 || result.processed_tokens > nominal) {
                 throw std::logic_error("ordinary prefill chunk made invalid progress");
@@ -1560,6 +2421,13 @@ runtime::PrefillStepResult ProgramImplCore::advance_prefill(SequenceState& seque
             if (staged.prepare_mtp) { sequence.mtp_kv_valid = staged.cursor; }
             if (speculative_backend == SpeculativeBackend::DFlash) {
                 sequence.dflash_context_frontier = staged.cursor;
+            }
+
+            if (staged.stable_checkpoint_capture_frontier &&
+                staged.cursor == *staged.stable_checkpoint_capture_frontier) {
+                sequence.stable_continuation = export_stable_continuation(
+                    sequence, staged.prompt, staged.cursor);
+                staged.stable_checkpoint_capture_frontier.reset();
             }
 
             if (!result.finalized) {

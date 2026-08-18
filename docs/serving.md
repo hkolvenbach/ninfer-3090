@@ -81,6 +81,7 @@ The endpoint supports:
 - `stream_options.include_usage`;
 - non-strict function tools, `tool_choice` `auto`/`none`, assistant tool-call history, and tool-result
   messages;
+- `prompt_cache_key` as a continuation-session routing hint, subject to exact prefix checks;
 - the top-level `reasoning_effort` field;
 - the `enable_thinking` extension;
 - `chat_template_kwargs.preserve_thinking` and the top-level `preserve_thinking` alias.
@@ -189,7 +190,7 @@ wire response contains typed `output` Items.
 | `input[].type=item_reference` | substitutes the exact retained output Item with that ID in place; independent of `previous_response_id`; stale, deleted, or evicted IDs return `item_not_found` |
 | `instructions` | optional string, inserted before the reconstructed conversation for this request only |
 | `previous_response_id` | optional ID of a retained local Response |
-| `prompt_cache_key` | optional string routing hint; accepted for OpenAI SDK compatibility and otherwise ignored |
+| `prompt_cache_key` | optional continuation-session routing hint; reuse is authorized only by exact prefix and runtime compatibility checks |
 | `max_output_tokens` | integer at least `16`; default is `--default-max-tokens` |
 | `stream` | boolean; `true` selects Responses SSE rather than a JSON body |
 | `store` | boolean, default `true`; controls local retrieval and continuation state |
@@ -388,9 +389,9 @@ curl http://127.0.0.1:8080/v1/responses/input_tokens \
 
 Unsupported Create fields include Conversations, prompt templates, context management, hosted
 moderation, safety/user identifiers, Structured Outputs/JSON mode, background execution,
-compaction, files/audio, and OpenAI-hosted/MCP/custom tools. `prompt_cache_key` is accepted only as
-an inert SDK routing hint. The only non-empty `include` value accepted is the ignored AI SDK hint
-`reasoning.encrypted_content`; no encrypted field is produced. These
+compaction, files/audio, and OpenAI-hosted/MCP/custom tools. `prompt_cache_key` is a continuation
+routing hint and never bypasses exact prepared-prefix checks. The only non-empty `include` value
+accepted is the ignored AI SDK hint `reasoning.encrypted_content`; no encrypted field is produced. These
 are explicit compatibility boundaries; unsupported values return capability errors rather than
 being silently accepted.
 
@@ -481,6 +482,20 @@ are errors. Delete and cancel routes accept no query parameters.
 | `--no-cuda-graph` | disable CUDA Graph decode | graphs on |
 | `--no-prefix-reuse` | disable compatible-prefix caching | prefix reuse on |
 | `--prefix-checkpoint-policy stable-turn\|rolling-tool` | choose a stable first-assistant rewrite checkpoint or advance it after completed tool history | `rolling-tool` |
+| `--continuation-cache off\|l1\|l1-l2\|l1-l2-l3` | retained VRAM only, plus host RAM, or plus persistent local storage | `l1-l2`, or `l1-l2-l3` when a directory is supplied |
+| `--continuation-cache-policy adaptive` | byte/value-aware implemented cache policy | `adaptive` |
+| `--continuation-cache-dir DIR` | L3 parent; entries use `DIR/NAMESPACE` | unset |
+| `--continuation-cache-namespace NAME` | safe single-component L3 namespace | `local` |
+| `--continuation-cache-l1-mib N` | retained-lane VRAM eviction budget | `768` |
+| `--continuation-cache-l2-mib N` | host continuation-image budget | `16384` |
+| `--continuation-cache-l3-mib N` | durable unique chunk plus manifest budget | `49152` |
+| `--continuation-cache-l1-idle-seconds N` | retained-lane idle eviction threshold; `0` means no expiry | `600` |
+| `--continuation-cache-l2-idle-seconds N` | independent host-image idle TTL; `0` means no expiry | `7200` |
+| `--continuation-cache-l3-ttl-seconds N` | independent durable-manifest idle TTL; `0` means no expiry | `86400` |
+| `--continuation-cache-persist-interval-seconds N` | timer persistence trigger; `0` disables only this trigger | `60` |
+| `--continuation-cache-persist-min-tokens N` | frontier-growth trigger; `0` makes every publication due | `8192` |
+| `--continuation-cache-filesystem-reserve-mib N` | minimum free space retained below the L3 root | `0` |
+| `--prefix-checkpoint-history N` | IDs retained per mutable session alias, including current head | `4` |
 | `--no-thinking` | disable thinking by default | thinking on |
 | `--preserve-thinking` | preserve closed-turn assistant reasoning by default | off |
 | `--cors` | permissive browser CORS headers | off |
@@ -502,6 +517,50 @@ request fields override process flags, and `--greedy` finally forces temperature
 
 Run `./build/apps/ninfer-serve --help` for the exact option contract.
 
+## Continuation sessions and persistence
+
+Use a stable, distinct `prompt_cache_key` for each of two or three OpenCode sessions, such as
+`repo-a`, `repo-b`, and `repo-c`. The key selects a candidate session head; it is not trusted as
+prompt identity. NInfer verifies the complete artifact/runtime compatibility domain and exact
+tokens, positions, media ledger, and boundary before restore, so accidental key reuse is a safe
+miss. Exact stable system/developer/tool prefixes also receive automatic immutable aliases and can
+be shared across independent requests with different user suffixes.
+
+```bash
+./build/apps/ninfer-serve models/qwen3_8_27b.ninfer \
+  --max-context 262144 --kv-capacity 262144 --max-concurrency 1 \
+  --kv-dtype rk4v4-e8 --spec mtp --draft-tokens 3 --lm-head-draft \
+  --continuation-cache l1-l2-l3 \
+  --continuation-cache-dir "$HOME/.cache/ninfer/continuations" \
+  --continuation-cache-namespace opencode \
+  --continuation-cache-filesystem-reserve-mib 8192
+```
+
+The server user needs create/read/write ownership of the cache path; Linux directories and files
+are secured to `0700`/`0600`. The configured directory also stores a local artifact SHA-256 sidecar
+under `DIR/NAMESPACE/artifacts`: an unchanged Linux reopen reports `fingerprint-cache` and avoids
+rescanning the model file, while any path, identity, metadata, permission, format, or I/O mismatch
+falls back to the byte-reporting `fingerprint` scan. The sidecar trusts the same local OS user and is
+disabled on platforms that cannot provide the complete file identity; it is an optimization, not
+artifact authority. Reuse the same writable path, namespace, exact artifact, KV/backend
+profile, and session key after restart. L3 publication is asynchronous and coalesced, due after 60
+seconds or 8,192 new tokens by default. Interval `0` disables only the timer trigger; token growth
+and orderly shutdown still persist the latest publication. Stored Responses and `previous_response_id` are separate
+process-local state and still disappear on restart. Do not point multiple server processes at one
+namespace; cross-process cache-root coordination is not implemented.
+
+The published Qwen3.8 artifact SHA-256
+`eec39564993d6e9c7d5e383382a760f093465c9d163ec9a1bd6b80199514bf3e` is compatible only with cache
+entries made from those exact artifact bytes. The on-disk cache manifest remains a development
+format; version mismatches are ignored as misses and may require rotating the namespace.
+
+Size L2 to hold the session heads that should switch without disk reads and L3 for durable heads,
+history, and stable prefixes. L1 uses the active GPU KV pool, so increasing it can reduce useful
+request headroom. The default 768 MiB/16 GiB/48 GiB profile is a starting point, not a guarantee.
+Set a nonzero filesystem reserve in production. See the
+[cache guide](continuation-cache.md) for tier TTL and persistence semantics, limitations, and
+the complete metric list.
+
 ## Structured request log
 
 `--request-log-jsonl FILE` enables the machine-readable measurement log. The server opens `FILE`
@@ -514,7 +573,7 @@ is also rejected if it resolves to the model artifact.
   --request-log-jsonl profiles/bench/run/server.requests.jsonl
 ```
 
-Every line is one `ninfer_serve_request_log` schema-v10 JSON object. All events carry
+Every line is one `ninfer_serve_request_log` schema-v12 JSON object. All events carry
 `timestamp_unix_ms` and a process-unique `server_instance_id`; request IDs are monotonic only within
 that server instance. Generation request records retain that numeric `request_id` for metrics and
 also carry `x_request_id`, matching the client-visible HTTP response header for log correlation.
@@ -523,14 +582,24 @@ also carry `x_request_id`, matching the client-visible HTTP response header for 
 |---|---|
 | `server_start` | target/weights identity and artifact, resolved Engine, registered thinking/non-thinking sampler defaults plus process overrides, thinking-history defaults, weights/sequence/workspace/request-transient arenas, KV sizing ledger, CUDA Graph observed/allowance bytes, CUDA/GPU environment, and redacted argv |
 | `request_start` | protocol, resolved sampler and seed, thinking modes, Responses semantic-change flag, output budget, stream/message/tool shape |
-| `request_done` | finish reason, prompt/completion/cache/computed-prefill tokens, prefix reuse path, unrounded phase seconds, and complete speculative-decoding counters |
+| `request_done` | finish reason, prompt/completion/cache/computed-prefill tokens, prefix reuse path, unrounded phase seconds, complete speculative-decoding counters, and a structured `continuation_cache` diagnostic |
 | `request_error` | the resolved request configuration and generation error message |
-| `throughput` | interval token deltas and rates, scheduler occupancy, and decode-round batch statistics |
+| `throughput` | interval token deltas and rates, scheduler occupancy, decode-round batch statistics, and cumulative/delta continuation tier and latency summaries |
 
 `request_done.timings_seconds` contains `prepare`, `ttft`, `vision`, `prefill`, `decode`, and `total`
 as full-precision JSON numbers. Its `speculative` object contains `backend`, `draft_window`, `rounds`,
 `drafted_tokens`, `accepted_tokens`, `fallback_steps`, and `accepted_per_position`. Rates can be
 derived downstream from raw token counts and seconds instead of rounded stderr strings.
+
+`request_done.continuation_cache` reports stable `source` (`none`, `l1`, `l2`, `l3`), `alias_kind`
+(`none`, `routed_session`, `stable_prefix`), and `final_miss_reason` names, plus lookup/preflight/restore
+microseconds, restored tokens/bytes, destructive rollback, and completion-publication state. It never
+contains the raw session key or internal stable alias. The corresponding human completion line uses
+`cache_source=`, `cache_alias=`, `cache_miss=`, `cache_lookup=...ms`,
+`cache_preflight=...ms`, `cache_restore=...ms`, restored tokens/bytes, rollback, and queued
+publication state. L1 identifies resident GPU reuse, not a host restore. L2/L3 identify where the
+selected image bytes were actually obtained. L3 persistence latency is asynchronous aggregate data
+and is present only in throughput and Prometheus metrics, never in request completion latency.
 
 The JSONL file contains no generated response text and never records an API-key value; `argv`
 replaces that value with `<redacted>`. The existing stderr summaries remain available for operators
@@ -549,6 +618,19 @@ and DFlash this is the accepted committed output, not draft or rejected tokens.
 the end of the interval. Fully idle zero intervals are omitted. The JSONL `throughput` event keeps
 the raw token and round deltas as well as derived rates; downstream measurement should prefer those
 raw values.
+
+The throughput `continuation_cache` object reports cumulative values and interval deltas for tier
+restore counts/tokens/bytes, routed-session/stable-prefix selections, terminal miss reasons,
+lookup/preflight/restore operation timing, L2 admission, L3 persistence, and publication outcomes;
+`occupancy` reports current L1/L2/L3 entries/bytes plus cumulative L1 evictions/demotions. Counter
+deltas tolerate a server/counter restart: when a current value is below the prior snapshot, the
+current value starts the new interval instead of underflowing.
+
+To verify interpretation, capture `/metrics`, send a cold request and a repeated routed request,
+then compare the completion records and counters. Retained reuse reports L1; evicting that lane and
+repeating reports L2; after persistence succeeds and the server restarts with the same compatibility
+domain, the first restore reports L3. A mismatching prompt with the same routing key should report a
+safe terminal reason such as `preflight_rejected`, without logging the key itself.
 
 ## Execution behavior
 

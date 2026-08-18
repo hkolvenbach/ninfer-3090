@@ -1,6 +1,7 @@
 #include "core/linear_attention_state.h"
 
 #include "core/device.h"
+#include "core/pinned_transfer.h"
 
 #include <limits>
 #include <stdexcept>
@@ -10,6 +11,7 @@ namespace ninfer {
 namespace {
 
 constexpr std::size_t kArenaAlign = 256;
+constexpr std::size_t kConvenienceTransferBytes = 2U * 1024U * 1024U;
 
 void validate_positive(std::int32_t value, const char* message) {
     if (value <= 0) { throw std::invalid_argument(message); }
@@ -221,6 +223,85 @@ void LinearAttentionStatePool::zero_slot(std::int32_t slot, cudaStream_t stream)
         const Tensor state = recurrent_slot(layer, slot);
         CUDA_CHECK(cudaMemsetAsync(state.data, 0, state.bytes(), stream));
     }
+}
+
+LinearAttentionStateImage export_linear_attention_state(const LinearAttentionStatePool& pool,
+                                                         std::int32_t slot,
+                                                         PinnedTransferBuffer& transfer,
+                                                         cudaStream_t stream) {
+    validate_layer_slot(pool, 0, slot, "LinearAttentionStatePool export source");
+    LinearAttentionStateImage image{
+        .layers         = pool.layer_count(),
+        .conv_channels  = pool.spec.conv_channels,
+        .conv_width     = pool.spec.conv_width,
+        .value_heads    = pool.spec.value_heads,
+        .value_head_dim = pool.spec.value_head_dim,
+        .key_head_dim   = pool.spec.key_head_dim,
+        .conv_dtype     = pool.spec.conv_dtype,
+    };
+    image.conv.resize(image.layers);
+    image.recurrent.resize(image.layers);
+    std::vector<DeviceToHostTransfer> copies;
+    for (std::uint32_t layer = 0; layer < image.layers; ++layer) {
+        const Tensor source = pool.conv_slot(layer, slot);
+        image.conv[layer].resize(source.bytes());
+        copies.push_back({&image.conv[layer], 0, source.data, source.bytes()});
+    }
+    for (std::uint32_t layer = 0; layer < image.layers; ++layer) {
+        const Tensor source = pool.recurrent_slot(layer, slot);
+        image.recurrent[layer].resize(source.bytes());
+        copies.push_back({&image.recurrent[layer], 0, source.data, source.bytes()});
+    }
+    transfer.copy_device_to_host(copies, stream);
+    return image;
+}
+
+LinearAttentionStateImage export_linear_attention_state(const LinearAttentionStatePool& pool,
+                                                         std::int32_t slot,
+                                                         cudaStream_t stream) {
+    PinnedTransferBuffer transfer(kConvenienceTransferBytes);
+    return export_linear_attention_state(pool, slot, transfer, stream);
+}
+
+void import_linear_attention_state(LinearAttentionStatePool& pool, std::int32_t slot,
+                                    const LinearAttentionStateImage& image,
+                                    PinnedTransferBuffer& transfer,
+                                    cudaStream_t stream) {
+    validate_layer_slot(pool, 0, slot, "LinearAttentionStatePool import destination");
+    if (image.layers != pool.layer_count() || image.conv_channels != pool.spec.conv_channels ||
+        image.conv_width != pool.spec.conv_width || image.value_heads != pool.spec.value_heads ||
+        image.value_head_dim != pool.spec.value_head_dim ||
+        image.key_head_dim != pool.spec.key_head_dim || image.conv_dtype != pool.spec.conv_dtype ||
+        image.conv.size() != image.layers || image.recurrent.size() != image.layers) {
+        throw std::invalid_argument("Linear Attention state image geometry differs from pool");
+    }
+    for (std::uint32_t layer = 0; layer < image.layers; ++layer) {
+        const Tensor destination = pool.conv_slot(layer, slot);
+        if (image.conv[layer].size() != destination.bytes()) {
+            throw std::invalid_argument("Linear Attention convolution image size is invalid");
+        }
+        const Tensor recurrent_destination = pool.recurrent_slot(layer, slot);
+        if (image.recurrent[layer].size() != recurrent_destination.bytes()) {
+            throw std::invalid_argument("Linear Attention recurrent image size is invalid");
+        }
+    }
+    std::vector<HostToDeviceTransfer> copies;
+    for (std::uint32_t layer = 0; layer < image.layers; ++layer) {
+        const Tensor destination = pool.conv_slot(layer, slot);
+        copies.push_back({destination.data, &image.conv[layer], 0, destination.bytes()});
+    }
+    for (std::uint32_t layer = 0; layer < image.layers; ++layer) {
+        const Tensor destination = pool.recurrent_slot(layer, slot);
+        copies.push_back({destination.data, &image.recurrent[layer], 0, destination.bytes()});
+    }
+    transfer.copy_host_to_device(copies, stream);
+}
+
+void import_linear_attention_state(LinearAttentionStatePool& pool, std::int32_t slot,
+                                    const LinearAttentionStateImage& image,
+                                    cudaStream_t stream) {
+    PinnedTransferBuffer transfer(kConvenienceTransferBytes);
+    import_linear_attention_state(pool, slot, image, transfer, stream);
 }
 
 } // namespace ninfer

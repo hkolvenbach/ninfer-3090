@@ -42,24 +42,29 @@ int main() {
                       "request log accepted the model artifact as its output path");
 
     ServeOptions options;
-    options.artifact_path                  = "/models/qwen3_8_27b.ninfer";
-    options.host                           = "127.0.0.1";
-    options.port                           = 8123;
-    options.api_key                        = "must-not-appear";
-    options.model_id_override              = "deployment-alias";
-    options.request_log_jsonl              = "requests.jsonl";
-    options.max_context                    = 262144;
-    options.kv_capacity                    = ninfer::KvCapacityPolicy::explicit_capacity(524288);
-    options.prefill_chunk                  = 1024;
-    options.log_stats_interval_ms          = 2500;
-    options.kv_cache                       = ninfer::KvCacheStorage::Int8Group64;
-    options.speculative.backend            = ninfer::SpeculativeBackend::Mtp;
-    options.speculative.draft_tokens       = 3;
-    options.speculative.proposal_head      = ninfer::ProposalHead::Optimized;
-    options.enable_vision                  = false;
-    options.allow_prefix_reuse             = false;
-    options.preserve_thinking              = true;
-    options.sampling_overrides.temperature = 0.6F;
+    options.artifact_path                = "/models/qwen3_8_27b.ninfer";
+    options.host                         = "127.0.0.1";
+    options.port                         = 8123;
+    options.api_key                      = "must-not-appear";
+    options.model_id_override            = "deployment-alias";
+    options.request_log_jsonl            = "requests.jsonl";
+    options.max_context                  = 262144;
+    options.kv_capacity                  = ninfer::KvCapacityPolicy::explicit_capacity(524288);
+    options.prefill_chunk                = 1024;
+    options.log_stats_interval_ms        = 2500;
+    options.kv_cache                     = ninfer::KvCacheStorage::Int8Group64;
+    options.speculative.backend          = ninfer::SpeculativeBackend::Mtp;
+    options.speculative.draft_tokens     = 3;
+    options.speculative.proposal_head    = ninfer::ProposalHead::Optimized;
+    options.enable_vision                = false;
+    options.allow_prefix_reuse           = false;
+    options.preserve_thinking            = true;
+    options.continuation_cache.tiers     = ninfer::ContinuationCacheTiers::L1L2L3;
+    options.continuation_cache.directory = "/var/cache/ninfer";
+    options.continuation_cache.cache_namespace        = "tenant-a";
+    options.continuation_cache.persist_min_tokens     = 512;
+    options.continuation_cache.filesystem_reserve_mib = 4096;
+    options.sampling_overrides.temperature            = 0.6F;
     options.startup_argv = {"ninfer-serve", options.artifact_path, "--api-key", "<redacted>"};
 
     const ninfer::ModelSamplingDefaults sampling_defaults{
@@ -145,6 +150,22 @@ int main() {
         check(server.at("engine").at("prefix_reuse") == false, "prefix-reuse state missing");
     failures += check(server.at("engine").at("prefix_checkpoint_policy") == "rolling-tool",
                       "prefix checkpoint policy missing");
+    const Json& continuation_cache = server.at("engine").at("continuation_cache");
+    failures += check(continuation_cache.at("tiers") == "l1-l2-l3" &&
+                          continuation_cache.at("policy") == "adaptive" &&
+                          continuation_cache.at("directory") == "/var/cache/ninfer" &&
+                          continuation_cache.at("namespace") == "tenant-a" &&
+                          continuation_cache.at("l1_capacity_mib") == 768 &&
+                          continuation_cache.at("l2_capacity_mib") == 16384 &&
+                          continuation_cache.at("l3_capacity_mib") == 49152 &&
+                          continuation_cache.at("l1_idle_ttl_seconds") == 600 &&
+                          continuation_cache.at("l2_idle_ttl_seconds") == 7200 &&
+                          continuation_cache.at("l3_idle_ttl_seconds") == 86400 &&
+                          continuation_cache.at("persist_interval_seconds") == 60 &&
+                          continuation_cache.at("persist_min_tokens") == 512 &&
+                          continuation_cache.at("filesystem_reserve_mib") == 4096 &&
+                          continuation_cache.at("prefix_checkpoint_history") == 4,
+                      "continuation cache configuration missing from server-start record");
     failures += check(server.at("server").at("default_preserve_thinking") == true,
                       "server preserve-thinking default missing");
     failures +=
@@ -230,6 +251,16 @@ int main() {
     outcome.metrics.speculative_accepted_tokens = 720;
     outcome.metrics.speculative_fallback_steps  = 2;
     outcome.metrics.speculative_accepted_per_position = {290, 240, 190};
+    outcome.metrics.continuation.source = ninfer::ContinuationSource::L3;
+    outcome.metrics.continuation.alias_kind = ninfer::ContinuationAliasKind::Session;
+    outcome.metrics.continuation.final_miss_reason = ninfer::ContinuationMissReason::None;
+    outcome.metrics.continuation.lookup_microseconds = 1234;
+    outcome.metrics.continuation.preflight_microseconds = 56;
+    outcome.metrics.continuation.restore_microseconds = 7890;
+    outcome.metrics.continuation.restored_tokens = 101;
+    outcome.metrics.continuation.restored_bytes = 4096;
+    outcome.metrics.continuation.destructive_rollback = true;
+    outcome.metrics.continuation.completion_publication_queued = true;
 
     const Json done = Json::parse(format_request_done_json("serve-test", 3000, context, outcome));
     failures += check(done.at("request").at("x_request_id") == "req_public_abc",
@@ -254,7 +285,17 @@ int main() {
                       "speculative fallback count missing");
     failures +=
         check(done.at("speculative").at("accepted_per_position") == Json::array({290, 240, 190}),
-              "speculative position counts missing");
+               "speculative position counts missing");
+    failures += check(done.at("schema_version") == 12 &&
+                          done.at("continuation_cache").at("source") == "l3" &&
+                           done.at("continuation_cache").at("alias_kind") == "routed_session" &&
+                          done.at("continuation_cache").at("final_miss_reason") == "none" &&
+                          done.at("continuation_cache").at("lookup_microseconds") == 1234 &&
+                          done.at("continuation_cache").at("restore_microseconds") == 7890 &&
+                          done.at("continuation_cache").at("destructive_rollback") == true &&
+                          done.at("continuation_cache")
+                                  .at("completion_publication_queued") == true,
+                       "schema-v12 continuation diagnostics missing");
 
     const Json error =
         Json::parse(format_request_error_json("serve-test", 4000, context, "generation failed"));
@@ -271,7 +312,19 @@ int main() {
               "human request log omits preserve-thinking mode");
     failures += check(format_request_done(context, outcome).find("reuse=restore_turn_checkpoint") !=
                           std::string::npos,
-                      "human request log omits prefix reuse path");
+                       "human request log omits prefix reuse path");
+    const std::string human_done = format_request_done(context, outcome);
+    failures += check(human_done.find("cache_source=l3") != std::string::npos &&
+                           human_done.find("cache_alias=routed_session") != std::string::npos &&
+                          human_done.find("cache_miss=none") != std::string::npos &&
+                          human_done.find("cache_lookup=1.234ms") != std::string::npos &&
+                           human_done.find("cache_preflight=0.056ms") != std::string::npos &&
+                           human_done.find("cache_restore=7.890ms") != std::string::npos &&
+                           human_done.find("cache_tokens=101") != std::string::npos &&
+                           human_done.find("cache_bytes=4096") != std::string::npos &&
+                           human_done.find("cache_rollback=yes") != std::string::npos &&
+                           human_done.find("cache_publish_queued=yes") != std::string::npos,
+                      "human request log omits deterministic cache diagnostics");
     failures += check(format_request_start(context).find("submitted") != std::string::npos,
                       "human request log mislabels a submitted request");
     failures += check(
@@ -283,19 +336,43 @@ int main() {
         "human generation logs omit the client-visible request id");
 
     ThroughputReport throughput;
-    throughput.interval_seconds                = 2.0;
-    throughput.computed_prefill_tokens         = 100;
-    throughput.committed_decode_tokens         = 40;
-    throughput.decode_rounds                   = 10;
-    throughput.decode_row_rounds               = 18;
-    throughput.scheduler.running_requests      = 2;
-    throughput.scheduler.prefilling_requests   = 1;
-    throughput.scheduler.decode_ready_requests = 1;
-    throughput.scheduler.waiting_requests      = 3;
-    const std::string human_throughput         = format_throughput(throughput);
+    throughput.interval_seconds                            = 2.0;
+    throughput.computed_prefill_tokens                     = 100;
+    throughput.committed_decode_tokens                     = 40;
+    throughput.decode_rounds                               = 10;
+    throughput.decode_row_rounds                           = 18;
+    throughput.scheduler.running_requests                  = 2;
+    throughput.scheduler.prefilling_requests               = 1;
+    throughput.scheduler.decode_ready_requests             = 1;
+    throughput.scheduler.waiting_requests                  = 3;
+    throughput.scheduler.continuation_lookup_hits          = 7;
+    throughput.scheduler.continuation_lookup_misses        = 2;
+    throughput.scheduler.continuation_restore_successes    = 4;
+    throughput.scheduler.continuation_publication_failures = 1;
+    throughput.scheduler.continuation_publication_superseded = 2;
+    throughput.scheduler.continuation_l1_restore_successes = 3;
+    throughput.scheduler.continuation_l2_restore_successes = 4;
+    throughput.scheduler.continuation_l3_restore_successes = 5;
+    throughput.scheduler.continuation_l2_lookup_microseconds = 600;
+    throughput.scheduler.continuation_l3_restore_microseconds = 700;
+    throughput.continuation_delta.continuation_l1_restore_successes = 1;
+    throughput.continuation_delta.continuation_l2_restore_successes = 2;
+    throughput.continuation_delta.continuation_l3_restore_successes = 3;
+    throughput.continuation_delta.continuation_l2_lookup_microseconds = 100;
+    throughput.continuation_delta.continuation_l3_restore_microseconds = 200;
+    throughput.continuation_delta.continuation_l2_lookup_operations = 6;
+    throughput.scheduler.continuation_l2_restored_bytes = 4096;
+    throughput.continuation_delta.continuation_l2_restored_bytes = 2048;
+    throughput.scheduler.continuation_miss_preflight_rejected = 4;
+    throughput.continuation_delta.continuation_miss_preflight_rejected = 1;
+    throughput.scheduler.l1_resident_entries = 2;
+    const std::string human_throughput                     = format_throughput(throughput);
     failures += check(human_throughput.find("prefill=50.0tok/s") != std::string::npos &&
-                          human_throughput.find("decode=20.0tok/s") != std::string::npos &&
-                          human_throughput.find("avg_decode_batch=1.80") != std::string::npos,
+                           human_throughput.find("decode=20.0tok/s") != std::string::npos &&
+                           human_throughput.find("avg_decode_batch=1.80") != std::string::npos &&
+                           human_throughput.find("cache_tier_delta=1/2/3") != std::string::npos &&
+                           human_throughput.find("cache_lookup_us_delta=100/0") !=
+                               std::string::npos,
                       "human throughput report mismatch");
     const Json throughput_json =
         Json::parse(format_throughput_json("serve-test", 5000, throughput));
@@ -305,6 +382,64 @@ int main() {
                       "throughput token deltas mismatch");
     failures += check(throughput_json.at("decode_batch").at("average_size") == 1.8,
                       "throughput batch average mismatch");
+    failures += check(throughput_json.at("continuation_cache").at("lookup_hits") == 7 &&
+                          throughput_json.at("continuation_cache").at("lookup_misses") == 2 &&
+                           throughput_json.at("continuation_cache").at("restore_successes") == 4 &&
+                            throughput_json.at("continuation_cache").at("publication_failures") == 1 &&
+                            throughput_json.at("continuation_cache").at("publication_superseded") == 2 &&
+                            throughput_json.at("continuation_cache").at("tiers").at(
+                                "delta_l3_restore_successes") == 3 &&
+                            throughput_json.at("continuation_cache")
+                                    .at("latency_microseconds")
+                                    .at("l2_lookup_delta") == 100 &&
+                            throughput_json.at("continuation_cache")
+                                    .at("latency_microseconds")
+                                     .at("l2_lookup_operations_delta") == 6,
+                        "throughput continuation counters mismatch");
+    failures += check(
+        throughput_json.at("continuation_cache").at("tiers").at("l2_restored_bytes") == 4096 &&
+            throughput_json.at("continuation_cache")
+                    .at("tiers")
+                    .at("delta_l2_restored_bytes") == 2048 &&
+            throughput_json.at("continuation_cache")
+                    .at("miss_reasons")
+                    .at("delta_preflight_rejected") == 1 &&
+            throughput_json.at("continuation_cache").at("occupancy").at("l1_entries") == 2,
+        "throughput tier bytes, miss reasons, and occupancy missing");
+
+    ninfer::RuntimeStats continuation_before;
+    ninfer::RuntimeStats continuation_after;
+    continuation_after.continuation_publication_successes = 1;
+    continuation_after.continuation_persistence_queued = 2;
+    continuation_after.continuation_persistence_successes = 1;
+    continuation_after.continuation_l3_persistence_microseconds = 900;
+    continuation_after.continuation_l3_persistence_operations = 1;
+    const ThroughputReport continuation_only =
+        make_throughput_report(continuation_before, continuation_after, 2.0);
+    failures += check(
+        throughput_report_has_activity(continuation_only) &&
+            continuation_only.computed_prefill_tokens == 0 &&
+            continuation_only.committed_decode_tokens == 0 &&
+            continuation_only.continuation_delta.continuation_publication_successes == 1 &&
+            continuation_only.continuation_delta.continuation_persistence_queued == 2 &&
+            continuation_only.continuation_delta.continuation_l3_persistence_microseconds == 900 &&
+            continuation_only.continuation_delta.continuation_l3_persistence_operations == 1,
+        "continuation-only reporter interval was suppressed or lost async deltas");
+
+    ninfer::RuntimeStats before_restart;
+    before_restart.computed_prefill_tokens = 100;
+    before_restart.continuation_l2_restore_successes = 9;
+    before_restart.continuation_miss_no_alias = 7;
+    ninfer::RuntimeStats after_restart;
+    after_restart.computed_prefill_tokens = 3;
+    after_restart.continuation_l2_restore_successes = 2;
+    after_restart.continuation_miss_no_alias = 1;
+    const ThroughputReport restarted =
+        make_throughput_report(before_restart, after_restart, 1.0);
+    failures += check(restarted.computed_prefill_tokens == 3 &&
+                          restarted.continuation_delta.continuation_l2_restore_successes == 2 &&
+                          restarted.continuation_delta.continuation_miss_no_alias == 1,
+                      "counter restart deltas use the current snapshot without underflow");
 
     const std::string console_prefix =
         format_console_log_prefix(std::chrono::system_clock::time_point{}, ConsoleLogLevel::Info);

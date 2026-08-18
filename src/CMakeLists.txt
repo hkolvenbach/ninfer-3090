@@ -16,9 +16,16 @@ function(ninfer_cuda_archive target)
   target_compile_options(${target} PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:-lineinfo>)
 endfunction()
 
+# Host-only continuation images and their RAM/disk content-addressed catalog. It intentionally has
+# no dependency on CUDA or a model target so future promotion/demotion workers can use it directly.
+add_library(ninfer_continuation_cache STATIC
+  runtime/cache/continuation_cache.cpp)
+ninfer_internal_includes(ninfer_continuation_cache)
+
 # Device/tensor/layout/graph primitives and the model-independent request runtime.
 add_library(ninfer_core STATIC
   core/arena.cu
+  core/pinned_transfer.cu
   core/device.cu
   core/dtype.cpp
   core/gdn_replay_records.cpp
@@ -38,6 +45,7 @@ target_link_libraries(ninfer_core PUBLIC ${NINFER_CUDART_TARGET} CUDA::nvtx3)
 
 # Generic .ninfer framing, binding, and direct final materialization.
 add_library(ninfer_artifact STATIC
+  artifact/sha256.cpp
   artifact/reader.cpp
   artifact/storage_layouts.cpp
   artifact/binder.cpp
@@ -351,6 +359,7 @@ endif()
 target_link_libraries(ninfer_engine
   PRIVATE
     ninfer_artifact
+    ninfer_continuation_cache
     ninfer_core
     ninfer_ops
     ninfer_text

@@ -278,6 +278,7 @@ int main(int argc, char** argv) {
         engine_options.kv_cache       = cli.kv_cache;
         engine_options.speculative    = cli.speculative;
         engine_options.prefix_checkpoint_policy = cli.prefix_checkpoint_policy;
+        engine_options.continuation_cache = cli.continuation_cache;
         engine_options.enable_vision  = cli.enable_vision;
         engine_options.use_cuda_graph = cli.use_cuda_graph;
         engine_options.load_progress  = load_progress.callback();

@@ -17,7 +17,7 @@
 
 namespace ninfer::serve {
 
-inline constexpr int kRequestLogSchemaVersion        = 10;
+inline constexpr int kRequestLogSchemaVersion        = 12;
 inline constexpr const char* kRequestLogArtifactType = "ninfer_serve_request_log";
 
 struct RequestLogContext {
@@ -58,7 +58,13 @@ struct ThroughputReport {
     std::uint64_t decode_rounds           = 0;
     std::uint64_t decode_row_rounds       = 0;
     ninfer::RuntimeStats scheduler;
+    ninfer::RuntimeStats continuation_delta;
 };
+
+ThroughputReport make_throughput_report(const ninfer::RuntimeStats& previous,
+                                        const ninfer::RuntimeStats& current,
+                                        double interval_seconds);
+[[nodiscard]] bool throughput_report_has_activity(const ThroughputReport& report) noexcept;
 
 RequestLogContext make_request_log_context(std::uint64_t id, std::string x_request_id,
                                            std::string protocol, const GenerationRequest& request,

@@ -1,6 +1,7 @@
 #include "core/cyclic_kv_cache.h"
 
 #include "core/device.h"
+#include "core/pinned_transfer.h"
 
 #include <array>
 #include <limits>
@@ -11,6 +12,7 @@ namespace ninfer {
 namespace {
 
 constexpr std::size_t kArenaAlign = 256;
+constexpr std::size_t kConvenienceTransferBytes = 2U * 1024U * 1024U;
 
 std::uint32_t align_up_u32(std::uint32_t value, std::uint32_t alignment) {
     const std::uint64_t mask    = static_cast<std::uint64_t>(alignment) - 1U;
@@ -120,6 +122,79 @@ void CyclicKVCache::copy_lane_from(const CyclicKVCache& source, std::int32_t lan
         CUDA_CHECK(cudaMemcpyAsync(destination_v.data, source_v.data, destination_v.bytes(),
                                    cudaMemcpyDeviceToDevice, stream));
     }
+}
+
+CyclicKVCacheImage export_cyclic_kv_lane(const CyclicKVCache& cache, std::int32_t lane,
+                                          PinnedTransferBuffer& transfer,
+                                          cudaStream_t stream) {
+    if (lane < 0 || lane >= cache.lane_capacity()) {
+        throw std::out_of_range("Cyclic KV export lane is out of range");
+    }
+
+    CyclicKVCacheImage image{
+        .layers          = cache.layer_count(),
+        .capacity        = cache.capacity(),
+        .padded_capacity = cache.padded_capacity(),
+        .num_kv_heads    = cache.num_kv_heads(),
+        .head_dim        = cache.head_dim(),
+    };
+    image.k.resize(image.layers);
+    image.v.resize(image.layers);
+    std::vector<DeviceToHostTransfer> copies;
+    for (std::uint32_t layer = 0; layer < image.layers; ++layer) {
+        const CyclicKVCacheLayerView view = cache.layer_view(layer);
+        const Tensor source_k             = view.k.slice(3, lane, 1);
+        const Tensor source_v             = view.v.slice(3, lane, 1);
+        image.k[layer].resize(source_k.bytes());
+        image.v[layer].resize(source_v.bytes());
+        copies.push_back({&image.k[layer], 0, source_k.data, source_k.bytes()});
+        copies.push_back({&image.v[layer], 0, source_v.data, source_v.bytes()});
+    }
+    transfer.copy_device_to_host(copies, stream);
+    return image;
+}
+
+CyclicKVCacheImage export_cyclic_kv_lane(const CyclicKVCache& cache, std::int32_t lane,
+                                          cudaStream_t stream) {
+    PinnedTransferBuffer transfer(kConvenienceTransferBytes);
+    return export_cyclic_kv_lane(cache, lane, transfer, stream);
+}
+
+void import_cyclic_kv_lane(CyclicKVCache& cache, std::int32_t lane, const CyclicKVCacheImage& image,
+                            PinnedTransferBuffer& transfer,
+                            cudaStream_t stream) {
+    if (lane < 0 || lane >= cache.lane_capacity()) {
+        throw std::out_of_range("Cyclic KV import lane is out of range");
+    }
+    if (image.layers != cache.layer_count() || image.capacity != cache.capacity() ||
+        image.padded_capacity != cache.padded_capacity() ||
+        image.num_kv_heads != cache.num_kv_heads() || image.head_dim != cache.head_dim() ||
+        image.k.size() != image.layers || image.v.size() != image.layers) {
+        throw std::invalid_argument("Cyclic KV image geometry differs from cache");
+    }
+    std::vector<HostToDeviceTransfer> copies;
+    for (std::uint32_t layer = 0; layer < image.layers; ++layer) {
+        const CyclicKVCacheLayerView view = cache.layer_view(layer);
+        if (image.k[layer].size() != view.k.slice(3, lane, 1).bytes() ||
+            image.v[layer].size() != view.v.slice(3, lane, 1).bytes()) {
+            throw std::invalid_argument("Cyclic KV image payload size is invalid");
+        }
+    }
+
+    for (std::uint32_t layer = 0; layer < image.layers; ++layer) {
+        const CyclicKVCacheLayerView view = cache.layer_view(layer);
+        const Tensor destination_k        = view.k.slice(3, lane, 1);
+        const Tensor destination_v        = view.v.slice(3, lane, 1);
+        copies.push_back({destination_k.data, &image.k[layer], 0, destination_k.bytes()});
+        copies.push_back({destination_v.data, &image.v[layer], 0, destination_v.bytes()});
+    }
+    transfer.copy_host_to_device(copies, stream);
+}
+
+void import_cyclic_kv_lane(CyclicKVCache& cache, std::int32_t lane,
+                            const CyclicKVCacheImage& image, cudaStream_t stream) {
+    PinnedTransferBuffer transfer(kConvenienceTransferBytes);
+    import_cyclic_kv_lane(cache, lane, image, transfer, stream);
 }
 
 } // namespace ninfer

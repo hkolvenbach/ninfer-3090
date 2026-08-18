@@ -2,11 +2,13 @@
 #include <ninfer/targets/qwen3_8/frontend_resources.h>
 
 #include "targets/qwen3_8/impl/frontend/chat_template.h"
+#include "targets/qwen3_8/impl/frontend/processor.h"
 #include "targets/qwen3_8/impl/frontend/test_access.h"
 #include "targets/qwen3_8/impl/frontend/tokenizer.h"
 
 #include <nlohmann/json.hpp>
 
+#include <algorithm>
 #include <array>
 #include <cmath>
 #include <cstddef>
@@ -93,6 +95,7 @@ FrontendResources resources(const std::string& chat_template = thinking_toggle_t
         {added(1, "helloST"), added(2, "OPtail"), added(3, "thought</thi"),
          added(4, "nk>\n\nanswer"), added(6, "<eos>", true), added(7, "<0.0 seconds>"),
          added(30, "user\n"), added(31, "assistant\n"), added(32, "\n"),
+         added(33, "system\n"),
          added(248045, "<|im_start|>", true), added(248046, "<|im_end|>", true),
          added(248053, "<|vision_start|>", true), added(248054, "<|vision_end|>", true),
          added(248056, "<|image_pad|>", true), added(248057, "<|video_pad|>", true),
@@ -203,10 +206,18 @@ bool throws_invalid_argument(Callable&& callable) {
     return false;
 }
 
+template <class Callable>
+bool throws_logic_error(Callable&& callable) {
+    try {
+        callable();
+    } catch (const std::logic_error&) { return true; }
+    return false;
+}
+
 int test_official_tokenizer_merge() {
-    const char* configured_root = std::getenv("NINFER_QWEN3_6_27B_HF_DIR");
+    const char* configured_root = std::getenv("NINFER_QWEN3_8_27B_HF_DIR");
     if (configured_root == nullptr || *configured_root == '\0') {
-        std::cout << "skip: NINFER_QWEN3_6_27B_HF_DIR is not set\n";
+        std::cout << "skip: NINFER_QWEN3_8_27B_HF_DIR is not set\n";
         return 0;
     }
     const std::filesystem::path root(configured_root);
@@ -489,6 +500,14 @@ int test_turn_rewrite_trace() {
                   *rolled.turn_rewrite_byte_offset == rolling_header + assistant_header.size() &&
                   *rolled.turn_rewrite_byte_offset > *open.turn_rewrite_byte_offset,
               "rolling tool checkpoint did not advance to the generation opener");
+    failures += check(
+        rolled.checkpoint_hints.size() == 3 &&
+            rolled.checkpoint_hints[0].kind == fi::SemanticCheckpointKind::StableTurn &&
+            rolled.checkpoint_hints[1].kind == fi::SemanticCheckpointKind::Rolling &&
+            rolled.checkpoint_hints[2].kind == fi::SemanticCheckpointKind::Rolling &&
+            rolled.checkpoint_hints[0].byte_offset < rolled.checkpoint_hints[1].byte_offset &&
+            rolled.checkpoint_hints[1].byte_offset < rolled.checkpoint_hints[2].byte_offset,
+        "semantic stable-turn and rolling checkpoint history is incomplete or unordered");
 
     const fi::RenderedChat first_roll = render_chat(
         {chat_message("user", "question"), first, chat_message("tool", "result one")}, rolling);
@@ -624,6 +643,150 @@ int test_text_and_image_prepare(const Frontend& frontend) {
                               near(prepared_data.patches[1536], 16.0F / 127.5F - 1.0F),
                           "image frontend patch normalization/order is incorrect");
     }
+    return failures;
+}
+
+int test_stable_prefix_identity(const Frontend& frontend) {
+    const auto make_input = [](std::string user, std::vector<std::string> tools = {}) {
+        ninfer::PromptInput input;
+        ninfer::ChatMessage system;
+        system.role = "system";
+        system.parts.push_back(
+            ninfer::MessagePart{.kind = ninfer::MessagePartKind::Text,
+                                .text = "x",
+                                .media = {}});
+        input.messages.push_back(std::move(system));
+        ninfer::ChatMessage message;
+        message.role = "user";
+        message.parts.push_back(ninfer::MessagePart{.kind = ninfer::MessagePartKind::Text,
+                                                    .text = std::move(user),
+                                                    .media = {}});
+        input.messages.push_back(std::move(message));
+        input.options.tool_jsons = std::move(tools);
+        return input;
+    };
+
+    const auto first = frontend.prepare(make_input("x"));
+    const auto second = frontend.prepare(make_input("xx"));
+    const auto& first_data = FrontendFactory::inspect(first);
+    const auto& second_data = FrontendFactory::inspect(second);
+    int failures = check(first_data.identity.stable_prefix_boundary &&
+                             first_data.identity.stable_prefix_boundary ==
+                                 second_data.identity.stable_prefix_boundary,
+                         "same system block did not produce a stable prefix boundary");
+    if (first_data.identity.stable_prefix_boundary) {
+        const std::size_t boundary = *first_data.identity.stable_prefix_boundary;
+        failures += check(boundary < first_data.token_ids.size() &&
+                              boundary < second_data.token_ids.size() &&
+                              std::equal(first_data.token_ids.begin(),
+                                         first_data.token_ids.begin() + boundary,
+                                         second_data.token_ids.begin()),
+                          "varying user messages changed stable prefix tokens");
+        failures += check(!first_data.identity.checkpoint_hints.empty() &&
+                              first_data.identity.checkpoint_hints.front().kind ==
+                                  ninfer::targets::qwen3_8::PromptCheckpointKind::StablePrefix &&
+                              first_data.identity.checkpoint_hints.front().boundary == boundary &&
+                              std::is_sorted(first_data.identity.checkpoint_hints.begin(),
+                                             first_data.identity.checkpoint_hints.end(),
+                                             [](const auto& lhs, const auto& rhs) {
+                                                 return lhs.boundary < rhs.boundary;
+                                             }),
+                          "semantic checkpoint history omitted or reordered stable prefix");
+    }
+
+    ninfer::PromptInput bare;
+    ninfer::ChatMessage bare_user;
+    bare_user.role = "user";
+    bare_user.parts.push_back(ninfer::MessagePart{.kind = ninfer::MessagePartKind::Text,
+                                                   .text = "x",
+                                                  .media = {}});
+    bare.messages.push_back(std::move(bare_user));
+    const auto no_stable = frontend.prepare(std::move(bare));
+    failures += check(!FrontendFactory::inspect(no_stable).identity.stable_prefix_boundary,
+                      "prompt without a leading block published a stable prefix");
+
+    const std::vector<std::string> tool_a = {
+        R"({"type":"function","function":{"name":"alpha","parameters":{"type":"object"}}})"};
+    const std::vector<std::string> tool_b = {
+        R"({"type":"function","function":{"name":"beta","parameters":{"type":"object"}}})"};
+    fi::ChatRenderOptions tool_a_options;
+    tool_a_options.tool_jsons = tool_a;
+    fi::ChatRenderOptions tool_b_options;
+    tool_b_options.tool_jsons = tool_b;
+    const fi::RenderedChat with_tool_a = render_chat(
+        {chat_message("system", "x"), chat_message("user", "x")}, tool_a_options);
+    const fi::RenderedChat with_tool_b = render_chat(
+        {chat_message("system", "x"), chat_message("user", "x")}, tool_b_options);
+    failures += check(with_tool_a.stable_prefix_byte_offset &&
+                          with_tool_b.stable_prefix_byte_offset &&
+                          with_tool_a.text.substr(0, *with_tool_a.stable_prefix_byte_offset) !=
+                              with_tool_b.text.substr(0, *with_tool_b.stable_prefix_byte_offset),
+                      "tool definition change did not change stable prefix tokens");
+
+    const fi::RenderedChat rendered = render_chat(
+        {chat_message("system", "x"), chat_message("user", "x")});
+    const fi::Tokenizer tokenizer({.tokenizer_json = resources().tokenizer_json,
+                                   .tokenizer_config_json = resources().tokenizer_config_json,
+                                   .generation_config_json = resources().generation_config_json});
+    const fi::EncodedChat encoded = fi::encode_rendered_chat(tokenizer, rendered);
+    const std::vector<int> exact_prefix = tokenizer.encode(
+        std::string_view(rendered.text).substr(0, *rendered.stable_prefix_byte_offset));
+    failures += check(encoded.stable_prefix_boundary == exact_prefix.size() &&
+                          std::equal(exact_prefix.begin(), exact_prefix.end(),
+                                     encoded.input_ids.begin()),
+                      "stable boundary was not separately tokenized as an exact prefix");
+    failures += check(encoded.checkpoint_hints.size() == rendered.checkpoint_hints.size() &&
+                          std::equal(encoded.checkpoint_hints.begin(),
+                                     encoded.checkpoint_hints.end(),
+                                     rendered.checkpoint_hints.begin(),
+                                     [&](const auto& token_hint, const auto& byte_hint) {
+                                         const std::vector<int> prefix = tokenizer.encode(
+                                             std::string_view(rendered.text)
+                                                 .substr(0, byte_hint.byte_offset));
+                                         return token_hint.kind == byte_hint.kind &&
+                                                token_hint.boundary == prefix.size() &&
+                                                std::equal(prefix.begin(), prefix.end(),
+                                                           encoded.input_ids.begin());
+                                     }),
+                      "semantic byte boundaries were not independently exact-prefix validated");
+
+    fi::RenderedChat unstable = rendered;
+    unstable.stable_prefix_byte_offset = 1;
+    failures += check(throws_logic_error(
+                          [&] { (void)fi::encode_rendered_chat(tokenizer, unstable); }),
+                      "tokenizer-unstable byte boundary was accepted");
+
+    fi::RenderedChat media_boundary;
+    media_boundary.text = "<|image_pad|>suffix";
+    media_boundary.turn_rewrite_byte_offset = std::string_view("<|image_pad|>").size();
+    media_boundary.checkpoint_hints.push_back(
+        {fi::SemanticCheckpointKind::Rolling, *media_boundary.turn_rewrite_byte_offset});
+    const std::size_t old_boundary = *media_boundary.turn_rewrite_byte_offset;
+    fi::adjust_rendered_boundaries_for_replacement(media_boundary, 0, old_boundary,
+                                                   old_boundary * 2);
+    failures += check(media_boundary.turn_rewrite_byte_offset == old_boundary * 2 &&
+                          media_boundary.checkpoint_hints.front().byte_offset == old_boundary * 2,
+                      "media expansion did not adjust every boundary");
+    media_boundary.checkpoint_hints.front().byte_offset = 1;
+    failures += check(throws_logic_error([&] {
+                          fi::adjust_rendered_boundaries_for_replacement(media_boundary, 0,
+                                                                         old_boundary,
+                                                                         old_boundary * 2);
+                      }),
+                      "boundary intersecting a media placeholder was accepted");
+
+    fi::ChatRenderOptions low_options;
+    low_options.reasoning_effort = ninfer::ReasoningEffort::Low;
+    fi::ChatRenderOptions xhigh_options;
+    xhigh_options.reasoning_effort = ninfer::ReasoningEffort::XHigh;
+    const fi::RenderedChat low = reasoning_effort_template().render(
+        {chat_message("user", "hello")}, low_options);
+    const fi::RenderedChat xhigh = reasoning_effort_template().render(
+        {chat_message("user", "hello")}, xhigh_options);
+    failures += check(low.stable_prefix_byte_offset && xhigh.stable_prefix_byte_offset &&
+                          low.text.substr(0, *low.stable_prefix_byte_offset) !=
+                              xhigh.text.substr(0, *xhigh.stable_prefix_byte_offset),
+                      "reasoning instruction change did not change stable block identity");
     return failures;
 }
 
@@ -833,6 +996,7 @@ int main() {
     failures += test_turn_rewrite_trace();
     failures += test_official_resource_guards();
     failures += test_text_and_image_prepare(frontend);
+    failures += test_stable_prefix_identity(frontend);
     failures += test_video_prepare(frontend);
     failures += test_cross_round_stop(frontend);
     failures += test_same_token_stop_priority(frontend);

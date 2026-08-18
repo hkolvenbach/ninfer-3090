@@ -1,6 +1,6 @@
 #pragma once
 #include "targets/qwen3_8/impl/runtime/instance.h"
-// Qwen3.6 family runtime implementation; instantiated only by exact variants.
+// Qwen3.8 family runtime implementation; instantiated only by exact variants.
 
 #include "targets/qwen3_8/impl/runtime/linear_state_slots.h"
 

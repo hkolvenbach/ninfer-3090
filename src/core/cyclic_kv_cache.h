@@ -11,6 +11,8 @@
 
 namespace ninfer {
 
+class PinnedTransferBuffer;
+
 /**
  * Fixed cyclic BF16 K/V storage with absolute-position addressing.
  *
@@ -37,6 +39,18 @@ struct CyclicKVCacheLayout {
     std::vector<TensorRegion> v;
 
     [[nodiscard]] std::size_t payload_bytes() const noexcept;
+};
+
+// Canonical image of one lane. lane_capacity and lane IDs are allocation details and are
+// intentionally absent.
+struct CyclicKVCacheImage {
+    std::uint32_t layers          = 0;
+    std::uint32_t capacity        = 0;
+    std::uint32_t padded_capacity = 0;
+    std::int32_t num_kv_heads     = 0;
+    std::int32_t head_dim         = 0;
+    std::vector<std::vector<std::uint8_t>> k;
+    std::vector<std::vector<std::uint8_t>> v;
 };
 
 [[nodiscard]] CyclicKVCacheLayout
@@ -78,5 +92,18 @@ private:
     std::int32_t head_dim_         = 0;
     std::int32_t lane_capacity_    = 0;
 };
+
+// Synchronous boundary operations on the supplied CUDA stream.
+[[nodiscard]] CyclicKVCacheImage
+export_cyclic_kv_lane(const CyclicKVCache& cache, std::int32_t lane, cudaStream_t stream = nullptr);
+[[nodiscard]] CyclicKVCacheImage export_cyclic_kv_lane(const CyclicKVCache& cache,
+                                                        std::int32_t lane,
+                                                        PinnedTransferBuffer& transfer,
+                                                        cudaStream_t stream = nullptr);
+void import_cyclic_kv_lane(CyclicKVCache& cache, std::int32_t lane, const CyclicKVCacheImage& image,
+                            cudaStream_t stream = nullptr);
+void import_cyclic_kv_lane(CyclicKVCache& cache, std::int32_t lane,
+                           const CyclicKVCacheImage& image, PinnedTransferBuffer& transfer,
+                           cudaStream_t stream = nullptr);
 
 } // namespace ninfer

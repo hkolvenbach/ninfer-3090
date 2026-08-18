@@ -49,7 +49,22 @@ int main() {
                           defaults.response_store_max_bytes == kDefaultResponseStoreBytes,
                       "Responses store defaults mismatch");
     failures += check(!defaults.model_id_override.has_value(),
-                      "model id override is unexpectedly configured by default");
+                       "model id override is unexpectedly configured by default");
+    failures += check(defaults.continuation_cache.tiers == ninfer::ContinuationCacheTiers::L1L2 &&
+                           defaults.continuation_cache.directory.empty(),
+                       "continuation cache does not default to memory tiers");
+    failures += check(defaults.continuation_cache.l1_capacity_mib == 768 &&
+                          defaults.continuation_cache.l2_capacity_mib == 16384 &&
+                           defaults.continuation_cache.l3_capacity_mib == 49152 &&
+                           defaults.continuation_cache.cache_namespace == "local" &&
+                           defaults.continuation_cache.l1_idle_ttl_seconds == 600 &&
+                           defaults.continuation_cache.l2_idle_ttl_seconds == 7200 &&
+                           defaults.continuation_cache.l3_idle_ttl_seconds == 86400 &&
+                           defaults.continuation_cache.persist_interval_seconds == 60 &&
+                           defaults.continuation_cache.persist_min_tokens == 8192 &&
+                           defaults.continuation_cache.filesystem_reserve_mib == 0 &&
+                           defaults.continuation_cache.prefix_checkpoint_history == 4,
+                      "continuation cache defaults mismatch");
     failures += check(
         !defaults.sampling_overrides.temperature && !defaults.sampling_overrides.top_p &&
             !defaults.sampling_overrides.top_k && !defaults.sampling_overrides.presence_penalty &&
@@ -137,7 +152,59 @@ int main() {
     failures += check(configured.pending_timeout_ms == 2500,
                       "--pending-timeout-ms did not reach serving options");
     failures += check(configured.log_stats_interval_ms == 0,
-                      "--log-stats-interval-ms did not disable periodic reporting");
+                       "--log-stats-interval-ms did not disable periodic reporting");
+
+    const ServeOptions continuation = parse(
+        {"ninfer-serve", "model.ninfer", "--continuation-cache-dir", "/var/cache/ninfer",
+         "--continuation-cache-policy", "adaptive", "--continuation-cache-namespace", "tenant-a",
+         "--continuation-cache-l1-mib", "100", "--continuation-cache-l2-mib", "200",
+         "--continuation-cache-l3-mib", "300", "--continuation-cache-l1-idle-seconds", "0",
+         "--continuation-cache-l2-idle-seconds", "20", "--continuation-cache-l3-ttl-seconds", "30",
+         "--continuation-cache-persist-interval-seconds", "0",
+         "--continuation-cache-persist-min-tokens", "512",
+         "--continuation-cache-filesystem-reserve-mib", "4096", "--prefix-checkpoint-history", "7"});
+    failures += check(
+        continuation.continuation_cache.tiers == ninfer::ContinuationCacheTiers::L1L2L3 &&
+            continuation.continuation_cache.directory == "/var/cache/ninfer" &&
+            continuation.continuation_cache.cache_namespace == "tenant-a" &&
+            continuation.continuation_cache.l1_capacity_mib == 100 &&
+            continuation.continuation_cache.l2_capacity_mib == 200 &&
+            continuation.continuation_cache.l3_capacity_mib == 300 &&
+            continuation.continuation_cache.l1_idle_ttl_seconds == 0 &&
+            continuation.continuation_cache.l2_idle_ttl_seconds == 20 &&
+            continuation.continuation_cache.l3_idle_ttl_seconds == 30 &&
+            continuation.continuation_cache.persist_interval_seconds == 0 &&
+            continuation.continuation_cache.persist_min_tokens == 512 &&
+            continuation.continuation_cache.filesystem_reserve_mib == 4096 &&
+            continuation.continuation_cache.prefix_checkpoint_history == 7,
+        "continuation cache flags did not reach serving options");
+    const ServeOptions memory_only = parse(
+        {"ninfer-serve", "model.ninfer", "--continuation-cache", "l1"});
+    failures += check(memory_only.continuation_cache.tiers == ninfer::ContinuationCacheTiers::L1 &&
+                          memory_only.continuation_cache.directory.empty(),
+                      "memory-only continuation cache unexpectedly requires a directory");
+
+    const ServeOptions memory_tiers =
+        parse({"ninfer-serve", "model.ninfer", "--continuation-cache", "l1-l2"});
+    failures += check(memory_tiers.continuation_cache.tiers ==
+                          ninfer::ContinuationCacheTiers::L1L2 &&
+                          memory_tiers.continuation_cache.directory.empty(),
+                      "L2 continuation cache unexpectedly requires a directory");
+
+    bool l3_without_directory_rejected = false;
+    try {
+        (void)parse(
+            {"ninfer-serve", "model.ninfer", "--continuation-cache", "l1-l2-l3"});
+    } catch (const std::invalid_argument&) { l3_without_directory_rejected = true; }
+    failures += check(l3_without_directory_rejected,
+                      "L3 continuation cache was accepted without a cache directory");
+
+    const ServeOptions explicitly_off =
+        parse({"ninfer-serve", "model.ninfer", "--continuation-cache", "off",
+               "--continuation-cache-dir", "/var/cache/ninfer"});
+    failures += check(explicitly_off.continuation_cache.tiers ==
+                          ninfer::ContinuationCacheTiers::Off,
+                      "cache directory overrode an explicit continuation-cache mode");
 
     const ServeOptions response_store =
         parse({"ninfer-serve", "model.ninfer", "--response-store-max-records", "42",
@@ -201,7 +268,12 @@ int main() {
                       "serve help omits --kv-capacity");
     failures += check(serve_usage_text("ninfer-serve").find("--response-store-max-mib") !=
                           std::string::npos,
-                      "serve help omits Responses store limits");
+                       "serve help omits Responses store limits");
+    failures += check(serve_usage_text("ninfer-serve").find("--continuation-cache off|l1|l1-l2|") !=
+                           std::string::npos &&
+                           serve_usage_text("ninfer-serve").find("defaults to l1-l2") !=
+                               std::string::npos,
+                      "serve help omits continuation cache safe-default semantics");
     failures +=
         check(serve_usage_text("ninfer-serve").find("identity.model_id") != std::string::npos,
               "serve help omits the artifact-derived model id default");

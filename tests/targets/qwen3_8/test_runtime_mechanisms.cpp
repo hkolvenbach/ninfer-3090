@@ -6,11 +6,15 @@
 #include <ninfer/targets/qwen3_8/vision_control.h>
 
 #include "targets/qwen3_8/impl/runtime/prefix_identity.h"
+#include "targets/qwen3_8/impl/runtime/continuation_image.h"
 
 #include <algorithm>
 #include <cstdint>
 #include <iostream>
+#include <limits>
+#include <stdexcept>
 #include <string_view>
+#include <utility>
 #include <vector>
 
 namespace {
@@ -222,6 +226,7 @@ q36::PreparedPromptData identity_prompt(std::uint8_t digest_byte = 1) {
                          .grid        = {.temporal = 1, .height = 2, .width = 4},
                          .patch_begin = 0,
                          .patch_count = 8,
+                         .timestamps  = {0.25, 0.5},
                          .token_spans = {{.begin = 1, .count = 2}}};
     item.content_digest.fill(digest_byte);
     prompt.vision_items.push_back(std::move(item));
@@ -282,6 +287,276 @@ void test_prefix_identity() {
            "truncated multimodal continuation identity");
 }
 
+void test_continuation_reuse_depth() {
+    q36::PreparedPromptData saved;
+    saved.token_ids   = {10, 11, 12, 13};
+    saved.token_types = {0, 0, 0, 0};
+    saved.positions   = {0, 1, 2, 3, 0, 1, 2, 3, 0, 1, 2, 3};
+    q36::detail::ResidentPrefixIdentity resident;
+    resident.assign(saved);
+    std::vector<ninfer::TokenId> ledger = saved.token_ids;
+    resident.append_generated(1, 0);
+    ledger.push_back(14);
+
+    q36::PreparedPromptData incoming = saved;
+    incoming.token_ids[2]            = 99;
+    append_text_token(incoming, 100, 4);
+    expect(q36::detail::continuation_reuse_depth(incoming, ledger, resident, 5, 2) == 2,
+           "a divergent completion reuses its exact saved turn checkpoint");
+
+    incoming.identity.turn_rewrite_boundary = 2;
+    expect(q36::detail::continuation_reuse_depth(incoming, ledger, resident, 5, 2) == 2,
+           "the planner can keep the matching saved turn checkpoint");
+    incoming.identity.turn_rewrite_boundary = 1;
+    expect(q36::detail::continuation_reuse_depth(incoming, ledger, resident, 5, 2) == 0,
+           "preflight rejects a checkpoint the planner would replace before reuse");
+    incoming.identity.turn_rewrite_boundary = 3;
+    expect(q36::detail::continuation_reuse_depth(incoming, ledger, resident, 5, 2) == 2,
+           "a later checkpoint can be captured while prefilling the divergent suffix");
+
+    q36::PreparedPromptData exact = saved;
+    append_text_token(exact, 14, 4);
+    exact.identity.turn_rewrite_boundary = 1;
+    expect(q36::detail::continuation_reuse_depth(exact, ledger, resident, 5, 2) == 0,
+           "an exact frontier is rejected when planner checkpoint policy forces full reset");
+
+    incoming.token_ids.resize(2);
+    incoming.token_types.resize(2);
+    incoming.positions = {0, 1, 0, 1, 0, 1};
+    incoming.identity.turn_rewrite_boundary.reset();
+    expect(q36::detail::continuation_reuse_depth(incoming, ledger, resident, 5, 2) == 0,
+           "checkpoint fallback requires a nonempty suffix");
+}
+
+void test_prefix_identity_snapshot() {
+    const q36::PreparedPromptData original = identity_prompt();
+    q36::detail::ResidentPrefixIdentity resident;
+    resident.assign(original);
+
+    q36::detail::ResidentPrefixIdentity restored;
+    restored.restore(resident.export_prefix(3));
+    std::vector<ninfer::TokenId> ledger(original.token_ids.begin(), original.token_ids.begin() + 3);
+    expect(restored.size() == 3 && q36::detail::prefix_matches(original, ledger, restored, 3),
+           "owning snapshot restores an exact multimodal prefix");
+
+    q36::PreparedPromptData changed = original;
+    changed.token_types[1]          = 0;
+    expect(!q36::detail::prefix_matches(changed, ledger, restored, 3),
+           "snapshot retains token types");
+    for (std::size_t axis = 0; axis < 3; ++axis) {
+        changed = original;
+        changed.positions[axis * original.token_ids.size() + 1] += 1;
+        expect(!q36::detail::prefix_matches(changed, ledger, restored, 3),
+               "snapshot retains every MRoPE axis");
+    }
+
+    const auto media_change_rejected = [&](auto change, std::string_view message) {
+        q36::PreparedPromptData candidate = original;
+        change(candidate.vision_items[0]);
+        expect(!q36::detail::prefix_matches(candidate, ledger, restored, 3), message);
+    };
+    media_change_rejected([](q36::VisionItem& item) { item.modality = q36::PromptModality::Video; },
+                          "snapshot retains media modality");
+    media_change_rejected([](q36::VisionItem& item) { ++item.grid.temporal; },
+                          "snapshot retains media grid");
+    media_change_rejected([](q36::VisionItem& item) { ++item.patch_begin; },
+                          "snapshot retains media patch offset");
+    media_change_rejected([](q36::VisionItem& item) { ++item.patch_count; },
+                          "snapshot retains media patch count");
+    media_change_rejected([](q36::VisionItem& item) { ++item.content_digest[0]; },
+                          "snapshot retains media digest");
+    media_change_rejected([](q36::VisionItem& item) { item.timestamps[0] += 0.25; },
+                          "snapshot retains media timestamps");
+    media_change_rejected([](q36::VisionItem& item) { ++item.token_spans[0].count; },
+                          "snapshot retains media token spans");
+
+    restored.restore(resident.export_prefix(2));
+    ledger.resize(2);
+    expect(restored.size() == 2 &&
+               !q36::detail::prefix_matches(original, ledger, restored, ledger.size()),
+           "snapshot preserves split-media frontier rejection");
+
+    q36::detail::ResidentPrefixIdentitySnapshot malformed = resident.export_prefix(1);
+    malformed.positions[2].clear();
+    bool rejected = false;
+    try {
+        restored.restore(std::move(malformed));
+    } catch (const std::invalid_argument&) { rejected = true; }
+    expect(rejected && restored.size() == 2, "snapshot restore validates shape atomically");
+}
+
+void test_continuation_image_codec() {
+    namespace image = q36::detail::continuation;
+    const q36::PreparedPromptData prompt = identity_prompt();
+    q36::detail::ResidentPrefixIdentity resident;
+    resident.assign(prompt);
+    const auto encoded = image::encode_prefix(prompt.token_ids,
+                                               resident.export_prefix(prompt.token_ids.size()));
+    image::PrefixData decoded = image::decode_prefix(encoded);
+    q36::detail::ResidentPrefixIdentity restored;
+    restored.restore(std::move(decoded.identity));
+    expect(decoded.ledger == prompt.token_ids &&
+               q36::detail::prefix_matches(prompt, decoded.ledger, restored,
+                                            prompt.token_ids.size()),
+           "continuation prefix codec preserves exact authorization identity");
+
+    const image::FrontierMetadata metadata{.execution_frontier = 3,
+                                            .ledger_frontier = 4,
+                                            .rope_delta = -7,
+                                            .text_kv_valid = 3,
+                                            .backend_kv_valid = 3,
+                                            .mtp_drafts = {8, 9}};
+    const image::FrontierMetadata metadata_roundtrip =
+        image::decode_frontier(image::encode_frontier(metadata));
+    expect(metadata_roundtrip.execution_frontier == 3 &&
+               metadata_roundtrip.ledger_frontier == 4 &&
+               metadata_roundtrip.rope_delta == -7 &&
+               metadata_roundtrip.mtp_drafts == std::vector<ninfer::TokenId>({8, 9}),
+            "continuation frontier metadata uses stable little-endian encoding");
+
+    const image::FrontierMetadata prefix_only{.execution_frontier = 3,
+                                               .ledger_frontier = 3,
+                                               .rope_delta = -7,
+                                               .text_kv_valid = 3,
+                                               .backend_kv_valid = 3};
+    const auto prefix_only_roundtrip =
+        image::decode_frontier(image::encode_frontier(prefix_only));
+    expect(prefix_only_roundtrip.execution_frontier ==
+                   prefix_only_roundtrip.ledger_frontier &&
+               prefix_only_roundtrip.mtp_drafts.empty(),
+           "prefix-only frontier encodes without a fabricated bonus token");
+    expect(image::valid_ledger_frontier(3, 3) && image::valid_ledger_frontier(3, 4) &&
+               !image::valid_ledger_frontier(3, 5),
+           "preflight accepts prefix-only and completed ledgers but rejects other shapes");
+
+    const auto rejects = [](const auto& operation) {
+        try {
+            operation();
+        } catch (const std::invalid_argument&) { return true; }
+        return false;
+    };
+    auto truncated = encoded;
+    truncated.pop_back();
+    expect(rejects([&] { (void)image::decode_prefix(truncated); }),
+           "continuation codec rejects truncation");
+    auto trailing = image::encode_boundary({.valid = true, .frontier = 2});
+    trailing.push_back(0);
+    expect(rejects([&] { (void)image::decode_boundary(trailing); }),
+           "continuation codec rejects trailing bytes");
+    expect(rejects([&] {
+               (void)image::decode_boundary(
+                   image::encode_boundary({.valid = false, .frontier = 2}));
+           }),
+           "continuation codec rejects invalid boundary invariants");
+
+    image::Writer oversized;
+    image::write_header(oversized, "tensor");
+    oversized.u64(std::numeric_limits<std::uint64_t>::max());
+    const auto malformed_size = std::move(oversized).finish();
+    expect(rejects([&] { (void)image::decode_tensor(malformed_size, 0); }),
+            "continuation codec rejects oversized lengths before allocation");
+
+    image::Writer oversized_prefix;
+    image::write_header(oversized_prefix, "qwen-prefix");
+    oversized_prefix.u64(std::numeric_limits<std::uint64_t>::max());
+    const auto malformed_prefix_count = std::move(oversized_prefix).finish();
+    expect(rejects([&] { (void)image::decode_prefix(malformed_prefix_count, 1024); }),
+           "continuation codec rejects huge prefix counts before allocation");
+
+    image::Writer too_many_drafts;
+    image::write_header(too_many_drafts, "qwen-frontier");
+    too_many_drafts.u32(1);
+    too_many_drafts.u32(2);
+    too_many_drafts.i32(0);
+    too_many_drafts.u32(1);
+    too_many_drafts.u32(1);
+    too_many_drafts.u64(q36::kMtpDecodeMaximumDrafts + 1U);
+    for (std::uint32_t i = 0; i <= q36::kMtpDecodeMaximumDrafts; ++i) {
+        too_many_drafts.i32(static_cast<std::int32_t>(i));
+    }
+    const auto malformed_drafts = std::move(too_many_drafts).finish();
+    expect(rejects([&] { (void)image::decode_frontier(malformed_drafts); }),
+           "continuation codec rejects MTP draft inventories above runtime geometry");
+
+    expect(rejects([&] { (void)image::decode_prefix(encoded, prompt.token_ids.size() - 1); }),
+           "continuation codec rejects prefixes above runtime capacity before allocation");
+}
+
+void test_continuation_prefix_filter_digest() {
+    namespace image = q36::detail::continuation;
+    const q36::PreparedPromptData prompt = identity_prompt();
+    q36::detail::ResidentPrefixIdentity resident;
+    resident.assign(prompt);
+    const auto snapshot = resident.export_prefix(prompt.token_ids.size());
+    const auto expected = image::prefix_filter_digest(prompt, prompt.token_ids.size());
+    expect(expected == image::prefix_filter_digest(prompt.token_ids, snapshot,
+                                                    prompt.token_ids.size()),
+           "prompt and resident paths produce the same canonical prefix filter digest");
+
+    q36::PreparedPromptData changed = prompt;
+    changed.token_ids.back() += 1;
+    expect(image::prefix_filter_digest(changed, changed.token_ids.size()) != expected,
+           "prefix filter digest binds token IDs");
+    changed = prompt;
+    changed.positions.back() += 1;
+    expect(image::prefix_filter_digest(changed, changed.token_ids.size()) != expected,
+           "prefix filter digest binds every position axis");
+    changed = identity_prompt(2);
+    expect(image::prefix_filter_digest(changed, changed.token_ids.size()) != expected,
+           "prefix filter digest binds media content identity");
+
+    bool split_rejected = false;
+    try {
+        (void)image::prefix_filter_digest(prompt, 2);
+    } catch (const std::logic_error&) { split_rejected = true; }
+    expect(split_rejected, "prefix filter digest rejects a frontier that divides a media item");
+}
+
+void test_stable_alias_identity() {
+    namespace image = q36::detail::continuation;
+    q36::PreparedPromptData first = identity_prompt();
+    first.identity.stable_prefix_boundary = 3;
+    q36::PreparedPromptData leaf = first;
+    leaf.token_ids[3] += 7;
+    for (std::size_t axis = 0; axis < 3; ++axis) {
+        leaf.positions[axis * leaf.token_ids.size() + 3] += 9;
+    }
+    const ninfer::cache::Bytes domain{1, 2, 3, 4};
+    const auto key = image::stable_alias(domain, first);
+    expect(key && key == image::stable_alias(domain, leaf),
+           "stable alias ignores user leaf content after the boundary");
+
+    const auto differs = [&](auto mutate, std::string_view message) {
+        q36::PreparedPromptData changed = first;
+        mutate(changed);
+        expect(image::stable_alias(domain, changed) != key, message);
+    };
+    differs([](auto& prompt) { ++prompt.token_ids[0]; }, "stable alias binds prefix token IDs");
+    differs([](auto& prompt) { ++prompt.token_types[1]; }, "stable alias binds token types");
+    for (std::size_t axis = 0; axis < 3; ++axis) {
+        differs([axis](auto& prompt) { ++prompt.positions[axis * prompt.token_ids.size() + 1]; },
+                "stable alias binds every position axis");
+    }
+    differs([](auto& prompt) { ++prompt.vision_items[0].content_digest[0]; },
+            "stable alias binds media identity through the boundary");
+    differs([](auto& prompt) { prompt.identity.stable_prefix_boundary = 4; },
+            "stable alias binds the boundary");
+    expect(image::stable_alias(ninfer::cache::Bytes{1, 2, 3, 5}, first) != key,
+           "stable alias binds the Program compatibility domain");
+}
+
+void test_multiple_checkpoint_planning() {
+    namespace image = q36::detail::continuation;
+    expect(image::next_prefill_checkpoint(0, 3, 7) == 3,
+           "prefill plans the stable checkpoint before a later turn checkpoint");
+    expect(image::next_prefill_checkpoint(3, std::nullopt, 7) == 7,
+           "prefill plans the later turn checkpoint after stable export");
+    expect(!image::next_prefill_checkpoint(7, std::nullopt, 7),
+           "prefill does not recapture a completed checkpoint");
+    expect(image::next_prefill_checkpoint(0, 3, 3) == 3,
+           "coincident stable and turn boundaries use one device snapshot");
+}
+
 } // namespace
 
 int main() {
@@ -291,10 +566,16 @@ int main() {
     test_mtp_alignment();
     test_vision_control();
     test_prefix_identity();
+    test_continuation_reuse_depth();
+    test_prefix_identity_snapshot();
+    test_continuation_image_codec();
+    test_continuation_prefix_filter_digest();
+    test_stable_alias_identity();
+    test_multiple_checkpoint_planning();
     if (failures != 0) {
-        std::cerr << failures << " Qwen3.6 runtime mechanism checks failed\n";
+        std::cerr << failures << " Qwen3.8 runtime mechanism checks failed\n";
         return 1;
     }
-    std::cout << "Qwen3.6 runtime mechanism checks passed\n";
+    std::cout << "Qwen3.8 runtime mechanism checks passed\n";
     return 0;
 }

@@ -1,8 +1,10 @@
 #include "core/paged_kv_cache.h"
 
 #include "core/device.h"
+#include "core/pinned_transfer.h"
 
 #include <algorithm>
+#include <cstring>
 #include <limits>
 #include <new>
 #include <stdexcept>
@@ -11,6 +13,8 @@
 
 namespace ninfer {
 namespace {
+
+constexpr std::size_t kConvenienceTransferBytes = 2U * 1024U * 1024U;
 
 std::int32_t checked_i32(std::uint32_t value, const char* label) {
     if (value == 0 ||
@@ -34,6 +38,41 @@ void validate_distinct_pools(std::span<const PagedKVReservation> reservations) {
             if (reservations[i].pool == reservations[j].pool) {
                 throw std::invalid_argument("Paged KV bundle contains the same pool twice");
             }
+        }
+    }
+}
+
+std::int32_t plane_head_count(const Tensor& plane, PagedKVPlaneOrder order) noexcept {
+    return order == PagedKVPlaneOrder::PageMajor ? plane.ne[2] : plane.ne[3];
+}
+
+std::size_t plane_page_bytes(const Tensor& plane, PagedKVPlaneOrder order) noexcept {
+    return order == PagedKVPlaneOrder::PageMajor
+               ? static_cast<std::size_t>(plane.nb[3])
+               : static_cast<std::size_t>(plane.nb[2]) *
+                     static_cast<std::size_t>(plane.ne[3]);
+}
+
+std::size_t checked_plane_image_bytes(const Tensor& plane, PagedKVPlaneOrder order,
+                                      std::uint32_t pages) {
+    const std::size_t page_bytes = plane_page_bytes(plane, order);
+    if (pages != 0 && page_bytes > std::numeric_limits<std::size_t>::max() / pages) {
+        throw std::overflow_error("Paged KV logical image size overflows size_t");
+    }
+    return page_bytes * pages;
+}
+
+void validate_image_inventory(const PagedKVPool& pool, const PagedKVLogicalImage& image) {
+    if (image.planes.size() != pool.plane_count() ||
+        image.payloads.size() != pool.plane_count()) {
+        throw std::invalid_argument("Paged KV logical image plane inventory differs from pool");
+    }
+    for (std::size_t index = 0; index < image.planes.size(); ++index) {
+        const PagedKVPlaneSpec& spec = image.planes[index];
+        const Tensor& plane          = pool.plane(index);
+        if (spec.dtype != plane.dtype || spec.leading_extent != plane.ne[0] ||
+            spec.head_extent != plane_head_count(plane, image.plane_order)) {
+            throw std::invalid_argument("Paged KV logical image plane geometry differs from pool");
         }
     }
 }
@@ -125,6 +164,12 @@ std::uint32_t PagedKVPool::logical_page_capacity() const noexcept {
 std::int32_t PagedKVPool::table_row_count() const noexcept { return spec_.table_rows; }
 
 std::size_t PagedKVPool::plane_count() const noexcept { return planes_.size(); }
+
+PagedKVPlaneOrder PagedKVPool::plane_order() const noexcept { return spec_.plane_order; }
+
+const PagedKVPlaneSpec& PagedKVPool::plane_spec(std::size_t index) const {
+    return spec_.planes.at(index);
+}
 
 const Tensor& PagedKVPool::plane(std::size_t index) const { return planes_.at(index); }
 
@@ -418,6 +463,152 @@ void PagedKVAllocation::release() noexcept {
     page_ids_.clear();
     page_entitlement_ = 0;
     pool_             = nullptr;
+}
+
+PagedKVLogicalImage export_paged_kv_logical(const PagedKVAllocation& allocation,
+                                             std::uint32_t valid_tokens,
+                                             PinnedTransferBuffer& transfer,
+                                             cudaStream_t stream) {
+    if (!allocation.valid() || allocation.pool_ == nullptr) {
+        throw std::invalid_argument("Cannot export an empty Paged KV allocation");
+    }
+    const std::uint32_t pages = pages_for_tokens(valid_tokens);
+    if (pages > allocation.mapped_page_count()) {
+        throw std::invalid_argument("Paged KV export extent exceeds mapped pages");
+    }
+
+    const PagedKVPool& pool = *allocation.pool_;
+    PagedKVLogicalImage image;
+    image.valid_tokens = valid_tokens;
+    image.plane_order  = pool.spec_.plane_order;
+    image.planes       = pool.spec_.planes;
+    image.payloads.resize(pool.plane_count());
+    std::vector<DeviceToHostTransfer> copies;
+
+    for (std::size_t plane_index = 0; plane_index < pool.plane_count(); ++plane_index) {
+        const Tensor& plane = pool.plane(plane_index);
+        auto& payload       = image.payloads[plane_index];
+        payload.resize(checked_plane_image_bytes(plane, image.plane_order, pages));
+        const auto* source = static_cast<const std::uint8_t*>(plane.data);
+
+        if (image.plane_order == PagedKVPlaneOrder::PageMajor) {
+            for (std::uint32_t logical = 0; logical < pages; ++logical) {
+                const std::int32_t physical = allocation.page_ids_[logical];
+                copies.push_back({&payload, static_cast<std::size_t>(logical) * plane.nb[3],
+                                  source + static_cast<std::int64_t>(physical) * plane.nb[3],
+                                  static_cast<std::size_t>(plane.nb[3])});
+            }
+        } else {
+            const std::size_t logical_head_stride = static_cast<std::size_t>(pages) * plane.nb[2];
+            for (std::int32_t head = 0;
+                 head < plane_head_count(plane, image.plane_order); ++head) {
+                for (std::uint32_t logical = 0; logical < pages; ++logical) {
+                    const std::int32_t physical = allocation.page_ids_[logical];
+                    copies.push_back(
+                        {&payload,
+                         static_cast<std::size_t>(head) * logical_head_stride +
+                             static_cast<std::size_t>(logical) * plane.nb[2],
+                         source + static_cast<std::int64_t>(head) * plane.nb[3] +
+                             static_cast<std::int64_t>(physical) * plane.nb[2],
+                         static_cast<std::size_t>(plane.nb[2])});
+                }
+            }
+        }
+    }
+    transfer.copy_device_to_host(copies, stream);
+
+    if (pages != 0 && valid_tokens % static_cast<std::uint32_t>(kPagedKVPageSize) != 0) {
+        const std::uint32_t valid_tail =
+            valid_tokens % static_cast<std::uint32_t>(kPagedKVPageSize);
+        for (std::size_t plane_index = 0; plane_index < pool.plane_count(); ++plane_index) {
+            const Tensor& plane = pool.plane(plane_index);
+            auto& payload       = image.payloads[plane_index];
+            const std::size_t zero_bytes =
+                static_cast<std::size_t>(kPagedKVPageSize - valid_tail) * plane.nb[1];
+            for (std::int32_t head = 0;
+                 head < plane_head_count(plane, image.plane_order); ++head) {
+                const std::size_t page_base =
+                    image.plane_order == PagedKVPlaneOrder::PageMajor
+                        ? static_cast<std::size_t>(pages - 1) * plane.nb[3] +
+                              static_cast<std::size_t>(head) * plane.nb[2]
+                        : static_cast<std::size_t>(head) * pages * plane.nb[2] +
+                              static_cast<std::size_t>(pages - 1) * plane.nb[2];
+                std::memset(payload.data() + page_base + static_cast<std::size_t>(valid_tail) *
+                                                        plane.nb[1],
+                            0, zero_bytes);
+            }
+        }
+    }
+    return image;
+}
+
+PagedKVLogicalImage export_paged_kv_logical(const PagedKVAllocation& allocation,
+                                             std::uint32_t valid_tokens,
+                                             cudaStream_t stream) {
+    PinnedTransferBuffer transfer(kConvenienceTransferBytes);
+    return export_paged_kv_logical(allocation, valid_tokens, transfer, stream);
+}
+
+void import_paged_kv_logical(PagedKVAllocation& allocation,
+                              const PagedKVLogicalImage& image, PinnedTransferBuffer& transfer,
+                              cudaStream_t stream) {
+    if (!allocation.valid() || allocation.pool_ == nullptr) {
+        throw std::invalid_argument("Cannot import into an empty Paged KV allocation");
+    }
+    PagedKVPool& pool = *allocation.pool_;
+    if (image.plane_order != pool.spec_.plane_order) {
+        throw std::invalid_argument("Paged KV logical image plane order differs from pool");
+    }
+    validate_image_inventory(pool, image);
+    const std::uint32_t pages = pages_for_tokens(image.valid_tokens);
+    if (pages > allocation.page_entitlement()) {
+        throw std::invalid_argument("Paged KV logical image exceeds allocation entitlement");
+    }
+    for (std::size_t index = 0; index < pool.plane_count(); ++index) {
+        if (image.payloads[index].size() !=
+            checked_plane_image_bytes(pool.plane(index), image.plane_order, pages)) {
+            throw std::invalid_argument("Paged KV logical image payload size is invalid");
+        }
+    }
+
+    allocation.materialize_pages(pages, stream);
+    std::vector<HostToDeviceTransfer> copies;
+    for (std::size_t plane_index = 0; plane_index < pool.plane_count(); ++plane_index) {
+        const Tensor& plane = pool.plane(plane_index);
+        const auto& payload = image.payloads[plane_index];
+        auto* destination   = static_cast<std::uint8_t*>(plane.data);
+
+        if (image.plane_order == PagedKVPlaneOrder::PageMajor) {
+            for (std::uint32_t logical = 0; logical < pages; ++logical) {
+                const std::int32_t physical = allocation.page_ids_[logical];
+                copies.push_back({destination + static_cast<std::int64_t>(physical) * plane.nb[3],
+                                  &payload, static_cast<std::size_t>(logical) * plane.nb[3],
+                                  static_cast<std::size_t>(plane.nb[3])});
+            }
+        } else {
+            const std::size_t logical_head_stride = static_cast<std::size_t>(pages) * plane.nb[2];
+            for (std::int32_t head = 0;
+                 head < plane_head_count(plane, image.plane_order); ++head) {
+                for (std::uint32_t logical = 0; logical < pages; ++logical) {
+                    const std::int32_t physical = allocation.page_ids_[logical];
+                    copies.push_back(
+                        {destination + static_cast<std::int64_t>(head) * plane.nb[3] +
+                             static_cast<std::int64_t>(physical) * plane.nb[2],
+                         &payload,
+                         static_cast<std::size_t>(head) * logical_head_stride +
+                             static_cast<std::size_t>(logical) * plane.nb[2],
+                         static_cast<std::size_t>(plane.nb[2])});
+                }
+            }
+        }
+    }
+    transfer.copy_host_to_device(copies, stream);
+}
+
+void import_paged_kv_logical(PagedKVAllocation& allocation,
+                              const PagedKVLogicalImage& image, cudaStream_t stream) {
+    PinnedTransferBuffer transfer(kConvenienceTransferBytes);
+    import_paged_kv_logical(allocation, image, transfer, stream);
 }
 
 std::vector<PagedKVAllocation>

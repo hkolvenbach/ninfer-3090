@@ -39,9 +39,24 @@ struct VisionItem {
     std::vector<TokenSpan> token_spans;
 };
 
+enum class PromptCheckpointKind : std::uint8_t {
+    StablePrefix,
+    StableTurn,
+    Rolling,
+};
+
+struct PromptCheckpointHint {
+    PromptCheckpointKind kind = PromptCheckpointKind::StablePrefix;
+    std::uint32_t boundary    = 0;
+};
+
 struct PromptIdentity {
     bool reusable = true;
+    std::optional<std::uint32_t> stable_prefix_boundary;
+    // Kept as the single policy-selected rewrite frontier for existing execution paths.
     std::optional<std::uint32_t> turn_rewrite_boundary;
+    // Ordered semantic candidates let cache layers retain the stable anchors and rolling history.
+    std::vector<PromptCheckpointHint> checkpoint_hints;
 };
 
 struct PrepareStats {

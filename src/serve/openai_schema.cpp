@@ -598,7 +598,11 @@ void reject_unsupported_features(const Json& body) {
         if (!body.at("user").is_string()) { bad_request("user must be a string", "user"); }
         // User identifiers are compatibility metadata; this local server has no attribution layer.
     }
-    for (const char* key : {"prompt_cache_key", "safety_identifier", "verbosity"}) {
+    if (body.contains("prompt_cache_key") && !body.at("prompt_cache_key").is_null() &&
+        !body.at("prompt_cache_key").is_string()) {
+        bad_request("prompt_cache_key must be a string", "prompt_cache_key");
+    }
+    for (const char* key : {"safety_identifier", "verbosity"}) {
         if (body.contains(key) && !body.at(key).is_null()) {
             bad_request(std::string(key) + " is not supported", key, "parameter_not_supported");
         }
@@ -691,6 +695,9 @@ GenerationRequest parse_chat_completion_request(const Json& body, const RequestL
         bad_request("missing required field: model", "model");
     }
     out.model = body.at("model").get<std::string>();
+    if (body.contains("prompt_cache_key") && !body.at("prompt_cache_key").is_null()) {
+        out.prompt_cache_routing_hint = body.at("prompt_cache_key").get<std::string>();
+    }
 
     parse_tools(body, out);
     parse_tool_choice(body, out);

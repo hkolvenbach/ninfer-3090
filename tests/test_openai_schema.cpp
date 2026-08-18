@@ -117,6 +117,26 @@ int test_parse_string_content() {
     return failures;
 }
 
+int test_prompt_cache_key_compatibility() {
+    const Json base = {
+        {"model", "qwen3.8-27b"},
+        {"messages", Json::array({Json{{"role", "user"}, {"content", "hello"}}})},
+    };
+    Json keyed = base;
+    keyed["prompt_cache_key"] = "session_123";
+    const GenerationRequest request = parse_chat_completion_request(keyed, default_limits());
+    int failures = check(request.prompt_cache_routing_hint == "session_123" &&
+                             to_request_options(request, default_server()).execution.routing_hint ==
+                                 "session_123",
+                         "Chat prompt_cache_key did not reach execution routing metadata");
+    Json invalid = base;
+    invalid["prompt_cache_key"] = 42;
+    failures += check(throws_api(
+                          [&] { (void)parse_chat_completion_request(invalid, default_limits()); }),
+                      "non-string Chat prompt_cache_key was accepted");
+    return failures;
+}
+
 int test_preserve_thinking_options() {
     const Json base = {
         {"model", "m"},
@@ -621,7 +641,7 @@ int test_capability_and_unknown_field_rejections() {
         check(!throws_api([&] { (void)parse_chat_completion_request(common, default_limits()); }),
               "common OpenAI client compatibility fields were rejected");
 
-    for (const auto& [key, value] : std::array<std::pair<const char*, Json>, 12>{{
+    for (const auto& [key, value] : std::array<std::pair<const char*, Json>, 11>{{
              {"logprobs", true},
              {"top_logprobs", 1},
              {"parallel_tool_calls", false},
@@ -631,7 +651,6 @@ int test_capability_and_unknown_field_rejections() {
              {"web_search_options", Json::object()},
              {"store", true},
              {"service_tier", "priority"},
-             {"prompt_cache_key", "session"},
              {"safety_identifier", "user-1"},
              {"verbosity", "low"},
          }}) {
@@ -835,6 +854,7 @@ int test_finish_reason_wire() {
 int main() {
     int failures = 0;
     failures += test_parse_string_content();
+    failures += test_prompt_cache_key_compatibility();
     failures += test_preserve_thinking_options();
     failures += test_reasoning_effort();
     failures += test_parse_parts_and_flatten();

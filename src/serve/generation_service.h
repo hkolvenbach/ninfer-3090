@@ -39,6 +39,7 @@ struct GenerationMetrics {
     std::vector<std::uint64_t> speculative_accepted_per_position;
     std::uint32_t prefix_cache_hit_tokens     = 0;
     ninfer::PrefixReusePath prefix_reuse_path = ninfer::PrefixReusePath::FullReset;
+    ninfer::ContinuationDiagnostics continuation;
 };
 
 struct GenerationOutcome {
@@ -73,6 +74,7 @@ struct PreparedRequest {
     bool enable_thinking                   = true;
     bool preserve_thinking                 = false;
     bool preserve_thinking_semantic_change = false;
+    std::optional<std::string> prompt_cache_routing_hint;
     std::shared_ptr<RequestLifetime> lifetime;
 };
 

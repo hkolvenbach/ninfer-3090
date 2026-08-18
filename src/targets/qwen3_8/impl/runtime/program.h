@@ -1,11 +1,13 @@
 #pragma once
 #include "targets/qwen3_8/impl/runtime/instance.h"
-// Qwen3.6 family runtime implementation; instantiated only by exact variants.
+// Qwen3.8 family runtime implementation; instantiated only by exact variants.
 
 #include "core/arena.h"
 #include "core/gdn_replay_records.h"
+#include "core/pinned_transfer.h"
 #include "ninfer/ops/sampling.h"
 #include "core/decode_graph.h"
+#include "runtime/cache/continuation_cache.h"
 #include <ninfer/targets/qwen3_8/prepared_prompt.h>
 
 #include "targets/qwen3_8/impl/runtime/layouts.h"
@@ -21,6 +23,7 @@
 #include <memory>
 #include <optional>
 #include <span>
+#include <string>
 #include <vector>
 
 namespace ninfer::targets::qwen3_8::detail::NINFER_QWEN38_RUNTIME_NS {
@@ -54,6 +57,7 @@ struct RequestBasePlanImpl<NINFER_QWEN38_VARIANT> {
     std::shared_ptr<const qwen3_8::VisionControl> vision_control;
     std::size_t vision_transient_bytes = 0;
     std::optional<std::uint32_t> turn_rewrite_boundary;
+    std::optional<std::uint32_t> stable_prefix_boundary;
     bool allow_prefix_reuse = false;
 };
 
@@ -69,6 +73,7 @@ struct RequestPlanImpl<NINFER_QWEN38_VARIANT> {
     NINFER_QWEN38_RUNTIME_NS::TurnCheckpointAction turn_checkpoint_action =
         NINFER_QWEN38_RUNTIME_NS::TurnCheckpointAction::Drop;
     std::optional<std::uint32_t> turn_checkpoint_capture_frontier;
+    std::optional<std::uint32_t> stable_checkpoint_capture_frontier;
     ops::SamplingConfig sampling;
     std::uint32_t text_kv_page_entitlement    = 0;
     std::uint32_t backend_kv_page_entitlement = 0;
@@ -155,6 +160,7 @@ struct SequenceState {
     bool tail_hidden_valid        = false;
     bool retained                 = false;
     TurnCheckpoint turn_checkpoint;
+    std::optional<cache::ContinuationImage> stable_continuation;
 };
 
 // Request/round control is not retained with a reusable SequenceState. A later concurrent Engine
@@ -172,6 +178,7 @@ struct RequestControl {
         std::unique_ptr<schedule::VisionPrefillSession> vision;
         runtime::TransientRegion transient;
         std::optional<std::uint32_t> turn_checkpoint_capture_frontier;
+        std::optional<std::uint32_t> stable_checkpoint_capture_frontier;
         std::uint32_t base               = 0;
         std::uint32_t cursor             = 0;
         std::uint32_t prompt_tokens      = 0;
@@ -189,7 +196,8 @@ struct RequestControl {
 class ProgramImplCore {
 public:
     ProgramImplCore(const LoadedModelData& model, const SequencePlanImpl& plan,
-                    DeviceContext& device);
+                    DeviceContext& device, std::string_view model_id, std::string_view weights_id,
+                    std::span<const std::uint8_t> artifact_fingerprint);
     ~ProgramImplCore() noexcept;
 
     [[nodiscard]] RequestBasePlan
@@ -218,7 +226,24 @@ public:
                                std::span<const std::uint8_t> cancelled);
     void abort_lane(std::uint32_t lane) noexcept;
     [[nodiscard]] bool has_retained_lane(std::uint32_t lane) const noexcept;
+    [[nodiscard]] std::size_t retained_lane_resident_bytes(std::uint32_t lane) const noexcept;
+    [[nodiscard]] std::size_t retained_lane_reused_bytes(
+        std::uint32_t lane, const RequestPlanImpl& plan) const noexcept;
     void evict_retained_lane(std::uint32_t lane) noexcept;
+    [[nodiscard]] cache::ContinuationImage export_continuation_lane(std::uint32_t lane) const;
+    [[nodiscard]] std::optional<std::string>
+    stable_prefix_alias(const PreparedPromptData& prompt) const;
+    [[nodiscard]] std::optional<cache::ContinuationImage>
+    take_stable_continuation_lane(std::uint32_t lane);
+    [[nodiscard]] std::uint32_t preflight_continuation_metadata(
+        const cache::SessionCandidateDescriptor& candidate,
+        const PreparedPromptData& prompt) const noexcept;
+    [[nodiscard]] std::uint32_t
+    preflight_continuation(const cache::ContinuationImage& image,
+                           const PreparedPromptData& prompt) const noexcept;
+    [[nodiscard]] bool import_continuation_lane(std::uint32_t lane,
+                                                const cache::ContinuationImage& image,
+                                                const PreparedPromptData& prompt) noexcept;
     [[nodiscard]] GenerationTimings generation_timings_lane(std::uint32_t lane) const noexcept;
     [[nodiscard]] SpeculativeStats speculative_stats_lane(std::uint32_t lane) const noexcept;
 
@@ -249,6 +274,7 @@ public:
     const std::size_t graph_allowance_bytes;
     std::size_t graph_observed_bytes = 0;
     const WorkspacePlan workspace_plan;
+    const cache::Bytes continuation_compatibility_key;
 
     DeviceArena persistent;
     DeviceArena workspace_storage;
@@ -271,6 +297,8 @@ public:
     DecodeGraphFamily dflash_graphs;
 
     PinnedHostBuffer round_host;
+    // One bounded startup allocation for all continuation payload movement (8 MiB per ring slot).
+    mutable PinnedTransferBuffer continuation_transfer;
     TokenId* host_tokens = nullptr;
     std::optional<PinnedHostBuffer> ordinary_host;
     qwen3_8::OrdinaryDecodeIngress* ordinary_host_ingress = nullptr;
@@ -285,6 +313,9 @@ public:
     std::size_t workspace_logical_peak_bytes = 0;
 
 private:
+    [[nodiscard]] cache::ContinuationImage
+    export_stable_continuation(const SequenceState& sequence, const PreparedPromptData& prompt,
+                               std::uint32_t frontier) const;
     void clear_lane(SequenceState& sequence, RequestControl& request) noexcept;
     void ordered_reset(SequenceState& sequence);
     void prepare_graphs();

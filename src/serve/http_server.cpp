@@ -92,25 +92,117 @@ std::string sse_error_event(const ApiError& error) {
     return "data: " + make_error_body(error) + "\n\n";
 }
 
-ThroughputReport make_throughput_report(const ninfer::RuntimeStats& previous,
-                                        const ninfer::RuntimeStats& current,
-                                        double interval_seconds) {
+ThroughputReport make_throughput_report_impl(const ninfer::RuntimeStats& previous,
+                                              const ninfer::RuntimeStats& current,
+                                              double interval_seconds) {
+    ninfer::RuntimeStats delta;
+    const auto monotonic_delta = [](std::uint64_t before, std::uint64_t after) {
+        return after >= before ? after - before : after;
+    };
+#define NINFER_DELTA(field) delta.field = monotonic_delta(previous.field, current.field)
+    NINFER_DELTA(continuation_lookup_hits);
+    NINFER_DELTA(continuation_lookup_misses);
+    NINFER_DELTA(continuation_preflight_rejections);
+    NINFER_DELTA(continuation_restore_failures);
+    NINFER_DELTA(continuation_l1_restore_successes);
+    NINFER_DELTA(continuation_l2_restore_successes);
+    NINFER_DELTA(continuation_l3_restore_successes);
+    NINFER_DELTA(continuation_l1_restored_tokens);
+    NINFER_DELTA(continuation_l2_restored_tokens);
+    NINFER_DELTA(continuation_l3_restored_tokens);
+    NINFER_DELTA(continuation_l1_restored_bytes);
+    NINFER_DELTA(continuation_l2_restored_bytes);
+    NINFER_DELTA(continuation_l3_restored_bytes);
+    NINFER_DELTA(continuation_session_restores);
+    NINFER_DELTA(continuation_stable_prefix_restores);
+    NINFER_DELTA(continuation_miss_disabled);
+    NINFER_DELTA(continuation_miss_no_alias);
+    NINFER_DELTA(continuation_miss_entry_unavailable_or_corrupt);
+    NINFER_DELTA(continuation_miss_not_deeper);
+    NINFER_DELTA(continuation_miss_preflight_rejected);
+    NINFER_DELTA(continuation_miss_rollback_conflict);
+    NINFER_DELTA(continuation_miss_no_lane);
+    NINFER_DELTA(continuation_miss_restore_failed);
+    NINFER_DELTA(continuation_l2_lookup_microseconds);
+    NINFER_DELTA(continuation_l2_lookup_operations);
+    NINFER_DELTA(continuation_l3_lookup_microseconds);
+    NINFER_DELTA(continuation_l3_lookup_operations);
+    NINFER_DELTA(continuation_preflight_microseconds);
+    NINFER_DELTA(continuation_preflight_operations);
+    NINFER_DELTA(continuation_l2_restore_microseconds);
+    NINFER_DELTA(continuation_l2_restore_operations);
+    NINFER_DELTA(continuation_l3_restore_microseconds);
+    NINFER_DELTA(continuation_l3_restore_operations);
+    NINFER_DELTA(continuation_l2_admission_microseconds);
+    NINFER_DELTA(continuation_l2_admission_operations);
+    NINFER_DELTA(continuation_l3_persistence_microseconds);
+    NINFER_DELTA(continuation_l3_persistence_operations);
+    NINFER_DELTA(continuation_publication_successes);
+    NINFER_DELTA(continuation_publication_failures);
+    NINFER_DELTA(continuation_publication_superseded);
+    NINFER_DELTA(continuation_persistence_queued);
+    NINFER_DELTA(continuation_persistence_coalesced);
+    NINFER_DELTA(continuation_persistence_successes);
+    NINFER_DELTA(continuation_persistence_failures);
+    NINFER_DELTA(l1_evictions);
+    NINFER_DELTA(l1_demotions);
+#undef NINFER_DELTA
+    delta.continuation_restore_successes = delta.continuation_l1_restore_successes +
+                                             delta.continuation_l2_restore_successes +
+                                             delta.continuation_l3_restore_successes;
+    delta.continuation_restored_tokens = delta.continuation_l1_restored_tokens +
+                                          delta.continuation_l2_restored_tokens +
+                                          delta.continuation_l3_restored_tokens;
+    delta.continuation_restored_bytes = delta.continuation_l1_restored_bytes +
+                                         delta.continuation_l2_restored_bytes +
+                                         delta.continuation_l3_restored_bytes;
     return ThroughputReport{
         .interval_seconds = interval_seconds,
         .computed_prefill_tokens =
-            current.computed_prefill_tokens - previous.computed_prefill_tokens,
+            monotonic_delta(previous.computed_prefill_tokens, current.computed_prefill_tokens),
         .committed_decode_tokens =
-            current.committed_decode_tokens - previous.committed_decode_tokens,
-        .decode_rounds     = current.decode_rounds - previous.decode_rounds,
-        .decode_row_rounds = current.decode_row_rounds - previous.decode_row_rounds,
+            monotonic_delta(previous.committed_decode_tokens, current.committed_decode_tokens),
+        .decode_rounds = monotonic_delta(previous.decode_rounds, current.decode_rounds),
+        .decode_row_rounds = monotonic_delta(previous.decode_row_rounds,
+                                             current.decode_row_rounds),
         .scheduler         = current,
+        .continuation_delta = delta,
     };
 }
 
-bool report_has_activity(const ThroughputReport& report) {
+bool report_has_activity_impl(const ThroughputReport& report) noexcept {
+    const auto& delta = report.continuation_delta;
     return report.computed_prefill_tokens != 0 || report.committed_decode_tokens != 0 ||
-           report.decode_rounds != 0 || report.scheduler.running_requests != 0 ||
-           report.scheduler.waiting_requests != 0;
+            report.decode_rounds != 0 || report.scheduler.running_requests != 0 ||
+            report.scheduler.waiting_requests != 0 ||
+            delta.continuation_l1_restore_successes != 0 ||
+            delta.continuation_l2_restore_successes != 0 ||
+            delta.continuation_l3_restore_successes != 0 ||
+            delta.continuation_lookup_hits != 0 || delta.continuation_lookup_misses != 0 ||
+            delta.continuation_preflight_rejections != 0 ||
+            delta.continuation_restore_failures != 0 ||
+            delta.continuation_miss_disabled != 0 || delta.continuation_miss_no_alias != 0 ||
+            delta.continuation_miss_entry_unavailable_or_corrupt != 0 ||
+            delta.continuation_miss_not_deeper != 0 ||
+            delta.continuation_miss_preflight_rejected != 0 ||
+            delta.continuation_miss_rollback_conflict != 0 ||
+            delta.continuation_miss_no_lane != 0 ||
+            delta.continuation_miss_restore_failed != 0 ||
+            delta.continuation_l2_lookup_operations != 0 ||
+            delta.continuation_l3_lookup_operations != 0 ||
+            delta.continuation_preflight_operations != 0 ||
+            delta.continuation_l2_restore_operations != 0 ||
+            delta.continuation_l3_restore_operations != 0 ||
+            delta.continuation_l2_admission_operations != 0 ||
+            delta.continuation_l3_persistence_operations != 0 ||
+            delta.continuation_publication_successes != 0 ||
+            delta.continuation_publication_failures != 0 ||
+            delta.continuation_publication_superseded != 0 ||
+            delta.continuation_persistence_queued != 0 ||
+            delta.continuation_persistence_coalesced != 0 ||
+            delta.continuation_persistence_successes != 0 ||
+            delta.continuation_persistence_failures != 0 || delta.l1_evictions != 0 ||
+            delta.l1_demotions != 0;
 }
 
 std::string_view unstreamed_content(const GenerationOutcome& outcome) {
@@ -121,6 +213,16 @@ std::string_view unstreamed_content(const GenerationOutcome& outcome) {
 }
 
 } // namespace
+
+ThroughputReport make_throughput_report(const ninfer::RuntimeStats& previous,
+                                        const ninfer::RuntimeStats& current,
+                                        double interval_seconds) {
+    return make_throughput_report_impl(previous, current, interval_seconds);
+}
+
+bool throughput_report_has_activity(const ThroughputReport& report) noexcept {
+    return report_has_activity_impl(report);
+}
 
 HttpServer::HttpServer(ServeOptions options)
     : options_(std::move(options)),
@@ -181,19 +283,18 @@ void HttpServer::run_stats_reporter() {
         const Clock::time_point now        = Clock::now();
         const ThroughputReport report      = make_throughput_report(
             previous, current, std::chrono::duration<double>(now - previous_time).count());
-        if (report_has_activity(report)) { log_throughput(report); }
-        previous      = current;
-        previous_time = now;
+        if (throughput_report_has_activity(report)) {
+            log_throughput(report);
+            previous      = current;
+            previous_time = now;
+        }
     }
 
     const ninfer::RuntimeStats current = service_->runtime_stats();
     const Clock::time_point now        = Clock::now();
     const ThroughputReport tail        = make_throughput_report(
         previous, current, std::chrono::duration<double>(now - previous_time).count());
-    if (tail.computed_prefill_tokens != 0 || tail.committed_decode_tokens != 0 ||
-        tail.decode_rounds != 0) {
-        log_throughput(tail);
-    }
+    if (throughput_report_has_activity(tail)) { log_throughput(tail); }
 }
 
 void HttpServer::stop_stats_reporter() {
@@ -297,7 +398,8 @@ void HttpServer::register_routes() {
         res.set_content(nlohmann::json{{"status", "ok"}}.dump(), "application/json");
     });
     server_.Get("/metrics", [this](const httplib::Request&, httplib::Response& res) {
-        res.set_content(metrics_.render(options_.max_concurrency), "text/plain; version=0.0.4");
+        res.set_content(metrics_.render(options_.max_concurrency, service_->runtime_stats()),
+                        "text/plain; version=0.0.4");
     });
     // llama.cpp-shaped slot detail. The Engine has no exposed slot table, so
     // the first `max_concurrency` in-flight requests (FIFO order) count as

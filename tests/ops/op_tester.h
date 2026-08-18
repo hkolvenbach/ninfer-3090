@@ -63,6 +63,19 @@ inline bool cuda_unavailable() {
     throw std::runtime_error(std::string("cudaGetDeviceCount: ") + cudaGetErrorString(e));
 }
 
+inline bool insufficient_cuda_memory(std::size_t required_bytes,
+                                     std::size_t reserve_bytes = 128ULL << 20) {
+    std::size_t free_bytes  = 0;
+    std::size_t total_bytes = 0;
+    cuda_check(cudaMemGetInfo(&free_bytes, &total_bytes), "cudaMemGetInfo");
+    const bool enough = required_bytes <= std::numeric_limits<std::size_t>::max() - reserve_bytes &&
+                        free_bytes >= required_bytes + reserve_bytes;
+    if (enough) return false;
+    std::cout << "SKIP: test requires " << required_bytes << " bytes plus " << reserve_bytes
+              << " bytes of device headroom, but only " << free_bytes << " bytes are free\n";
+    return true;
+}
+
 // --- bf16 <-> f32 (round-to-nearest-even) -----------------------------------
 inline float bf16_to_f32(std::uint16_t h) {
     std::uint32_t u = std::uint32_t(h) << 16;

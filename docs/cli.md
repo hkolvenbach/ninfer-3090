@@ -176,6 +176,44 @@ generated token IDs in diagnostics.
 
 Run `./build/apps/ninfer --help` for the exact option contract.
 
+## Tiered continuation cache
+
+The native one-shot CLI defaults continuation tiers to `off`. Explicit continuation-cache tuning
+enables retained GPU plus host-RAM tiers (`l1-l2`). Because one CLI invocation runs one request and
+exits, L1/L2 mostly benefit work within that invocation.
+Add a directory to enable L3 and reuse an automatically identified stable system/tool prefix across
+later invocations:
+
+```bash
+./build/apps/ninfer models/qwen3_8_27b.ninfer \
+  --messages request.json --max-context 32768 --max-new 256 \
+  --continuation-cache l1-l2-l3 \
+  --continuation-cache-dir "$HOME/.cache/ninfer/continuations" \
+  --continuation-cache-namespace native \
+  --continuation-cache-l2-mib 16384 \
+  --continuation-cache-l3-mib 49152 \
+  --continuation-cache-filesystem-reserve-mib 8192
+```
+
+Supplying `--continuation-cache-dir` without `--continuation-cache` selects `l1-l2-l3`; another
+explicit `--continuation-cache-*` tuning flag without a directory selects `l1-l2`.
+The defaults are 768/16,384/49,152 MiB for L1/L2/L3; 600 seconds for retained L1; 7,200 seconds
+for an L2-only image; 86,400 seconds for an L3-mode catalog image; persistence after 60 seconds or
+8,192 new tokens; namespace `local`; filesystem reserve `0`; and history depth `4` including the
+current session head. Use a positive disk reserve operationally.
+
+The CLI does not accept `prompt_cache_key`, so it does not publish a mutable named session head.
+Stable leading prefixes are shared by exact content-derived aliases. Every load checks complete
+artifact/runtime compatibility and exact prepared-prefix identity; a stale, corrupt, or nonmatching
+entry safely becomes cold prefill. The cache stores continuation state, not generated results.
+
+The published Qwen3.8 artifact SHA-256 is
+`eec39564993d6e9c7d5e383382a760f093465c9d163ec9a1bd6b80199514bf3e`; complete artifact SHA-256 is
+part of cache compatibility. Cache manifests are currently development-versioned and may be ignored
+by a later build, in which case remove or rotate the namespace. See
+[Tiered continuation cache](continuation-cache.md) for all flags, permissions, sizing, and format
+status.
+
 ## Context and memory
 
 The registered model IDs have a native context limit of 262,144 tokens. The practical

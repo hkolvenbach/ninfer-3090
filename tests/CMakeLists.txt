@@ -64,7 +64,20 @@ ninfer_add_test(ninfer_tensor_test       SOURCES test_tensor.cpp)
 ninfer_add_test(ninfer_arena_test        SOURCES test_arena.cpp)
 ninfer_add_test(ninfer_request_memory_test SOURCES test_request_memory.cpp)
 ninfer_add_test(ninfer_admission_policy_test SOURCES test_admission_policy.cpp)
+ninfer_add_test(ninfer_l1_retention_policy_test SOURCES test_l1_retention_policy.cpp)
+ninfer_add_test(ninfer_stable_prefix_flights_test
+  SOURCES test_stable_prefix_flights.cpp
+  LIBRARIES Threads::Threads)
 ninfer_add_test(ninfer_kv_capacity_test SOURCES test_kv_capacity.cpp)
+ninfer_add_test(ninfer_continuation_cache_test
+  SOURCES test_continuation_cache.cpp
+  LIBRARIES ninfer_continuation_cache Threads::Threads)
+ninfer_add_test(ninfer_continuation_candidate_selection_test
+  SOURCES test_continuation_candidate_selection.cpp
+  LIBRARIES ninfer_continuation_cache)
+ninfer_add_test(ninfer_cli_options_test
+  SOURCES test_cli_options.cpp ${PROJECT_SOURCE_DIR}/apps/cli/options.cpp)
+target_include_directories(ninfer_cli_options_test PRIVATE ${PROJECT_SOURCE_DIR}/apps/cli)
 ninfer_add_test(ninfer_sampling_defaults_test
   SOURCES test_sampling_defaults.cpp
   LIBRARIES ninfer_engine)

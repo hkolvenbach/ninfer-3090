@@ -78,9 +78,23 @@ struct ChatRenderOptions {
     std::vector<std::string> tool_jsons;
 };
 
+enum class SemanticCheckpointKind : std::uint8_t {
+    StablePrefix,
+    StableTurn,
+    Rolling,
+};
+
+struct SemanticCheckpointByteHint {
+    SemanticCheckpointKind kind = SemanticCheckpointKind::StablePrefix;
+    std::size_t byte_offset     = 0;
+};
+
 struct RenderedChat {
     std::string text;
+    std::optional<std::size_t> stable_prefix_byte_offset;
     std::optional<std::size_t> turn_rewrite_byte_offset;
+    // These offsets mark model-state-safe semantic frontiers, not arbitrary message ends.
+    std::vector<SemanticCheckpointByteHint> checkpoint_hints;
 };
 
 enum class ChatTemplateSemantics : std::uint8_t {

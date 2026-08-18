@@ -1,6 +1,8 @@
 #include "ops/linear/linear_test_common.h"
+#include "ops/op_tester.h"
 
 #include <array>
+#include <cstddef>
 #include <exception>
 #include <iostream>
 
@@ -12,6 +14,19 @@ using namespace ninfer::test::linear;
 constexpr Invocation a16(std::int32_t t) { return {t}; }
 
 constexpr Invocation convenience(std::int32_t t) { return {t, CallForm::A16Convenience}; }
+
+constexpr std::size_t q4_peak_device_bytes() {
+    constexpr std::size_t n              = 4304;
+    constexpr std::size_t k              = 1152;
+    constexpr std::size_t t              = 131072;
+    constexpr std::size_t groups_per_row = k / 64;
+    constexpr std::size_t weight         = n * groups_per_row * (32 + 2);
+    constexpr std::size_t activation     = k * t * sizeof(std::uint16_t);
+    constexpr std::size_t output         = n * t * sizeof(std::uint16_t);
+    constexpr std::size_t output_guards  = 2 * 256;
+    constexpr std::size_t workspace      = 256;
+    return weight + activation + output + output_guards + workspace;
+}
 
 int q4_a16_conformance() {
     int failures = 0;
@@ -88,6 +103,7 @@ int main() {
         std::cout << "SKIP: no usable CUDA device\n";
         return 77;
     }
+    if (ninfer::test::insufficient_cuda_memory(q4_peak_device_bytes())) { return 77; }
 
     try {
         const int failures = q4_a16_conformance();

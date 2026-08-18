@@ -32,7 +32,7 @@ RUN --mount=type=cache,id=ninfer-sm89-cuda13.2-release,target=/build,sharing=loc
         -DNINFER_BUILD_BENCHMARKS=OFF \
         -DNINFER_BUILD_QWEN3_8_27B=ON \
         -DNINFER_BUILD_QWEN3_6_35B_A3B=OFF \
-    && cmake --build /build --parallel --target ninfer ninfer-serve \
+    && cmake --build /build --parallel 16 --target ninfer ninfer-serve \
     && install -D /build/apps/ninfer /opt/ninfer/bin/ninfer \
     && install -D /build/apps/ninfer-serve /opt/ninfer/bin/ninfer-serve
 
@@ -72,5 +72,6 @@ COPY --from=build /opt/ninfer/bin/ninfer-serve /usr/local/bin/ninfer-serve
 WORKDIR /workspace
 EXPOSE 8080
 STOPSIGNAL SIGTERM
+VOLUME ["/var/cache/ninfer"]
 
-CMD ["ninfer-serve", "/opt/ninfer/models/qwen3_8_27b.ninfer", "--model-id", "qwen3.8-27b", "--host", "0.0.0.0", "--port", "8080", "--max-context", "262144", "--kv-capacity", "262144", "--max-concurrency", "1", "--max-pending-requests", "16", "--prefill-chunk", "1024", "--kv-dtype", "rk4v4-e8", "--spec", "mtp", "--draft-tokens", "3", "--lm-head-draft", "--prefix-checkpoint-policy", "rolling-tool", "--preserve-thinking"]
+CMD ["ninfer-serve", "/opt/ninfer/models/qwen3_8_27b.ninfer", "--model-id", "qwen3.8-27b", "--host", "0.0.0.0", "--port", "8080", "--max-context", "262144", "--kv-capacity", "262144", "--max-concurrency", "1", "--max-pending-requests", "16", "--prefill-chunk", "1024", "--kv-dtype", "rk4v4-e8", "--spec", "mtp", "--draft-tokens", "3", "--lm-head-draft", "--prefix-checkpoint-policy", "rolling-tool", "--continuation-cache", "l1-l2-l3", "--continuation-cache-dir", "/var/cache/ninfer", "--continuation-cache-namespace", "local", "--continuation-cache-l1-mib", "768", "--continuation-cache-l2-mib", "16384", "--continuation-cache-l3-mib", "49152", "--continuation-cache-filesystem-reserve-mib", "4096", "--preserve-thinking"]

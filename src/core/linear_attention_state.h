@@ -10,6 +10,8 @@
 
 namespace ninfer {
 
+class PinnedTransferBuffer;
+
 struct LinearAttentionStatePoolSpec {
     std::uint32_t layers        = 0;
     std::int32_t conv_channels  = 0;
@@ -33,6 +35,20 @@ struct LinearAttentionStateAllLayersView {
     std::int64_t conv_layer_stride_bytes      = 0;
     std::int64_t recurrent_layer_stride_bytes = 0;
     LinearAttentionStatePoolSpec spec;
+};
+
+// Canonical single-slot image. slot_count is intentionally absent because lane numbering and pool
+// capacity are allocation details, not continuation compatibility.
+struct LinearAttentionStateImage {
+    std::uint32_t layers        = 0;
+    std::int32_t conv_channels  = 0;
+    std::int32_t conv_width     = 0;
+    std::int32_t value_heads    = 0;
+    std::int32_t value_head_dim = 0;
+    std::int32_t key_head_dim   = 0;
+    DType conv_dtype            = DType::BF16;
+    std::vector<std::vector<std::uint8_t>> conv;
+    std::vector<std::vector<std::uint8_t>> recurrent;
 };
 
 [[nodiscard]] LinearAttentionStatePoolLayout
@@ -64,5 +80,18 @@ struct LinearAttentionStatePool {
     void copy_slot(std::int32_t src, std::int32_t dst, cudaStream_t stream = nullptr);
     void zero_slot(std::int32_t slot, cudaStream_t stream = nullptr);
 };
+
+[[nodiscard]] LinearAttentionStateImage
+export_linear_attention_state(const LinearAttentionStatePool& pool, std::int32_t slot,
+                               cudaStream_t stream = nullptr);
+[[nodiscard]] LinearAttentionStateImage
+export_linear_attention_state(const LinearAttentionStatePool& pool, std::int32_t slot,
+                              PinnedTransferBuffer& transfer, cudaStream_t stream = nullptr);
+void import_linear_attention_state(LinearAttentionStatePool& pool, std::int32_t slot,
+                                    const LinearAttentionStateImage& image,
+                                    cudaStream_t stream = nullptr);
+void import_linear_attention_state(LinearAttentionStatePool& pool, std::int32_t slot,
+                                   const LinearAttentionStateImage& image,
+                                   PinnedTransferBuffer& transfer, cudaStream_t stream = nullptr);
 
 } // namespace ninfer

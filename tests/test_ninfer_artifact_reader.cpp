@@ -1,16 +1,25 @@
 #include "artifact/reader.h"
+#include "artifact/sha256.h"
 #include "artifact_fixture.h"
 
 #include <nlohmann/json.hpp>
 
 #include <array>
+#include <chrono>
 #include <cstdint>
+#include <filesystem>
+#include <fstream>
 #include <iostream>
 #include <span>
 #include <stdexcept>
 #include <string>
 #include <string_view>
 #include <vector>
+
+#ifndef _WIN32
+#include <sys/stat.h>
+#include <unistd.h>
+#endif
 
 namespace {
 
@@ -183,6 +192,174 @@ void test_common_validation() {
     }
 }
 
+void test_content_fingerprint() {
+    ninfer::artifact::Sha256 known_hash;
+    const std::array<std::byte, 3> abc = {std::byte{'a'}, std::byte{'b'}, std::byte{'c'}};
+    known_hash.update(std::span<const std::byte>(abc.data(), 1));
+    known_hash.update(std::span<const std::byte>(abc.data() + 1, 2));
+    const auto known_digest = known_hash.finish();
+    constexpr std::array<std::uint8_t, 32> kAbcSha256 = {
+        0xba, 0x78, 0x16, 0xbf, 0x8f, 0x01, 0xcf, 0xea, 0x41, 0x41, 0x40,
+        0xde, 0x5d, 0xae, 0x22, 0x23, 0xb0, 0x03, 0x61, 0xa3, 0x96, 0x17,
+        0x7a, 0x9c, 0xb4, 0x10, 0xff, 0x61, 0xf2, 0x00, 0x15, 0xad,
+    };
+    if (known_digest != kAbcSha256) {
+        throw std::runtime_error("streaming artifact SHA-256 failed the known-answer test");
+    }
+
+    auto original = write_fixture(normative_directory(), "fingerprint_original");
+    auto changed  = write_fixture(normative_directory(), "fingerprint_changed");
+    {
+        std::fstream file(changed.path, std::ios::binary | std::ios::in | std::ios::out);
+        file.seekg(-1, std::ios::end);
+        char byte = 0;
+        file.read(&byte, 1);
+        byte ^= 0x5a;
+        file.seekp(-1, std::ios::end);
+        file.write(&byte, 1);
+        if (!file) { throw std::runtime_error("failed to mutate fingerprint fixture"); }
+    }
+
+    const Reader first(original.path);
+    const Reader reopened(original.path);
+    const Reader different(changed.path);
+    if (first.identity() != different.identity()) {
+        throw std::runtime_error("fingerprint fixtures do not have identical labels");
+    }
+    if (first.content_fingerprint() != reopened.content_fingerprint()) {
+        throw std::runtime_error("artifact content fingerprint is unstable for the same file");
+    }
+    if (first.content_fingerprint() == different.content_fingerprint()) {
+        throw std::runtime_error("artifact content fingerprint ignored a payload change");
+    }
+}
+
+#ifndef _WIN32
+struct FingerprintEvent {
+    ninfer::artifact::FingerprintProgressPhase phase;
+    std::uint64_t done;
+    std::uint64_t total;
+};
+
+std::vector<FingerprintEvent> open_with_fingerprint_cache(
+    const std::filesystem::path& artifact, const std::filesystem::path& cache_root,
+    ninfer::artifact::Sha256Digest* digest = nullptr) {
+    std::vector<FingerprintEvent> events;
+    Reader reader(artifact,
+                  {.directory = cache_root, .cache_namespace = "reader-test"},
+                  [&](auto phase, std::uint64_t done, std::uint64_t total) {
+                      events.push_back({phase, done, total});
+                  });
+    if (digest != nullptr) { *digest = reader.content_fingerprint(); }
+    return events;
+}
+
+bool has_phase(const std::vector<FingerprintEvent>& events,
+               ninfer::artifact::FingerprintProgressPhase phase) {
+    return std::any_of(events.begin(), events.end(),
+                       [phase](const auto& event) { return event.phase == phase; });
+}
+
+void require_scan(const std::vector<FingerprintEvent>& events, std::string_view label) {
+    using Phase = ninfer::artifact::FingerprintProgressPhase;
+    if (!has_phase(events, Phase::Scan) || has_phase(events, Phase::CacheHit) || events.empty() ||
+        events.back().done != events.back().total) {
+        throw std::runtime_error(std::string(label) + " did not perform a complete fingerprint scan");
+    }
+}
+
+void test_fingerprint_sidecar_cache() {
+    using Phase = ninfer::artifact::FingerprintProgressPhase;
+    const auto cache_root = std::filesystem::temp_directory_path() /
+                            ("ninfer_fingerprint_cache_" + std::to_string(::getpid()));
+    std::error_code ignored;
+    std::filesystem::remove_all(cache_root, ignored);
+    struct Cleanup {
+        std::filesystem::path path;
+        ~Cleanup() {
+            std::error_code ec;
+            std::filesystem::remove_all(path, ec);
+        }
+    } cleanup{cache_root};
+
+    auto fixture = write_fixture(normative_directory(), "fingerprint_sidecar");
+    ninfer::artifact::Sha256Digest original_digest{};
+    require_scan(open_with_fingerprint_cache(fixture.path, cache_root, &original_digest),
+                 "first cached open");
+
+    const auto artifacts = cache_root / "reader-test" / "artifacts";
+    if (!std::filesystem::is_directory(artifacts)) {
+        throw std::runtime_error("first fingerprint scan did not create the artifacts cache");
+    }
+    std::vector<std::filesystem::path> records;
+    for (const auto& entry : std::filesystem::directory_iterator(artifacts)) {
+        if (entry.is_regular_file()) { records.push_back(entry.path()); }
+    }
+    if (records.size() != 1) {
+        throw std::runtime_error("first fingerprint scan did not create exactly one record");
+    }
+    struct stat directory_status {};
+    struct stat namespace_status {};
+    struct stat record_status {};
+    if (::stat((cache_root / "reader-test").c_str(), &namespace_status) != 0 ||
+        ::stat(artifacts.c_str(), &directory_status) != 0 ||
+        ::stat(records.front().c_str(), &record_status) != 0 ||
+        (namespace_status.st_mode & 0777) != 0700 || (directory_status.st_mode & 0777) != 0700 ||
+        (record_status.st_mode & 0777) != 0600) {
+        throw std::runtime_error("fingerprint cache permissions are not owner-only");
+    }
+
+    ninfer::artifact::Sha256Digest cached_digest{};
+    const auto hit = open_with_fingerprint_cache(fixture.path, cache_root, &cached_digest);
+    if (hit.size() != 1 || hit.front().phase != Phase::CacheHit ||
+        hit.front().done != hit.front().total || cached_digest != original_digest) {
+        throw std::runtime_error("unchanged artifact did not produce an immediate cache hit");
+    }
+
+    {
+        std::fstream file(fixture.path, std::ios::binary | std::ios::in | std::ios::out);
+        file.seekg(-1, std::ios::end);
+        char byte = 0;
+        file.read(&byte, 1);
+        byte ^= 0x33;
+        file.seekp(-1, std::ios::end);
+        file.write(&byte, 1);
+        if (!file) { throw std::runtime_error("failed to mutate cached fixture content"); }
+    }
+    require_scan(open_with_fingerprint_cache(fixture.path, cache_root), "content change");
+
+    {
+        std::ofstream file(fixture.path, std::ios::binary | std::ios::app);
+        file.put('\0');
+        if (!file) { throw std::runtime_error("failed to grow cached fixture"); }
+    }
+    require_scan(open_with_fingerprint_cache(fixture.path, cache_root), "size change");
+
+    const auto old_time = std::filesystem::last_write_time(fixture.path);
+    std::filesystem::last_write_time(fixture.path, old_time - std::chrono::seconds(5));
+    require_scan(open_with_fingerprint_cache(fixture.path, cache_root), "mtime change");
+
+    const auto replacement = fixture.path.string() + ".replacement";
+    std::filesystem::copy_file(fixture.path, replacement,
+                               std::filesystem::copy_options::overwrite_existing);
+    std::filesystem::rename(replacement, fixture.path);
+    require_scan(open_with_fingerprint_cache(fixture.path, cache_root), "inode replacement");
+
+    std::filesystem::resize_file(records.front(), 5);
+    require_scan(open_with_fingerprint_cache(fixture.path, cache_root), "truncated record");
+
+    auto uncached = write_fixture(normative_directory(), "fingerprint_no_sidecar");
+    Reader no_cache(uncached.path);
+    std::size_t record_count = 0;
+    for (const auto& entry : std::filesystem::directory_iterator(artifacts)) {
+        if (entry.is_regular_file()) { ++record_count; }
+    }
+    if (record_count != 1 || std::filesystem::exists(uncached.path.string() + ".sha256")) {
+        throw std::runtime_error("reader without a cache directory wrote cache output");
+    }
+}
+#endif
+
 } // namespace
 
 int main() {
@@ -190,6 +367,10 @@ int main() {
         test_registered_sizes();
         test_normative_fixture();
         test_common_validation();
+        test_content_fingerprint();
+#ifndef _WIN32
+        test_fingerprint_sidecar_cache();
+#endif
         return 0;
     } catch (const std::exception& error) {
         std::cerr << error.what() << '\n';
