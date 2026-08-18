@@ -3,7 +3,7 @@
 This document defines the registered `qwen3.8-27b/groupwise-int` artifact: its identity,
 persistent inventory, conversion entry point, and Engine binding. Model mathematics, dimensions,
 frontend semantics, and state behavior are defined by
-[`qwen3.6-27b-model.md`](qwen3.6-27b-model.md).
+[`qwen3.8-27b-model.md`](qwen3.8-27b-model.md).
 
 ## 1. Identity
 
@@ -63,7 +63,7 @@ dtypes, frontend resources, conversion recipes, and complete object plan. It wri
 report to `out/qwen3_8_27b.ninfer.conversion.json`.
 
 The converter owns and pins the official Qwen3.8 six-resource frontend profile. Relative to the
-Qwen3.6-27B profile, `tokenizer.json`, `tokenizer_config.json`, and `chat_template.jinja` have
+Qwen3.8-27B profile, `tokenizer.json`, `tokenizer_config.json`, and `chat_template.jinja` have
 Qwen3.8-specific bytes; `generation_config.json`, `preprocessor_config.json`, and
 `video_preprocessor_config.json` are byte-identical.
 

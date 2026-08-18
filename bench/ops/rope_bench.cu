@@ -1,4 +1,4 @@
-// Exact-domain RoPE benchmark for Qwen3.6 Text and Vision geometries.
+// Exact-domain RoPE benchmark for Qwen3.8 Text and Vision geometries.
 // Examples:
 //   ./ninfer_rope_bench --text --geometry dflash --axes 1 \
 //       --tokens 1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16

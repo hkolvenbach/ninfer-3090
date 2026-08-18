@@ -43,7 +43,7 @@ targets:
   model_api:
     protocol: openai_chat
     base_url: http://127.0.0.1:18080/v1
-    model: qwen3.6-27b
+    model: qwen3.8-27b
     api_key_env: MODEL_API_KEY   # optional; omit for an unauthenticated endpoint
     max_concurrency: 1
     request:

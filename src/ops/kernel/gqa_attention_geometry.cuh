@@ -1,6 +1,6 @@
 #pragma once
 
-// Exact grouped-query head geometries served by the Qwen3.6 GQA kernels. Head
+// Exact grouped-query head geometries served by the Qwen3.8 GQA kernels. Head
 // dimension, cache format, and tile policy are shared; head mapping remains a
 // compile-time property so each registered shape gets an independent kernel.
 

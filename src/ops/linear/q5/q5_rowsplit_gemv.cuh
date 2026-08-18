@@ -2,7 +2,7 @@
 
 // Shared Q5 row-split decode (T=1) GEMV core.
 //
-// Memory-bound design for the narrow Qwen3.6 decode shapes (N ~= 5-7K):
+// Memory-bound design for the narrow Qwen3.8 decode shapes (N ~= 5-7K):
 //   - A block owns kRowsPerBlock output rows; one warp computes one full row.
 //   - Each warp streams its row's 16-group weight tiles through shared memory with
 //     a cp.async pipeline kStages buffers deep: tiles j+1 .. j+kStages-1 are in

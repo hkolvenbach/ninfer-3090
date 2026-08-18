@@ -23,7 +23,7 @@ struct Geometry {
     bool parent_weight;
 };
 
-constexpr Geometry kQwen27{"qwen3_6_27b", 5120, 48, false};
+constexpr Geometry kQwen27{"qwen3_8_27b", 5120, 48, false};
 constexpr Geometry kQwen35{"qwen3_6_35b_a3b", 2048, 32, true};
 
 constexpr ReductionCriterion kGdnProjectionFp32{/*relative_l2=*/1.4e-6,

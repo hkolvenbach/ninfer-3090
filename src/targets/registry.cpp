@@ -133,23 +133,23 @@ ConstructedTarget construct_registered(const EngineOptions& options, DeviceConte
 
 } // namespace
 
-LoadedQwen3_6_27B::LoadedQwen3_6_27B(std::unique_ptr<Qwen3_6_27B::LoadedModel> stable_model,
+LoadedQwen3_8_27B::LoadedQwen3_8_27B(std::unique_ptr<Qwen3_8_27B::LoadedModel> stable_model,
                                      PrefixCheckpointPolicy prefix_checkpoint_policy)
     : model(std::move(stable_model)),
-      frontend(Qwen3_6_27B::make_frontend(*model, prefix_checkpoint_policy)) {}
+      frontend(Qwen3_8_27B::make_frontend(*model, prefix_checkpoint_policy)) {}
 
-LoadedQwen3_6_27B::~LoadedQwen3_6_27B() = default;
+LoadedQwen3_8_27B::~LoadedQwen3_8_27B() = default;
 
-Qwen3_6_27BInstance::Qwen3_6_27BInstance(std::unique_ptr<LoadedQwen3_6_27B> stable_loaded,
-                                         runtime::KvCapacityResolution resolution,
-                                         Qwen3_6_27B::SequencePlan sequence_plan,
+Qwen3_8_27BInstance::Qwen3_8_27BInstance(std::unique_ptr<LoadedQwen3_8_27B> stable_loaded,
+                                          runtime::KvCapacityResolution resolution,
+                                         Qwen3_8_27B::SequencePlan sequence_plan,
                                          DeviceContext& device)
     : loaded(std::move(stable_loaded)), kv_capacity_resolution(resolution),
       request_memory(device, sequence_plan.request_transient_capacity_bytes()),
       capacity(sequence_plan.capacity()),
-      program(Qwen3_6_27B::create_program(*loaded->model, std::move(sequence_plan), device)) {}
+      program(Qwen3_8_27B::create_program(*loaded->model, std::move(sequence_plan), device)) {}
 
-Qwen3_6_27BInstance::~Qwen3_6_27BInstance() = default;
+Qwen3_8_27BInstance::~Qwen3_8_27BInstance() = default;
 
 LoadedQwen3_6_35BA3B::LoadedQwen3_6_35BA3B(
     std::unique_ptr<Qwen3_6_35BA3B::LoadedModel> stable_model,
@@ -176,13 +176,9 @@ ConstructedTarget construct_target(const EngineOptions& options, DeviceContext& 
 
     artifact::Reader reader(options.artifact_path);
     const auto& identity = reader.identity();
-    if (identity.model_id == Qwen3_6_27B::model_id) {
-        return construct_registered<Qwen3_6_27B, LoadedQwen3_6_27B, Qwen3_6_27BInstance>(
-            options, device, reader, load_start, Qwen3_6_27B::target_key);
-    }
-    if (identity.model_id == Qwen3_6_27B::qwen3_8_model_id) {
-        return construct_registered<Qwen3_6_27B, LoadedQwen3_6_27B, Qwen3_6_27BInstance>(
-            options, device, reader, load_start, Qwen3_6_27B::qwen3_8_target_key);
+    if (identity.model_id == Qwen3_8_27B::model_id) {
+        return construct_registered<Qwen3_8_27B, LoadedQwen3_8_27B, Qwen3_8_27BInstance>(
+            options, device, reader, load_start, Qwen3_8_27B::target_key);
     }
     if (identity.model_id == Qwen3_6_35BA3B::model_id) {
         return construct_registered<Qwen3_6_35BA3B, LoadedQwen3_6_35BA3B, Qwen3_6_35BA3BInstance>(

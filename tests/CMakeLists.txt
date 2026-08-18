@@ -70,7 +70,7 @@ ninfer_add_test(ninfer_sampling_defaults_test
   LIBRARIES ninfer_engine)
 target_include_directories(ninfer_sampling_defaults_test PRIVATE
   ${PROJECT_SOURCE_DIR}/src/targets/qwen3_6/export
-  ${PROJECT_SOURCE_DIR}/src/targets/qwen3_6_27b/export
+  ${PROJECT_SOURCE_DIR}/src/targets/qwen3_8_27b/export
   ${PROJECT_SOURCE_DIR}/src/targets/qwen3_6_35b_a3b/export)
 ninfer_add_test(ninfer_kv_cache_test
   SOURCES test_kv_cache.cpp
@@ -103,19 +103,19 @@ ninfer_add_test(ninfer_qwen3_6_runtime_mechanisms_test
   LIBRARIES ninfer_engine ninfer_core)
 target_include_directories(ninfer_qwen3_6_runtime_mechanisms_test PRIVATE
   ${PROJECT_SOURCE_DIR}/src/targets/qwen3_6/export)
-ninfer_add_test(ninfer_qwen3_6_27b_prefix_real_test
-  SOURCES targets/qwen3_6_27b/test_engine_prefix_real.cpp
+ninfer_add_test(ninfer_qwen3_8_27b_prefix_real_test
+  SOURCES targets/qwen3_8_27b/test_engine_prefix_real.cpp
   LIBRARIES ninfer_engine)
-set_tests_properties(ninfer_qwen3_6_27b_prefix_real_test PROPERTIES SKIP_RETURN_CODE 77)
-ninfer_add_test(ninfer_qwen3_6_27b_load_plan_test
-  SOURCES targets/qwen3_6_27b/test_load_plan.cpp
+set_tests_properties(ninfer_qwen3_8_27b_prefix_real_test PROPERTIES SKIP_RETURN_CODE 77)
+ninfer_add_test(ninfer_qwen3_8_27b_load_plan_test
+  SOURCES targets/qwen3_8_27b/test_load_plan.cpp
   NEEDS_SOURCE_DIR
   LIBRARIES ninfer_engine)
-target_include_directories(ninfer_qwen3_6_27b_load_plan_test PRIVATE
+target_include_directories(ninfer_qwen3_8_27b_load_plan_test PRIVATE
   ${PROJECT_SOURCE_DIR}/src/targets/qwen3_6/export
-  ${PROJECT_SOURCE_DIR}/src/targets/qwen3_6_27b/export)
-target_link_libraries(ninfer_qwen3_6_27b_load_plan_test PRIVATE CUDA::cudart)
-set_tests_properties(ninfer_qwen3_6_27b_load_plan_test PROPERTIES SKIP_RETURN_CODE 77)
+  ${PROJECT_SOURCE_DIR}/src/targets/qwen3_8_27b/export)
+target_link_libraries(ninfer_qwen3_8_27b_load_plan_test PRIVATE CUDA::cudart)
+set_tests_properties(ninfer_qwen3_8_27b_load_plan_test PROPERTIES SKIP_RETURN_CODE 77)
 ninfer_add_test(ninfer_qwen3_6_35b_a3b_real_test
   SOURCES targets/qwen3_6_35b_a3b/test_engine_real.cpp
   LIBRARIES ninfer_engine)
@@ -168,10 +168,10 @@ ninfer_add_test(ninfer_request_log_test
   LIBRARIES ninfer_serve)
 ninfer_add_test(ninfer_bench_support_test
   SOURCES test_ninfer_bench_support.cpp
-          ${PROJECT_SOURCE_DIR}/bench/targets/qwen3_6_27b/ninfer_bench_support.cpp
+          ${PROJECT_SOURCE_DIR}/bench/targets/qwen3_8_27b/ninfer_bench_support.cpp
   NEEDS_SOURCE_DIR
   LIBRARIES ninfer_engine)
-target_include_directories(ninfer_bench_support_test PRIVATE ${PROJECT_SOURCE_DIR}/bench/targets/qwen3_6_27b)
+target_include_directories(ninfer_bench_support_test PRIVATE ${PROJECT_SOURCE_DIR}/bench/targets/qwen3_8_27b)
 
 # Shared Op numerical tests. Target-composed schedule tests are registered separately below.
 set(ninfer_op_tests
@@ -292,10 +292,10 @@ ninfer_add_fused_linear_test(
   ops/linear_swiglu/test_nvfp4.cpp
   ops/linear_swiglu/linear_swiglu_test_common.cpp)
 
-ninfer_add_test(ninfer_qwen3_6_27b_visual_scatter_test
-  SOURCES targets/qwen3_6_27b/test_visual_scatter.cpp
+ninfer_add_test(ninfer_qwen3_8_27b_visual_scatter_test
+  SOURCES targets/qwen3_8_27b/test_visual_scatter.cpp
   LIBRARIES ninfer_engine ninfer_core)
-set_tests_properties(ninfer_qwen3_6_27b_visual_scatter_test PROPERTIES SKIP_RETURN_CODE 77)
+set_tests_properties(ninfer_qwen3_8_27b_visual_scatter_test PROPERTIES SKIP_RETURN_CODE 77)
 
 # Isolated E8 Lattice Tensor Core KV Codec Testbed
 add_executable(ninfer_test_e8_codec
@@ -310,12 +310,12 @@ set_target_properties(ninfer_test_e8_codec PROPERTIES CUDA_ARCHITECTURES "89")
 
 # These tests deliberately compile against the exact target's internal contracts; the target does
 # not export impl/ to ordinary consumers.
-set(ninfer_qwen3_6_27b_internal_tests
-  ninfer_qwen3_6_27b_visual_scatter_test)
-foreach(test_target IN LISTS ninfer_qwen3_6_27b_internal_tests)
+set(ninfer_qwen3_8_27b_internal_tests
+  ninfer_qwen3_8_27b_visual_scatter_test)
+foreach(test_target IN LISTS ninfer_qwen3_8_27b_internal_tests)
   target_include_directories(${test_target} PRIVATE
-    ${PROJECT_SOURCE_DIR}/src/targets/qwen3_6_27b/impl
-    ${PROJECT_SOURCE_DIR}/src/targets/qwen3_6_27b/export
+    ${PROJECT_SOURCE_DIR}/src/targets/qwen3_8_27b/impl
+    ${PROJECT_SOURCE_DIR}/src/targets/qwen3_8_27b/export
     ${PROJECT_SOURCE_DIR}/src/targets/qwen3_6/export)
 endforeach()
 

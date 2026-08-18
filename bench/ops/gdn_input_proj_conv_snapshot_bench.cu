@@ -1,4 +1,4 @@
-// Public Qwen3.6 GDN projection/convolution Snapshot and ReplaySSM Record benchmark.
+// Public Qwen3.8 GDN projection/convolution Snapshot and ReplaySSM Record benchmark.
 //
 // The timed body is exactly one selected gdn_input_proj_conv_*() public Op call.
 // Production dispatch, kernel topology, and workspace use remain behind that contract.

@@ -1,6 +1,6 @@
 #pragma once
 
-// Shared Qwen3.6 GQA dimensions and leaf PTX helpers used by the independently tuned
+// Shared Qwen3.8 GQA dimensions and leaf PTX helpers used by the independently tuned
 // BF16 and INT8 prompt kernels. This file deliberately owns no staging policy,
 // shared-memory arena, warp schedule, or kernel body.
 

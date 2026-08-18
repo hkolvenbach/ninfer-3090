@@ -49,7 +49,7 @@ struct Geometry {
 };
 
 constexpr Geometry kGeometries[] = {
-    {"qwen3_6_27b", 24, 4},
+    {"qwen3_8_27b", 24, 4},
     {"qwen3_6_35b_a3b", 16, 2},
 };
 

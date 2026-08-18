@@ -8,7 +8,7 @@ under [`tools/parity`](../parity).
 `ninfer_bench` benchmarks prefill at an exact length by slicing the first `P` token ids of a
 committed corpus, so the corpus must be real, in-distribution text (not random tokens) and at
 least as long as the largest prefill you want to run. `make_bench_corpus.py` bakes that corpus
-offline with a local Hugging Face Qwen3.6 tokenizer.
+offline with a local Hugging Face Qwen3.8 tokenizer.
 
 Outputs (committed):
 
@@ -46,12 +46,12 @@ The tokenizer is loaded locally only; the tool never downloads from the network.
 ```bash
 # Regenerate the committed corpus from the built-in bank (default 65536 tokens).
 python3 tools/bench/make_bench_corpus.py \
-  --tokenizer-path /path/to/local/Qwen3.6-27B/tokenizer \
+  --tokenizer-path /path/to/local/Qwen3.8-27B/tokenizer \
   --tokens 65536
 
 # Bake from your own downloaded/assembled text instead (kept local; not committed).
 python3 tools/bench/make_bench_corpus.py \
-  --tokenizer-path /path/to/local/Qwen3.6-27B/tokenizer \
+  --tokenizer-path /path/to/local/Qwen3.8-27B/tokenizer \
   --tokens 131072 --source-text /path/to/book.txt
 
 # Check that the committed .ids and its descriptive manifest agree; no tokenizer or source needed.
@@ -67,7 +67,7 @@ optionally use `--source-text`) to benchmark longer prefills, memory permitting.
 `.ninfer` artifact and stores its local reports under `profiles/bench/`. Its defaults are:
 
 ```text
-artifact: out/qwen3_6_27b.ninfer
+artifact: out/qwen3_8_27b.ninfer
 binary:   build/bench/ninfer_bench
 corpus:   bench/fixtures/bench_corpus.ids
 ```
@@ -149,14 +149,14 @@ position for every request.
 
 ```bash
 python3 tools/bench/run_serve_concurrency.py \
-  --artifact qwen3_6_27b=out/qwen3_6_27b_nvfp4.ninfer \
+  --artifact qwen3_8_27b=out/qwen3_8_27b_nvfp4.ninfer \
   --mode mtp3 --suite decode-saturation \
   --concurrency 1 --concurrency 2 --concurrency 4 \
   --decode-tokens 8192 \
   --output profiles/bench/concurrent-decode
 
 python3 tools/bench/run_serve_concurrency.py \
-  --artifact qwen3_6_27b=out/qwen3_6_27b_nvfp4.ninfer \
+  --artifact qwen3_8_27b=out/qwen3_8_27b_nvfp4.ninfer \
   --mode mtp3 --suite corpus-makespan \
   --concurrency 1 --concurrency 2 \
   --output profiles/bench/concurrent-corpus

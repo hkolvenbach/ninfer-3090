@@ -51,7 +51,7 @@ KV 设计必须区分三个彼此独立的粒度：
 Page boundary 既不是 Attention 语义边界，也不是 prefix-cache hit boundary。一个合法 frontier 可以位于
 page 内部任意 token offset。
 
-当前 Qwen3.6 target 的 Linear Attention state 不能从 KV prefix 单独重建。Prefix lookup 只能使用保留了
+当前 Qwen3.8 target 的 Linear Attention state 不能从 KV prefix 单独重建。Prefix lookup 只能使用保留了
 完整 continuation state 的 target-declared checkpoint。当前可复用位置是 current resume frontier 和一份
 有效时的 turn checkpoint，具体 claim/restore 语义见 §10。落在这两个 checkpoint
 之外的更短 token prefix 是 arbitrary partial hit，本设计不支持。
@@ -743,7 +743,7 @@ Cancellation 在第一个观察到它的 GPU boundary release bundle；不修改
 ### 10.1 Reusable checkpoints
 
 一个 retained entry 发布 target 已证明拥有完整 continuation state 的 reusable checkpoints。当前
-Qwen3.6 retained sequence 包含：
+Qwen3.8 retained sequence 包含：
 
 - current resume frontier；
 - 一份有效时的 turn checkpoint。

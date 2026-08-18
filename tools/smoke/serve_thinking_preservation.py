@@ -1,4 +1,4 @@
-"""Run the Qwen3.6 thinking-preservation fixture through a real ninfer-serve process."""
+"""Run the Qwen3.8 thinking-preservation fixture through a real ninfer-serve process."""
 
 from __future__ import annotations
 
@@ -281,7 +281,7 @@ def main() -> None:
     parser.add_argument(
         "--fixture",
         type=Path,
-        default=Path("tests/fixtures/serve/qwen3_6_thinking_preservation.json"),
+        default=Path("tests/fixtures/serve/qwen3_8_thinking_preservation.json"),
     )
     parser.add_argument("--startup-timeout", type=float, default=600.0)
     parser.add_argument("--port", type=int, default=0)

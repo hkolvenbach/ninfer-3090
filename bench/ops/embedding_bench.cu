@@ -1,4 +1,4 @@
-// Public aggregate-column benchmark for the registered Qwen3.6 embedding profiles.
+// Public aggregate-column benchmark for the registered Qwen3.8 embedding profiles.
 //
 // Every measurement is exactly one ninfer::ops::embedding call. L2 eviction
 // completes before the timed interval.

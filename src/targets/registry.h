@@ -2,7 +2,7 @@
 
 #include "ninfer/types.h"
 #include "runtime/engine/request_memory.h"
-#include <ninfer/targets/qwen3_6_27b/package.h>
+#include <ninfer/targets/qwen3_8_27b/package.h>
 #include <ninfer/targets/qwen3_6_35b_a3b/package.h>
 
 #include <memory>
@@ -14,37 +14,37 @@ struct DeviceContext;
 
 namespace targets {
 
-using Qwen3_6_27B    = qwen3_6_27b::Package;
+using Qwen3_8_27B    = qwen3_8_27b::Package;
 using Qwen3_6_35BA3B = qwen3_6_35b_a3b::Package;
 
-struct LoadedQwen3_6_27B {
-    std::unique_ptr<Qwen3_6_27B::LoadedModel> model;
-    Qwen3_6_27B::Frontend frontend;
+struct LoadedQwen3_8_27B {
+    std::unique_ptr<Qwen3_8_27B::LoadedModel> model;
+    Qwen3_8_27B::Frontend frontend;
 
-    LoadedQwen3_6_27B(std::unique_ptr<Qwen3_6_27B::LoadedModel> stable_model,
+    LoadedQwen3_8_27B(std::unique_ptr<Qwen3_8_27B::LoadedModel> stable_model,
                       PrefixCheckpointPolicy prefix_checkpoint_policy);
-    ~LoadedQwen3_6_27B();
+    ~LoadedQwen3_8_27B();
 
-    LoadedQwen3_6_27B(const LoadedQwen3_6_27B&)            = delete;
-    LoadedQwen3_6_27B& operator=(const LoadedQwen3_6_27B&) = delete;
+    LoadedQwen3_8_27B(const LoadedQwen3_8_27B&)            = delete;
+    LoadedQwen3_8_27B& operator=(const LoadedQwen3_8_27B&) = delete;
 };
 
-struct Qwen3_6_27BInstance {
-    using Package = Qwen3_6_27B;
+struct Qwen3_8_27BInstance {
+    using Package = Qwen3_8_27B;
 
-    std::unique_ptr<LoadedQwen3_6_27B> loaded;
+    std::unique_ptr<LoadedQwen3_8_27B> loaded;
     runtime::KvCapacityResolution kv_capacity_resolution;
     runtime::RequestMemory request_memory;
     const std::uint32_t capacity;
-    std::unique_ptr<Qwen3_6_27B::Program> program;
+    std::unique_ptr<Qwen3_8_27B::Program> program;
 
-    Qwen3_6_27BInstance(std::unique_ptr<LoadedQwen3_6_27B> stable_loaded,
+    Qwen3_8_27BInstance(std::unique_ptr<LoadedQwen3_8_27B> stable_loaded,
                         runtime::KvCapacityResolution resolution,
-                        Qwen3_6_27B::SequencePlan sequence_plan, DeviceContext& device);
-    ~Qwen3_6_27BInstance();
+                        Qwen3_8_27B::SequencePlan sequence_plan, DeviceContext& device);
+    ~Qwen3_8_27BInstance();
 
-    Qwen3_6_27BInstance(const Qwen3_6_27BInstance&)            = delete;
-    Qwen3_6_27BInstance& operator=(const Qwen3_6_27BInstance&) = delete;
+    Qwen3_8_27BInstance(const Qwen3_8_27BInstance&)            = delete;
+    Qwen3_8_27BInstance& operator=(const Qwen3_8_27BInstance&) = delete;
 };
 
 struct LoadedQwen3_6_35BA3B {
@@ -78,7 +78,7 @@ struct Qwen3_6_35BA3BInstance {
 };
 
 using ActiveTarget =
-    std::variant<std::unique_ptr<Qwen3_6_27BInstance>, std::unique_ptr<Qwen3_6_35BA3BInstance>>;
+    std::variant<std::unique_ptr<Qwen3_8_27BInstance>, std::unique_ptr<Qwen3_6_35BA3BInstance>>;
 
 struct ConstructedTarget {
     ActiveTarget active;

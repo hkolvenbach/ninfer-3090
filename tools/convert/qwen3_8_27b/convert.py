@@ -22,9 +22,9 @@ import torch
 from tools.artifact.container import ArtifactIdentity, ArtifactObject, ArtifactWriter
 from tools.convert.common.quantize import pick_device
 from tools.convert.common.safetensors import ShardReader
-from tools.convert.qwen3_6.common import conversion as family_conversion
-from tools.convert.qwen3_6_27b import convert as qwen3_6_convert
-from tools.convert.qwen3_6_27b import draft_head, recipe
+from tools.convert.qwen3_8.common import conversion as family_conversion
+from tools.convert.qwen3_8_27b import base_convert
+from tools.convert.qwen3_8_27b import draft_head, recipe
 
 from . import inventory
 
@@ -119,7 +119,7 @@ def load_resources(model_dir: str | Path) -> tuple[ResourcePayload, ...]:
 def preflight_conversion(model_dir: str | Path) -> ConversionPreflight:
     model = Path(model_dir)
     config = family_conversion.load_json(model / "config.json")
-    config_summary = qwen3_6_convert.validate_config(config)
+    config_summary = base_convert.validate_config(config)
     preflight_inventory()
     source = recipe.preflight_sources(model)
     resources = load_resources(model)
@@ -142,7 +142,7 @@ def materialize_tensor(
     reader: ShardReader,
     draft: draft_head.DraftHeadContext,
 ) -> torch.Tensor:
-    return qwen3_6_convert.materialize_tensor(spec, reader, draft)
+    return base_convert.materialize_tensor(spec, reader, draft)
 
 
 def encode_tensor_payload(
@@ -165,6 +165,8 @@ def build_conversion_report(
     final_bytes: int,
     device: torch.device,
     ranking_path: str | Path,
+    revision: str | None = None,
+    environment: Mapping[str, object] | None = None,
 ) -> dict[str, object]:
     return family_conversion.build_conversion_report(
         identity=ArtifactIdentity(inventory.MODEL_ID, inventory.WEIGHTS_ID),
@@ -181,6 +183,8 @@ def build_conversion_report(
         final_bytes=final_bytes,
         device=device,
         ranking_path=ranking_path,
+        revision=revision,
+        environment_summary=environment,
     )
 
 

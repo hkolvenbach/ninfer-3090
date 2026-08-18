@@ -170,13 +170,13 @@ void test_common_validation() {
     {
         auto normative = normative_directory();
         nlohmann::json directory{
-            {"model_id", "qwen3.6-27b"},
+            {"model_id", "qwen3.8-27b"},
             {"objects", normative.at("objects")},
         };
         auto fixture =
             write_fixture(directory, "legacy_v1", ninfer::test::artifact_fixture::kV1Magic);
         Reader reader(fixture.path);
-        if (reader.identity().model_id != "qwen3.6-27b" ||
+        if (reader.identity().model_id != "qwen3.8-27b" ||
             reader.identity().weights_id != "groupwise-int") {
             throw std::runtime_error("legacy v1 identity mapping mismatch");
         }

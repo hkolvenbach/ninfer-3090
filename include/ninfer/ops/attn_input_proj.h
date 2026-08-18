@@ -78,7 +78,7 @@ void attn_input_proj(const Tensor& x, const Weight& query_key_gate_value_weight,
                      Tensor& gate, Tensor& k, Tensor& v, cudaStream_t stream);
 
 /**
- * Qwen3.6 companion W8 specialization. The W8G32_F16S RowSplit parent has shape [6144,2048]
+ * Qwen3.8 companion W8 specialization. The W8G32_F16S RowSplit parent has shape [6144,2048]
  * and stored row order [query 4096, key 1024, value 1024]. `x` is contiguous BF16 [2048,T],
  * q is contiguous BF16 [4096,T], and k/v are contiguous BF16 [1024,T]. Every route writes
  * the three independent final allocations directly; no parent output or transient workspace

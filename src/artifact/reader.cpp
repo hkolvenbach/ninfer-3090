@@ -411,7 +411,7 @@ struct Reader::Impl {
             static constexpr std::array root_members = {"model_id", "objects"};
             require_members(directory, root_members, "legacy directory root");
             identity.model_id = require_string(directory.at("model_id"), "model_id");
-            if (identity.model_id != "qwen3.6-27b" && identity.model_id != "qwen3.6-35b-a3b") {
+            if (identity.model_id != "qwen3.8-27b" && identity.model_id != "qwen3.6-35b-a3b") {
                 throw ArtifactError("legacy artifact model_id is not a registered groupwise target");
             }
             identity.weights_id = "groupwise-int";

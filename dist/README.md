@@ -16,7 +16,7 @@ Generated binaries and archives are ignored by Git because GitHub source reposit
 contain build products. Upload the `.zip` and versioned checksum file as GitHub Release assets.
 The packaging guide itself is tracked.
 
-Model artifacts are not included. Download either the 16.29 GiB `qwen3_6_27b.ninfer` or 20.84 GiB
+Model artifacts are not included. Download either the 16.29 GiB `qwen3_8_27b.ninfer` or 20.84 GiB
 `qwen3_6_35b_a3b.ninfer` artifact from the repositories linked in the project README and verify its
 published SHA-256 separately. The compact 35B artifact is text-only; leave `--vision` disabled.
 

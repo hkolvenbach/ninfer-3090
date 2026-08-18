@@ -27,7 +27,7 @@ using namespace ninfer::test;
 
 namespace {
 
-// SparseMoe is the exact qwen3_6_35b_a3b post-mixer Op. qwen3_6_27b has a dense SwiGLU
+// SparseMoe is the exact qwen3_6_35b_a3b post-mixer Op. qwen3_8_27b has a dense SwiGLU
 // post-mixer and therefore contributes no second SparseMoe geometry.
 constexpr std::int32_t kHidden         = 2048;
 constexpr std::int32_t kExperts        = 256;

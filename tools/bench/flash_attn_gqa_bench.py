@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""FlashAttention reference bench for the Qwen3.6 GQA prompt-attention shape.
+"""FlashAttention reference bench for the Qwen3.8 GQA prompt-attention shape.
 
 This is an optional performance oracle, not a project runtime dependency. It
 measures the same causal append-prompt attention geometry as

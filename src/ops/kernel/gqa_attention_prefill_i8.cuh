@@ -1,6 +1,6 @@
 #pragma once
 
-// INT8-native GQA prompt kernel for the registered Qwen3.6 head geometries. QK stays INT8 through
+// INT8-native GQA prompt kernel for the registered Qwen3.8 head geometries. QK stays INT8 through
 // m16n8k32.s8 Tensor Cores; V alone is dequantized with packed FP16 arithmetic while
 // producer warps execute QK. Sixteen warps split each 16-row FP16 PV output across
 // four 64-dimension slices.

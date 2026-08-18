@@ -161,7 +161,7 @@ crossover 或 candidate-legality 表。
 suite 调用顺序运行全部 point：
 
 ```bash
-./build/bench/ninfer_linear_bench --suite qwen3_6_27b
+./build/bench/ninfer_linear_bench --suite qwen3_8_27b
 ./build/bench/ninfer_linear_bench --suite qwen3_6_35b_a3b
 ./build/bench/ninfer_linear_bench --suite all
 ```
@@ -186,7 +186,7 @@ suite entry 使用两种固定采样类：
 suite 对每个 `(qtype,N,K)` 只生成一次 weight，并按该 entry 的最大 T 一次性分配
 activation/output。不同 T 复用同一组 allocation，不重复构造大权重。
 
-### 2.2 `qwen3_6_27b`
+### 2.2 `qwen3_8_27b`
 
 27B core suite 只登记当前模型中实际通过 pure public Linear 使用的主要 Text/MTP/head
 几何：

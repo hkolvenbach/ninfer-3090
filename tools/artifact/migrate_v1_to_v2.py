@@ -26,7 +26,7 @@ from tools.artifact.container import (
     plan_objects,
 )
 from tools.artifact.layouts import align_up
-from tools.convert.qwen3_6_27b import inventory as inventory_27b
+from tools.convert.qwen3_8_27b import inventory as inventory_27b
 from tools.convert.qwen3_6_35b_a3b import inventory as inventory_35b
 
 

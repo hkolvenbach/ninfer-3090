@@ -23,7 +23,7 @@
     "code",
     "math"
   ],
-  "tokenizer_dir": "/home/neroued/models/llm/qwen/Qwen3.6-27B/base-hf-bf16",
+  "tokenizer_dir": "/home/neroued/models/llm/qwen/Qwen3.8-27B/base-hf-bf16",
   "top_tokens": [
     {
       "count": 1520733,
@@ -679,5 +679,5 @@
     "tokens_forwarded": 70865184
   },
   "vocab": 248320,
-  "weights": "out/qwen3_6_27b.q5090_w4g64_mixed_v3_mtp_w8g32.qus"
+  "weights": "out/qwen3_8_27b.q5090_w4g64_mixed_v3_mtp_w8g32.qus"
 }

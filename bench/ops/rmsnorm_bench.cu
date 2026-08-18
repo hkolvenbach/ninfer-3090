@@ -1,4 +1,4 @@
-// Performance bench for the registered Qwen3.6 RMSNorm domains.
+// Performance bench for the registered Qwen3.8 RMSNorm domains.
 //
 // Default matrix:
 //   decode / verification T=1..16
