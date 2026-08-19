@@ -706,6 +706,12 @@ Admission 在同一 lane 成功时消费 retained entry，并把 SequenceState o
 Turn-checkpoint restore 保留包含 checkpoint 的部分尾页，释放其后的完整 pages。KV page 或 token prefix match
 本身不是 checkpoint；当前架构不支持 arbitrary longest-common-prefix reuse。
 
+Prefix reuse 复现 full prefill 的**输入语义**，不复现其算术。两条路径把同一 prompt 切成不同的
+prefill 调用，FP32 GDN recurrence 因此在不同 chunk 边界上累加，两者从不 bitwise 相同；当某个位置
+的 argmax margin 足够小时，greedy 输出可以不同。groupwise-int 的 INT8 prefill projection 路线
+（`performance.md` 的 RTX 4090 activation-compute profile 一节）使这一点可观测。Reuse 保证的是 reused prefix 与重新 prefill
+同一 prefix 表示同一输入，不保证逐 token 相同的生成结果。
+
 一个 retained entry 同时只能被一个 active request 消费。多个 active requests 不共享同一份可写
 sequence state，也不使用 copy-on-write branching。Request-local RNG、sampling、stop、generation
 limit 和 output state 始终由新 request 创建。

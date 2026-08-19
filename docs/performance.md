@@ -17,7 +17,8 @@ Tested Git revisions:
   `0795169393cab0f2c16246d4bac20dee735dc2a4`.
 
 The serving measurements characterize the two measured model IDs independently on one
-NVIDIA GeForce RTX 5090. They cover long-context prefill and baseline decode with speculative
+NVIDIA GeForce RTX 5090. A separate RTX 4090 (`sm_89`) long-context prefill section appears at the
+end of this file and is not comparable to the RTX 5090 tables. They cover long-context prefill and baseline decode with speculative
 decoding disabled, plus long-reasoning and cross-scenario decode with MTP and DFlash. The 27B
 results report its `groupwise-int` and `nvfp4` weight profiles separately. The concurrent
 decode-saturation campaign measures the same three artifact profiles at C=1, 2, 4, and 8.
@@ -466,3 +467,79 @@ Each category contains three fixtures and five seeds per fixture, for 15 samples
 
 The baseline and speculative-decode suites intentionally measure different supported workloads.
 No per-scenario baseline/speculative speedup is reported.
+
+## RTX 4090 (`sm_89`) long-context prefill
+
+The sections above characterize one RTX 5090. This section is a separate hardware target: the
+`sm_89` build of `qwen3.8-27b/groupwise-int` on one NVIDIA GeForce RTX 4090, and it reports prefill
+throughput only.
+
+| Setting | Value |
+|---|---|
+| GPU | NVIDIA GeForce RTX 4090, 24 GiB, 480 W power limit (~2,715 MHz sustained) |
+| Toolchain | CUDA 13.2, `CMAKE_CUDA_ARCHITECTURES=89`, Release |
+| Artifact | `qwen3.8-27b/groupwise-int` |
+| KV dtype | `rk4v4-e8` |
+| Prompt | 115,125 tokens |
+
+```bash
+./build-sm89/apps/ninfer-serve models/qwen3_8_27b.ninfer \
+  --max-context 262144 --kv-capacity 262144 --prefill-chunk 1024 \
+  --kv-dtype rk4v4-e8 --continuation-cache off --no-prefix-reuse
+```
+
+Prefill rate is read from the structured request log (`prefill_tok_s`), not from HTTP round-trip
+timing, so prepare and vision time are excluded. Two hazards invalidate a prefill measurement if
+ignored: the continuation cache must be off, because a repeated prompt otherwise restores state
+instead of prefilling; and SM clock and power should be logged, because sustained prefill on this
+card can throttle and be misread as a kernel regression. Repeat measurements of one configuration
+reproduce to within 0.12%.
+
+### Result
+
+INT8 tensor-core prefill routes (`mma.m16n8k32.s32.s8.s8.s32`) replaced BF16 routes on all six
+dense body GEMM Ops, in three stages:
+
+| Configuration | Prefill | Cumulative |
+|---|---:|---:|
+| BF16 routes | 1,701.4 tok/s | 1.000× |
+| INT8 `linear_swiglu` (Q4) | 1,976.4 tok/s | 1.162× |
+| INT8 `linear_add` (Q5) | 2,147.3 tok/s | 1.262× |
+| INT8 `attn_input_proj` + `gdn_input_proj` | **2,409.2 tok/s** | **1.415×** |
+
+`--prefill-chunk 2048` adds a further 0.6% (2,423.2 tok/s); 4096 does not improve on it.
+
+### Activation-compute profile
+
+The INT8 routes quantize the activation to group-64 symmetric INT8, which is a declared semantic
+boundary rather than a bit-exact transform of the BF16 route. It is admitted in prefill only:
+decode and speculative verify keep the BF16 catalog and are bit-identical to the previous build.
+
+Because the projections feed the attention scores and the FP32 GDN recurrence, the profile does
+move greedy output. Screening against a BF16-projection build on the same configuration: 7 of 12
+short prompts produced byte-identical output, and all five divergences were paraphrases with no
+factual or arithmetic error. A retrieval probe at a 139,910-token prompt placed a distinct code at
+five depths and both builds retrieved 5/5 with byte-identical answers. AIME/GPQA were not re-run
+for this profile, so task-level reasoning accuracy under it is unverified.
+
+Prefix reuse reproduces the input semantics of full prefill, not its arithmetic. The two paths
+decompose a prompt into different prefill calls, so the FP32 GDN recurrence accumulates over
+different chunk boundaries; they were never bitwise identical, and this profile made the difference
+observable in generated tokens.
+
+### Prompt-length characteristics
+
+The INT8 routes are registered over every prefill token count, so short prompts take them where the
+tuned small-`T` BF16 routes were faster:
+
+| Prompt tokens | BF16 projections | INT8 projections |
+|---:|---:|---:|
+| 99 | 185.5 tok/s | 177.3 tok/s |
+| 229 | 447.2 tok/s | 434.1 tok/s |
+| 770 | 1,311.4 tok/s | 1,334.5 tok/s |
+| 2,827 | 2,316.0 tok/s | 2,535.7 tok/s |
+| 8,105 | 2,760.0 tok/s | 3,186.5 tok/s |
+
+Break-even is near 770 tokens and the worst case is about 15 ms on a 229-token prompt. A token-count
+threshold would recover it, but it would also make a token's projection output depend on the width
+of the call that produced it, which widens rather than narrows how far prefix reuse can drift.

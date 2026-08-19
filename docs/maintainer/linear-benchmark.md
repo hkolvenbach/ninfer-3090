@@ -497,3 +497,48 @@ policy 只是许可，长期 benchmark 不把许可本身冒充为低精度执�
 
 benchmark 不承担数值 correctness；各 weight/activation-compute profile 继续由 public
 Linear conformance suite 和统一 CPU FP64 GEMM oracle 负责。
+
+## 10. W4A8 / W5A8 INT8 route: measured ceiling on `sm_89`
+
+RTX 4090, CUDA 13.2, `qwen3.8-27b/groupwise-int`. Instruction peaks measured on this card:
+`mma.m16n8k16.f32.bf16` 171.7 TFLOP/s, `mma.m16n8k16.f16.f16` 342.9, and
+`mma.m16n8k32.s32.s8.s8.s32` **686.1** — a 4.00× instruction advantage for INT8 over BF16.
+
+The tuned INT8 routes realize **230.0 TFLOP/s** at `[34816,5120] × T=1024`, which is 1.76× the BF16
+route but only **33.5%** of the INT8 instruction peak. The reason is structural rather than a
+tuning deficit, and disassembly locates it exactly.
+
+Taking the densest 64-IMMA window of the shipped Q4 SwiGLU kernel
+(`Q4Int8SwiGluSchedule<64,256,16,128,3,1>`, `Full=true`) — its steady-state inner loop — gives
+**6.55 non-MMA instructions per IMMA**:
+
+| Instruction | Per IMMA | Role |
+|---|---:|---|
+| `I2FP` | 1.75 | int32 accumulator to float |
+| `FMUL` | 1.75 | multiply by the weight group scale |
+| `FFMA` | 1.75 | multiply by the activation group scale and accumulate |
+| `LDS` | 0.91 | fragment loads |
+| `LOP3` | 0.17 | Q4 nibble decode |
+
+Weight decode costs 0.17 instructions per IMMA and is not a factor. The per-group rescale costs
+5.25 of the 6.55, and it is algebraically irreducible under the current numeric contract: the inner
+statement `acc += (float)s · ws[h] · xsv[j]` runs once per accumulator element per weight group, and
+with `MT=1, NT=16` the 64 required scale products cannot be hoisted or shared — precomputing
+`ws·xsv` costs exactly the `FMUL` count it saves. Accumulating across groups in int32 is unavailable
+because the artifact's Q4G64 weight scale changes every 64 k-elements.
+
+The only remaining lever is the activation scale granularity, which the engine chooses rather than
+the artifact. A per-token activation scale removes the `xsv` multiply from the inner loop and cuts
+non-MMA work by 27%; an activation super-group of 256 with an FP32 temporary folds four groups'
+multiplies into one and cuts it by about 14%. Both trade activation fidelity on a model with known
+outlier channels, so neither is taken without a task-level accuracy gate.
+
+Two implementation facts worth retaining for any future INT8 route here:
+
+- **Super-group staging.** `codes[row][group][32]` places consecutive rows 2560 B apart, so staging
+  one quant group issues 16 scattered requests. Staging a 256-element super-group instead gives one
+  128 B line per row and cuts barriers 4×. No artifact change is required.
+- **Pipeline depth.** With `AST` activation stages, commit index `j` carries activation group `j`.
+  Entering iteration `g` there are `AST-1+g` commits outstanding and groups `0..g` must have landed,
+  so at most `AST-2` may be pending: the correct wait is `cp_wait<AST-2>()`. `cp_wait<AST-1>()` is a
+  steady-state race, not merely a prologue one, and `compute-sanitizer --tool racecheck` reports it.

@@ -31,6 +31,11 @@ constexpr ReductionCriterion tolerance_for(ActivationCompute activation_compute)
     switch (activation_compute) {
     case ActivationCompute::A16:
         return {3.3e-3, 5.0e-3, 6.3e-3};
+    // Group-64 symmetric INT8 activations. The criterion is set from the route's
+    // measured behaviour against the FP64 oracle, not from A16's: quantizing the
+    // activation to 8 bits is a declared semantic boundary of this profile.
+    case ActivationCompute::A8:
+        return {4.0e-2, 2.0e-2, 5.0e-2};
     case ActivationCompute::A4:
         return {1.6e-1, 1.0e-2, 1.6e-1};
     }
@@ -222,7 +227,9 @@ void validate_profile(const Profile& profile) {
     }
     if ((nvfp4 && profile.activation_compute != ActivationCompute::A16 &&
          profile.activation_compute != ActivationCompute::A4) ||
-        (!nvfp4 && profile.activation_compute != ActivationCompute::A16)) {
+        (q4 && profile.activation_compute != ActivationCompute::A16 &&
+         profile.activation_compute != ActivationCompute::A8) ||
+        (w8 && profile.activation_compute != ActivationCompute::A16)) {
         throw std::invalid_argument("linear_swiglu test: invalid activation-compute profile");
     }
 }
@@ -266,9 +273,10 @@ int run_profile(std::string_view label, const Profile& profile,
     device_activation.copy_from_host(host_activation.data(),
                                      host_activation.size() * sizeof(std::uint16_t));
 
-    const ops::LinearPolicy policy    = profile.activation_compute == ActivationCompute::A4
-                                            ? ops::LinearPolicy::AllowA4
-                                            : ops::LinearPolicy::A16Only;
+    const ops::LinearPolicy policy =
+        profile.activation_compute == ActivationCompute::A4   ? ops::LinearPolicy::AllowA4
+        : profile.activation_compute == ActivationCompute::A8 ? ops::LinearPolicy::AllowA8
+                                                              : ops::LinearPolicy::A16Only;
     const std::size_t workspace_bytes = ops::linear_swiglu_workspace_capacity_bytes(
         profile.qtype, profile.gate_up_rows, profile.input_rows, policy, 1, maximum_tokens);
     WorkspaceArena workspace(std::max<std::size_t>(workspace_bytes, 256));

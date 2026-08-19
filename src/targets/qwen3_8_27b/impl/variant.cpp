@@ -53,6 +53,38 @@ ops::LinearPolicy text_policy(const Weight& weight) {
     return weight.qtype == QType::NVFP4 ? kNvfp4TextPolicy : ops::LinearPolicy::A16Only;
 }
 
+// The permitted activation-compute profile is per-Op: an Op admits AllowA8 only
+// where it has a qualified INT8 route. See docs/maintainer/op-development.md
+// section 2.1 for what that profile means and where it may be registered.
+ops::LinearPolicy text_swiglu_policy(const Weight& weight) {
+    if (weight.qtype == QType::NVFP4) { return kNvfp4TextPolicy; }
+    return weight.qtype == QType::Q4G64_F16S ? ops::LinearPolicy::AllowA8
+                                             : ops::LinearPolicy::A16Only;
+}
+
+// The split Q4/Q5 projection pairs are named by their Q4 parent; both halves
+// take the same profile. INT8 activations are admitted in Prefill only: Verify
+// carries the committed decode path, whose numerics stay bit-identical to the
+// A16 catalog, and is the phase that CUDA Graphs capture.
+//
+// Unlike the MLP and residual Ops, these projections feed the attention scores
+// and the FP32 GDN recurrence, so A8 here does move greedy output. That is an
+// accepted property of the profile, not a defect: prefix reuse reproduces the
+// input semantics of full prefill, not its arithmetic.
+ops::LinearPolicy text_proj_pair_policy(const Weight& weight, qwen3_8::TextPhase phase) {
+    if (weight.qtype == QType::NVFP4) { return kNvfp4TextPolicy; }
+    if (weight.qtype != QType::Q4G64_F16S || phase != qwen3_8::TextPhase::Prefill) {
+        return ops::LinearPolicy::A16Only;
+    }
+    return ops::LinearPolicy::AllowA8;
+}
+
+ops::LinearPolicy text_linear_add_policy(const Weight& weight) {
+    if (weight.qtype == QType::NVFP4) { return kNvfp4TextPolicy; }
+    return weight.qtype == QType::Q5G64_F16S ? ops::LinearPolicy::AllowA8
+                                             : ops::LinearPolicy::A16Only;
+}
+
 constexpr std::size_t kMinimumLeafWorkspaceBytes = 1;
 
 std::size_t gdn_record_workspace_bytes(const Tensor& hidden,
@@ -115,11 +147,12 @@ std::vector<GraphExecutionProfile> Variant::dflash_graph_profiles(std::uint32_t,
 
 void Variant::attention_projection(const Tensor& hidden,
                                    const FullAttentionProjectionWeights& weights, Tensor& query,
-                                   Tensor& gate, Tensor& key, Tensor& value, qwen3_8::TextPhase,
-                                   WorkspaceArena& workspace, cudaStream_t stream) {
+                                   Tensor& gate, Tensor& key, Tensor& value,
+                                   qwen3_8::TextPhase phase, WorkspaceArena& workspace,
+                                   cudaStream_t stream) {
     if (const auto* split = std::get_if<SplitAttentionProjectionPayload>(&weights)) {
         ops::attn_input_proj(hidden, split->query_key, split->gate_value, query, gate, key, value,
-                             stream);
+                             text_proj_pair_policy(split->query_key, phase), workspace, stream);
         return;
     }
     const Weight& fused = std::get<FusedAttentionProjectionPayload>(weights).query_key_gate_value;
@@ -130,7 +163,7 @@ void Variant::attention_projection(const Tensor& hidden,
 void Variant::attention_output_projection(const Tensor& attention, const Weight& weight,
                                           Tensor& residual, qwen3_8::TextPhase,
                                           WorkspaceArena& workspace, cudaStream_t stream) {
-    ops::linear_add(attention, weight, residual, text_policy(weight), workspace, stream);
+    ops::linear_add(attention, weight, residual, text_linear_add_policy(weight), workspace, stream);
 }
 
 void Variant::mtp_attention_projection(const Tensor& hidden,
@@ -161,14 +194,14 @@ void Variant::mtp_q_gate_projection(const Tensor& hidden,
 }
 
 void Variant::gdn_input_projection(const Tensor& hidden, const GdnProjectionWeights& weights,
-                                   Tensor& qkv, Tensor& output_gate, qwen3_8::TextPhase,
+                                   Tensor& qkv, Tensor& output_gate, qwen3_8::TextPhase phase,
                                    WorkspaceArena& workspace, cudaStream_t stream) {
     Tensor output_gate_flat =
         output_gate.view({TextConfig::value_dim, static_cast<int>(hidden.ne[1])});
     if (const auto* split =
             std::get_if<SplitGdnInputProjectionPayload>(&weights.input_projection)) {
         ops::gdn_input_proj(hidden, split->query_key, split->value_z, qkv, output_gate_flat,
-                            stream);
+                            text_proj_pair_policy(split->query_key, phase), workspace, stream);
         return;
     }
     const Weight& fused =
@@ -226,7 +259,7 @@ void Variant::gdn_input_projection_record(const Tensor& hidden, const GdnProject
 void Variant::gdn_output_projection(const Tensor& hidden, const Weight& weight, Tensor& residual,
                                     qwen3_8::TextPhase, WorkspaceArena& workspace,
                                     cudaStream_t stream) {
-    ops::linear_add(hidden, weight, residual, text_policy(weight), workspace, stream);
+    ops::linear_add(hidden, weight, residual, text_linear_add_policy(weight), workspace, stream);
 }
 
 void Variant::gdn_norm_control_projection(const Tensor& residual, const Tensor& norm_weight,
@@ -242,10 +275,11 @@ void Variant::post_mixer(const Tensor& hidden, const PostMixerWeights& weights, 
                          qwen3_8::TextPhase, WorkspaceArena& workspace, cudaStream_t stream) {
     auto scope        = workspace.scope();
     Tensor activation = workspace.alloc(DType::BF16, {TextConfig::intermediate, hidden.ne[1]});
-    ops::linear_swiglu(hidden, weights.gate_up, activation, text_policy(weights.gate_up), workspace,
+    ops::linear_swiglu(hidden, weights.gate_up, activation, text_swiglu_policy(weights.gate_up),
+                       workspace,
                        stream);
-    ops::linear_add(activation, weights.down, residual, text_policy(weights.down), workspace,
-                    stream);
+    ops::linear_add(activation, weights.down, residual, text_linear_add_policy(weights.down),
+                    workspace, stream);
 }
 
 void Variant::mtp_post_mixer(const Tensor& hidden, const MtpPostMixerWeights& weights,
@@ -291,7 +325,8 @@ std::size_t Variant::attention_projection_workspace_capacity_bytes(WeightsProfil
     switch (weights_profile) {
     case WeightsProfile::GroupwiseInt:
     case WeightsProfile::GroupwiseIntW8Endpoints:
-        return 0;
+        return ops::attn_input_proj_workspace_capacity_bytes(
+            TextConfig::hidden, ops::LinearPolicy::AllowA8, first, last);
     case WeightsProfile::Nvfp4:
         return ops::attn_input_proj_workspace_capacity_bytes(
             QType::NVFP4, 14336, TextConfig::hidden, kNvfp4TextPolicy, first, last);
@@ -307,7 +342,7 @@ std::size_t Variant::attention_output_projection_workspace_capacity_bytes(
     case WeightsProfile::GroupwiseIntW8Endpoints:
         return ops::linear_add_workspace_capacity_bytes(QType::Q5G64_F16S, TextConfig::hidden,
                                                         TextConfig::query_size,
-                                                        ops::LinearPolicy::A16Only, first, last);
+                                                        ops::LinearPolicy::AllowA8, first, last);
     case WeightsProfile::Nvfp4:
         return ops::linear_add_workspace_capacity_bytes(QType::NVFP4, TextConfig::hidden,
                                                         TextConfig::query_size, kNvfp4TextPolicy,
@@ -324,7 +359,8 @@ std::size_t Variant::gdn_input_projection_workspace_capacity_bytes(WeightsProfil
     switch (weights_profile) {
     case WeightsProfile::GroupwiseInt:
     case WeightsProfile::GroupwiseIntW8Endpoints:
-        return 0;
+        return ops::gdn_input_proj_workspace_capacity_bytes(
+            TextConfig::hidden, ops::LinearPolicy::AllowA8, first, last);
     case WeightsProfile::Nvfp4:
         return ops::gdn_input_proj_workspace_capacity_bytes(QType::NVFP4, 16384, TextConfig::hidden,
                                                             kNvfp4TextPolicy, first, last);
@@ -379,7 +415,7 @@ std::size_t Variant::gdn_output_projection_workspace_capacity_bytes(WeightsProfi
     case WeightsProfile::GroupwiseIntW8Endpoints:
         return ops::linear_add_workspace_capacity_bytes(QType::Q5G64_F16S, TextConfig::hidden,
                                                         TextConfig::value_dim,
-                                                        ops::LinearPolicy::A16Only, first, last);
+                                                        ops::LinearPolicy::AllowA8, first, last);
     case WeightsProfile::Nvfp4:
         return ops::linear_add_workspace_capacity_bytes(
             QType::NVFP4, TextConfig::hidden, TextConfig::value_dim, kNvfp4TextPolicy, first, last);
@@ -399,18 +435,21 @@ std::size_t Variant::post_mixer_workspace_capacity_bytes(WeightsProfile weights_
     validate_token_interval(first, last);
     QType gate_up_qtype;
     QType down_qtype;
-    ops::LinearPolicy policy;
+    ops::LinearPolicy gate_up_policy;
+    ops::LinearPolicy down_policy;
     switch (weights_profile) {
     case WeightsProfile::GroupwiseInt:
     case WeightsProfile::GroupwiseIntW8Endpoints:
-        gate_up_qtype = QType::Q4G64_F16S;
-        down_qtype    = QType::Q5G64_F16S;
-        policy        = ops::LinearPolicy::A16Only;
+        gate_up_qtype  = QType::Q4G64_F16S;
+        down_qtype     = QType::Q5G64_F16S;
+        gate_up_policy = ops::LinearPolicy::AllowA8;
+        down_policy    = ops::LinearPolicy::AllowA8;
         break;
     case WeightsProfile::Nvfp4:
-        gate_up_qtype = QType::NVFP4;
-        down_qtype    = QType::NVFP4;
-        policy        = kNvfp4TextPolicy;
+        gate_up_qtype  = QType::NVFP4;
+        down_qtype     = QType::NVFP4;
+        gate_up_policy = kNvfp4TextPolicy;
+        down_policy    = kNvfp4TextPolicy;
         break;
     default:
         throw std::invalid_argument("qwen3_8_27b: invalid weights profile");
@@ -420,12 +459,13 @@ std::size_t Variant::post_mixer_workspace_capacity_bytes(WeightsProfile weights_
     {
         auto scope = layout.scope();
         (void)layout.alloc_bytes(ops::linear_swiglu_workspace_capacity_bytes(
-            gate_up_qtype, 2 * TextConfig::intermediate, TextConfig::hidden, policy, first, last));
+            gate_up_qtype, 2 * TextConfig::intermediate, TextConfig::hidden, gate_up_policy, first,
+            last));
     }
     {
         auto scope = layout.scope();
         (void)layout.alloc_bytes(ops::linear_add_workspace_capacity_bytes(
-            down_qtype, TextConfig::hidden, TextConfig::intermediate, policy, first, last));
+            down_qtype, TextConfig::hidden, TextConfig::intermediate, down_policy, first, last));
     }
     return layout.peak_bytes(1);
 }

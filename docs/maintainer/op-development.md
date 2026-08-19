@@ -162,6 +162,37 @@ typed assignment or a copy with cast, transpose, concat, scatter, remap, or anot
 mapping is the corresponding Op. An interface expressed only as addresses, byte count, and transfer
 direction is a core or host transfer.
 
+### 2.1 Activation-compute profiles
+
+An Op may admit more than one activation-compute profile behind an explicit `LinearPolicy`
+parameter. `A16Only` keeps the BF16 activation catalog. `AllowA8` additionally admits routes that
+quantize the activation to group-64 symmetric INT8 before the tensor-core contraction; `AllowA4` is
+the NVFP4 equivalent. The profile is a semantic parameter of the call, not an execution resource:
+it changes the observable result and must be chosen by the caller.
+
+Quantizing the activation inside a route is a **declared semantic boundary**, not a bit-exact
+transform of the A16 route. It follows the same oracle rule as every other Op — one independent
+naive FP32/FP64 evaluation of the complete logical formula from the represented public inputs — but
+is checked against that oracle with a criterion belonging to its own profile. A measured example
+from the Qwen3.8-27B groupwise-int routes: relative Frobenius error 1.59e-02 for A8 against
+2.97e-03 for BF16 on the same oracle and shapes. Do not widen an A16 criterion to accommodate an A8
+route; give the A8 profile its own.
+
+Two rules constrain where such a route may be registered.
+
+- **Phase.** Admit a lossy activation profile only where the product tolerates it. The 27B target
+  admits `AllowA8` in prefill and keeps `A16Only` for decode and speculative verify, so committed
+  decode numerics are bit-identical to the A16 catalog and CUDA Graph capture is unaffected.
+- **Call invariance.** Within an admitted profile, the route catalog must not be split by token
+  count. A token's output must not depend on the width of the call that produced it or on the
+  column it occupied, because prefix reuse re-indexes the first uncached token to column 0 and
+  replays a cached prefix against a differently sized call. Register one route across the whole
+  token range of the profile, and assert the invariance in the Op test rather than assuming it.
+
+A profile that moves observable model output requires a stated accuracy gate and a stated
+limitation where that gate was not run. Route-level oracle agreement is not by itself evidence that
+end-to-end model behavior is preserved.
+
 ## 3. Contract headers
 
 Repository-internal contracts live in:

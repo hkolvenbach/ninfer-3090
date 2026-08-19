@@ -1,11 +1,13 @@
 #include "ninfer/ops/attn_input_proj.h"
 
+#include "core/arena.h"
 #include "ops/direct_bf16_weight.h"
 #include "ops/input_projection_test_common.h"
 
 #include <cuda_runtime.h>
 
 #include <algorithm>
+#include <cstddef>
 #include <cstdint>
 #include <iostream>
 #include <span>
@@ -23,6 +25,10 @@ namespace {
 // This criterion belongs to the complete A16 attention-input-projection Op.
 constexpr ReductionCriterion kAttnInputProjA16Tolerance{2.9e-3, 4.0e-3, 4.5e-3};
 constexpr ReductionCriterion kAttnInputProjA4Tolerance{0.16, 1.0 / 256.0, 0.16};
+// Group-64 symmetric INT8 activations. The criterion belongs to the A8 compute
+// profile, not to A16: quantizing the activation to 8 bits is a declared
+// semantic boundary of that profile.
+constexpr ReductionCriterion kAttnInputProjA8Tolerance{4.0e-2, 2.0e-2, 5.0e-2};
 // Retain the original seven grid points while stabilizing the distribution-level A4 criterion.
 constexpr std::int32_t kA4SampleRows = 31;
 
@@ -43,7 +49,7 @@ int verify_output(std::string_view label, const GuardedBf16Tensor& output,
 }
 
 int run_q4_q5_case(DevicePackedWeight& query_key, DevicePackedWeight& gate_value,
-                   std::int32_t tokens) {
+                   std::int32_t tokens, ops::LinearPolicy policy = ops::LinearPolicy::A16Only) {
     constexpr std::int32_t kHidden      = 5120;
     constexpr std::int32_t kQRows       = 6144;
     constexpr std::int32_t kKvRows      = 1024;
@@ -60,23 +66,81 @@ int run_q4_q5_case(DevicePackedWeight& query_key, DevicePackedWeight& gate_value
     Tensor g = gate.tensor();
     Tensor k = key.tensor();
     Tensor v = value.tensor();
-    ops::attn_input_proj(x, query_key.view(), gate_value.view(), q, g, k, v, nullptr);
+    const bool a8 = policy == ops::LinearPolicy::AllowA8;
+    if (a8) {
+        const std::size_t bytes =
+            ops::attn_input_proj_workspace_capacity_bytes(kHidden, policy, tokens, tokens);
+        WorkspaceArena workspace(std::max<std::size_t>(bytes, 256));
+        ops::attn_input_proj(x, query_key.view(), gate_value.view(), q, g, k, v, policy, workspace,
+                             nullptr);
+    } else {
+        ops::attn_input_proj(x, query_key.view(), gate_value.view(), q, g, k, v, nullptr);
+    }
     cuda_synchronize();
 
-    const std::string suffix = " Q4/Q5 A16 T=" + std::to_string(tokens);
-    int failures             = 0;
+    const ReductionCriterion& criterion =
+        a8 ? kAttnInputProjA8Tolerance : kAttnInputProjA16Tolerance;
+    const std::string suffix =
+        std::string(a8 ? " Q4/Q5 A8 T=" : " Q4/Q5 A16 T=") + std::to_string(tokens);
+    int failures = 0;
     failures += verify_output("attn q" + suffix, query, query_key.host, 0, kQRows, activation,
-                              kHidden, tokens);
+                              kHidden, tokens, criterion);
     failures += verify_output("attn k" + suffix, key, query_key.host, kQRows, kKvRows, activation,
-                              kHidden, tokens);
+                              kHidden, tokens, criterion);
     failures += verify_output("attn gate" + suffix, gate, gate_value.host, 0, kQRows, activation,
-                              kHidden, tokens);
+                              kHidden, tokens, criterion);
     failures += verify_output("attn value" + suffix, value, gate_value.host, kQRows, kKvRows,
-                              activation, kHidden, tokens);
+                              activation, kHidden, tokens, criterion);
     failures += verify_preserved("attn x" + suffix, device_activation, activation_bits);
     failures += query_key.verify_preserved("attn query/key" + suffix);
     failures += gate_value.verify_preserved("attn gate/value" + suffix);
     return failures;
+}
+
+// Prefix reuse replays a cached prefix by re-indexing the first uncached token
+// to column 0, so the A8 route must be bitwise independent of both the width of
+// the call and the column a token lands in. A route catalog that split A8 by
+// token count, or a schedule chosen from T, would break this.
+int verify_call_invariance(DevicePackedWeight& query_key, DevicePackedWeight& gate_value) {
+    constexpr std::int32_t kHidden = 5120;
+    constexpr std::int32_t kQRows = 6144, kKvRows = 1024;
+    constexpr std::int32_t kWide = 260, kNarrow = 128;
+    const std::vector<float> activation = make_bf16_activation(kHidden, kWide, 7U);
+    const std::vector<std::uint16_t> bits = bf16_bits(activation);
+    DeviceBuffer dev = to_device(bits);
+    std::vector<std::vector<std::uint16_t>> captured;
+    // Arm A: tokens 4..131 sitting at columns 4..131 of a 260-wide call.
+    // Arm B: the same tokens re-indexed to columns 0..127 of a 128-wide call,
+    // exactly as prefix reuse re-indexes the first uncached token to column 0.
+    constexpr std::int32_t kShift = 4;
+    std::vector<std::uint16_t> shifted(
+        bits.begin() + static_cast<std::ptrdiff_t>(kShift) * kHidden, bits.end());
+    DeviceBuffer dev_shifted = to_device(shifted);
+    for (int arm = 0; arm < 2; ++arm) {
+        const std::int32_t T = arm == 0 ? kWide : kNarrow;
+        GuardedBf16Tensor query(kQRows, T), gate(kQRows, T), key(kKvRows, T), value(kKvRows, T);
+        Tensor x(arm == 0 ? dev.p : dev_shifted.p, DType::BF16, {kHidden, T});
+        Tensor q = query.tensor(), g = gate.tensor(), k = key.tensor(), v = value.tensor();
+        const std::size_t bytes = ops::attn_input_proj_workspace_capacity_bytes(
+            kHidden, ops::LinearPolicy::AllowA8, T, T);
+        WorkspaceArena ws(std::max<std::size_t>(bytes, 256));
+        ops::attn_input_proj(x, query_key.view(), gate_value.view(), q, g, k, v,
+                             ops::LinearPolicy::AllowA8, ws, nullptr);
+        cuda_synchronize();
+        captured.push_back(query.bits());
+    }
+    std::size_t diff = 0;
+    const std::size_t n = static_cast<std::size_t>(kQRows) * kNarrow;
+    for (std::size_t i = 0; i < n; ++i) {
+        const std::size_t a = static_cast<std::size_t>(kQRows) * kShift + i;
+        if (captured[0][a] != captured[1][i]) { ++diff; }
+    }
+    if (diff != 0) {
+        std::cerr << "attn Q4/Q5 A8: " << diff << " of " << n
+                  << " outputs changed when the same tokens were re-indexed\n";
+        return 1;
+    }
+    return 0;
 }
 
 int run_q4_q5() {
@@ -87,9 +151,14 @@ int run_q4_q5() {
     DevicePackedWeight gate_value(
         quantized_weight::make_patterned_weight(QType::Q5G64_F16S, kParent, kHidden, 107U));
 
-    int failures = 0;
+    int failures = verify_call_invariance(query_key, gate_value);
     for (const std::int32_t tokens : {1, 2, 16, 17, 21, 48}) {
         failures += run_q4_q5_case(query_key, gate_value, tokens);
+    }
+    // AllowA8 shares the T <= 16 route with A16 and takes the INT8 jobs above
+    // it; both the exact (64-row/64-column) and masked tile shapes are covered.
+    for (const std::int32_t tokens : {1, 16, 17, 21, 48, 64, 128, 257}) {
+        failures += run_q4_q5_case(query_key, gate_value, tokens, ops::LinearPolicy::AllowA8);
     }
     return failures;
 }

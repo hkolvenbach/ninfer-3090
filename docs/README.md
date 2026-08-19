@@ -57,6 +57,15 @@ Artifact and model references:
 - [Qwen3.6-35B-A3B model semantics](maintainer/qwen3.6-35b-a3b-model.md)
 - [Qwen3.6-35B-A3B artifact contracts](maintainer/qwen3.6-35b-a3b-artifact.md)
 
+Work record:
+
+- [Prefill throughput plan (sm_89 / Qwen3.8-27B `groupwise-int`)](maintainer/prefill-throughput-plan.md)
+  holds the roofline analysis, per-kernel budgets, INT8 route design, tuning sweeps, and the
+  measured reasons the GQA head-packing and SwiGLU-fusion levers were closed. Its stable
+  conclusions are mirrored into `performance.md`, `maintainer/op-development.md`,
+  `maintainer/linear-benchmark.md`, and `maintainer/softmax-attention.md`, which are the
+  authorities; this file is the supporting detail.
+
 Pending migration plan:
 
 - [Softmax Attention organization and migration](maintainer/softmax-attention.md) describes the

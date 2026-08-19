@@ -640,3 +640,47 @@ runtime registry、通用 mask IR 或 backend interface 不属于扩展性，而
 - 两个注册目标的 Text、Vision、MTP、DFlash、prefix reuse 和 CUDA Graph 路径保持支持；
 - 受影响文档和命令使用新名称，除本文的迁移映射外没有陈旧引用；
 - 相关公共 benchmark 证明迁移未造成目标路径的性能回退，或对有意的性能变化给出直接证据。
+
+## 11. GQA prefill head packing on `sm_89`: evaluated and rejected
+
+`gqa_attention_prefill_i8_kernel` launches `grid = (ceil(T/64), 24 q_heads)`. With `q_heads=24` and
+`kv_heads=4`, six CTAs independently stream, unpack, and stage the same K/V history for each KV
+head. Packing the GQA group into one CTA so each decoded tile serves all six query heads was
+evaluated on RTX 4090 and **rejected on measurement**. Recorded so it is not re-proposed from the
+grid shape alone.
+
+**The redundancy is smaller than it looks.** `--kv-dtype int8` removes the packed-4-bit unpack and
+both Hadamard rotations outright. Against `rk4v4-e8` at a 115,125-token prompt with capacity matched
+across both arms, that is worth 26.4 µs/token — 5.7% of prefill, or 16.5% of the attention kernel.
+Head packing removes only the *redundancy* in that work, not the work, so at a 3× stream reduction
+its ceiling is about 3.9% end-to-end.
+
+Attention is also not bandwidth bound here: `int8` doubles the KV bytes read and is still 6% faster
+overall, so the binding cost is the unpack ALU work that the figure above already measures.
+
+**The natural configuration does not fit.** At `Br=64, Bc=64` the kernel uses 93,696 B of the
+~101,376 B Ada limit: Q 17,408 + K 16,384 + V 16,384 + V-FP16-staging 32,768 + P 8,192 +
+scales/stats 2,560. Packing `H` query heads multiplies Q, P and the per-row stats by `H`, so
+`Br=32, H=6, Bc=64` needs 115,200 B.
+
+**The V staging buffer cannot be reclaimed.** In the PV loop the V fragment coordinates depend on
+the k-step, the lane, and `d_slice`, but not on `row_tile`, so the four warps sharing a `d_slice`
+read the same V fragments and the staging buffer dequantizes each element once for all four.
+Feeding the MMA directly would dequantize it four times, and the fragments are transposed
+(`ldmatrix_x2_t`), which is what the shared-memory round trip provides. V is roughly half the decode
+cost, so that trade is strongly negative.
+
+**The only fitting configuration carries a measured penalty.** `Br=32, H=6, Bc=32` fits at 86,016 B.
+Measuring `Bc` alone on the existing kernel at `H=1`: `Bc=64` gives 2,407.4 tok/s and `Bc=32` gives
+2,306.0 tok/s, a **4.2% loss**. Halving the KV tile doubles the tile count and with it the barriers,
+the per-tile alpha rescale of the output accumulator, and the softmax running-state updates. Under
+`H=6` the barrier share amortizes across six heads, but the alpha rescale and softmax updates scale
+with `H` and do not. Against a 3.9% ceiling that leaves roughly +2 to +3%, with the downside case at
+zero, in exchange for rewriting a warp-specialized kernel with paired producers, swizzled Q/K/P
+layouts, cross-warp stats exchange, and an Ada-specific FP16 PV accumulate.
+
+The kernel does have unexploited headroom — with `int8` KV and no unpack at all it still runs at
+about 41% of its blended INT8-QK/FP16-acc-PV ceiling. That loss is barrier and softmax structure,
+not KV decode, so it is a different problem from head packing and nothing measured here predicts
+what addressing it would return. `ncu` counters are unavailable on that box
+(`RmProfilingAdminOnly: 1`), so it should not be attempted blind.
