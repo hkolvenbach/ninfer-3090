@@ -262,6 +262,7 @@ GenerationService::GenerationService(ServeOptions options, LoadProgress load_pro
     engine_options.prefix_checkpoint_policy = options_.prefix_checkpoint_policy;
     engine_options.continuation_cache   = options_.continuation_cache;
     engine_options.enable_vision        = options_.enable_vision;
+    engine_options.vision_max_tokens    = options_.vision_max_tokens;
     engine_options.use_cuda_graph       = options_.use_cuda_graph;
     engine_options.speculative          = options_.speculative;
     engine_options.load_progress        = std::move(load_progress);
@@ -440,6 +441,8 @@ GenerationOutcome GenerationService::run(PreparedRequest& prepared, const Stream
     outcome.completion_tokens = static_cast<int>(result.generated_token_ids.size());
     outcome.reasoning_tokens  = static_cast<int>(result.reasoning_tokens);
     outcome.finish_reason     = result.finish_reason;
+    outcome.id_slot           = result.slot;
+    outcome.session_digest    = std::move(result.session_digest);
 
     outcome.metrics.prepare_seconds = prepared.prepare_seconds;
     outcome.metrics.ttft_seconds =

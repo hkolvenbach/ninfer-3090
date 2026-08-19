@@ -128,11 +128,13 @@ private:
 
     friend class FrontendTestAccess;
     friend Frontend make_frontend(const FrontendResources& resources, bool vision_enabled,
+                                  std::uint32_t vision_max_tokens,
                                   PrefixCheckpointPolicy prefix_checkpoint_policy);
 };
 
 [[nodiscard]] Frontend make_frontend(
     const FrontendResources& resources, bool vision_enabled,
+    std::uint32_t vision_max_tokens                 = 8192,
     PrefixCheckpointPolicy prefix_checkpoint_policy = PrefixCheckpointPolicy::RollingTool);
 
 } // namespace ninfer::targets::qwen3_8

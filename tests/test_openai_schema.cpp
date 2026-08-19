@@ -702,6 +702,23 @@ int test_response_serialization() {
     failures +=
         check(jr.at("choices").at(0).at("message").at("reasoning_content") == "let me think",
               "reasoning_content carried");
+
+    // Slot identity is omitted entirely until set, then emitted top-level next to timings.
+    failures += check(!j.contains("id_slot") && !j.contains("session_digest"),
+                      "no slot identity when unset");
+    CompletionUsage slot_usage{10, 3};
+    slot_usage.id_slot        = 1;
+    slot_usage.session_digest = "00ff00ff00ff00ff";
+    const Json js             = Json::parse(
+        make_chat_completion_response("id-3", "m", 111, "hi", "", "stop", slot_usage));
+    failures += check(js.at("id_slot") == 1, "id_slot emitted");
+    failures +=
+        check(js.at("session_digest") == "00ff00ff00ff00ff", "session_digest emitted");
+    const std::string final_chunk = make_chat_chunk_final("id-3", "m", 111, "stop", false,
+                                                          slot_usage);
+    const Json jf = Json::parse(final_chunk.substr(6, final_chunk.size() - 8));
+    failures += check(jf.at("id_slot") == 1 && jf.at("session_digest") == "00ff00ff00ff00ff",
+                      "slot identity on final stream chunk");
     return failures;
 }
 
@@ -812,17 +829,20 @@ int test_tool_chunk_serialization() {
 
 int test_models_and_error() {
     int failures    = 0;
-    const Json list = Json::parse(make_models_list("qwen3.8-27b", 1, 65536));
+    const Json list = Json::parse(make_models_list("qwen3.8-27b", 1, 65536, true));
     failures += check(list.at("object") == "list", "models list object");
     failures += check(list.at("data").at(0).at("id") == "qwen3.8-27b", "models list id");
     failures += check(list.at("data").at(0).at("object") == "model", "models list entry object");
     failures += check(list.at("data").at(0).at("owned_by") == "ninfer", "models list owner");
     failures += check(list.at("data").at(0).at("context_window") == 65536, "models list context");
+    failures += check(list.at("data").at(0).at("modalities").at("vision") == true,
+                      "models list vision modality");
 
-    const Json one = Json::parse(make_model_object("qwen3.8-27b", 1, 65536));
+    const Json one = Json::parse(make_model_object("qwen3.8-27b", 1, 65536, false));
     failures += check(one.at("id") == "qwen3.8-27b" && one.at("object") == "model", "model object");
     failures += check(one.at("owned_by") == "ninfer", "model owner");
     failures += check(one.at("context_window") == 65536, "model object context");
+    failures += check(one.at("modalities").at("vision") == false, "model object vision modality");
 
     ApiError error;
     error.status   = 400;

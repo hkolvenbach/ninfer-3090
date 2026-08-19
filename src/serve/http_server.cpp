@@ -5,15 +5,18 @@
 #include "serve/openai_schema.h"
 #include "serve/request_log.h"
 #include "serve/responses_schema.h"
+#include "serve/slot_files.h"
 #include "serve/translate.h"
 
 #include <nlohmann/json.hpp>
 
 #include <atomic>
 #include <chrono>
+#include <cstdio>
 #include <exception>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -21,6 +24,12 @@
 
 namespace ninfer::serve {
 namespace {
+
+std::string format_seconds(double seconds) {
+    char text[32];
+    std::snprintf(text, sizeof(text), "%.2f", seconds);
+    return text;
+}
 
 struct StreamingRequest {
     explicit StreamingRequest(PreparedRequest request) : prepared(std::move(request)) {}
@@ -60,6 +69,25 @@ ApiError public_internal_error() {
 
 ApiError public_error(ApiError error) {
     return error.status == 500 ? public_internal_error() : std::move(error);
+}
+
+// CompletionUsage carrying the engine's measured phase timings, so the OpenAI
+// schema layer can emit the llama.cpp-compatible `timings` block (llama-swap
+// derives Prefill/Decode rates and draft stats from it).
+CompletionUsage usage_with_timings(const GenerationOutcome& outcome) {
+    CompletionUsage usage;
+    usage.prompt_tokens     = outcome.prompt_tokens;
+    usage.completion_tokens = outcome.completion_tokens;
+    usage.has_timings       = true;
+    usage.prefill_seconds   = outcome.metrics.prefill_seconds;
+    usage.decode_seconds    = outcome.metrics.decode_seconds;
+    usage.ttft_seconds      = outcome.metrics.ttft_seconds;
+    usage.cache_hit_tokens  = outcome.metrics.prefix_cache_hit_tokens;
+    usage.draft_tokens      = outcome.metrics.speculative_draft_tokens;
+    usage.accepted_tokens   = outcome.metrics.speculative_accepted_tokens;
+    usage.id_slot           = outcome.id_slot;
+    usage.session_digest    = outcome.session_digest;
+    return usage;
 }
 
 void write_error(httplib::Response& res, const ApiError& error) {
@@ -401,33 +429,35 @@ void HttpServer::register_routes() {
         res.set_content(metrics_.render(options_.max_concurrency, service_->runtime_stats()),
                         "text/plain; version=0.0.4");
     });
-    // llama.cpp-shaped slot detail. The Engine has no exposed slot table, so
-    // the first `max_concurrency` in-flight requests (FIFO order) count as
-    // processing and the rest of the table reads idle; per-slot cache detail
-    // is unknown mid-flight and reported as zero. A fully idle table keeps
-    // the last completed request's counts on slot 0 - llama.cpp retains slot
-    // state the same way, and scrapers read it as the resident session
-    // depth, which the prefix cache genuinely still holds. With requests in
-    // flight the retained figure is suppressed: it may describe the same
-    // session a busy slot is already reporting, and per-slot attribution is
-    // unknowable without an engine slot table.
+    // llama.cpp-shaped slot detail, read from the Engine's real lane table: a busy lane
+    // reports its request's prompt and reused-prefix sizes; an idle retained lane reports
+    // the resident session's depth (as both tokens and cache, matching llama.cpp's retained
+    // slot) plus its identifying `session_digest`. Before the service attaches (model still
+    // loading) every slot reads idle.
     server_.Get("/slots", [this](const httplib::Request&, httplib::Response& res) {
-        const auto active      = metrics_.active_snapshot();
-        const auto last        = metrics_.last_completed();
-        const bool speculative = options_.speculative.backend != ninfer::SpeculativeBackend::None;
-        nlohmann::json slots   = nlohmann::json::array();
+        const bool speculative =
+            options_.speculative.backend != ninfer::SpeculativeBackend::None;
+        std::vector<ninfer::SlotState> states;
+        if (service_ != nullptr) { states = service_->slot_states(); }
+        nlohmann::json slots = nlohmann::json::array();
         for (std::uint32_t i = 0; i < options_.max_concurrency; ++i) {
-            const bool busy    = i < active.size();
-            const bool retains = active.empty() && i == 0;
-            slots.push_back(
-                {{"id", i},
-                 {"is_processing", busy},
-                 {"n_ctx", options_.max_context},
-                 {"n_prompt_tokens", busy ? active[i].second : (retains ? last.prompt_tokens : 0)},
-                 {"n_prompt_tokens_cache", retains ? last.cached_tokens : 0},
-                 {"speculative", speculative}});
+            const ninfer::SlotState state =
+                i < states.size() ? states[i] : ninfer::SlotState{};
+            slots.push_back({{"id", i},
+                             {"is_processing", state.processing},
+                             {"retained", state.retained},
+                             {"session_digest", state.session_digest},
+                             {"n_ctx", options_.max_context},
+                             {"n_prompt_tokens", state.prompt_tokens},
+                             {"n_prompt_tokens_cache", state.cached_tokens},
+                             {"speculative", speculative}});
         }
         res.set_content(slots.dump(), "application/json");
+    });
+    // llama.cpp-shaped session persistence: POST /slots/{id}?action=save|restore|erase with
+    // {"filename": NAME}. Enabled only by --slot-save-path.
+    server_.Post(R"(/slots/(\d+))", [this](const httplib::Request& req, httplib::Response& res) {
+        handle_slot_action(req, res);
     });
     server_.Get("/v1/models", [this](const httplib::Request& req, httplib::Response& res) {
         handle_models(req, res);
@@ -476,7 +506,8 @@ void HttpServer::register_routes() {
 }
 
 void HttpServer::handle_models(const httplib::Request&, httplib::Response& res) const {
-    res.set_content(make_models_list(public_model_id_, unix_time_now(), options_.max_context),
+    res.set_content(make_models_list(public_model_id_, unix_time_now(), options_.max_context,
+                                     options_.enable_vision),
                     "application/json");
 }
 
@@ -491,8 +522,123 @@ void HttpServer::handle_model(const httplib::Request& req, httplib::Response& re
         write_error(res, error);
         return;
     }
-    res.set_content(make_model_object(public_model_id_, unix_time_now(), options_.max_context),
+    res.set_content(make_model_object(public_model_id_, unix_time_now(), options_.max_context,
+                                      options_.enable_vision),
                     "application/json");
+}
+
+void HttpServer::handle_slot_action(const httplib::Request& req, httplib::Response& res) {
+    const auto fail = [&res](int status, std::string code, std::string message) {
+        ApiError error;
+        error.status  = status;
+        error.type    = status >= 500 ? "server_error" : "invalid_request_error";
+        error.code    = std::move(code);
+        error.message = std::move(message);
+        write_error(res, error);
+    };
+    if (options_.slot_save_path.empty()) {
+        fail(501, "slot_persistence_disabled",
+             "this server was started without --slot-save-path; slot save/restore is disabled");
+        return;
+    }
+    const std::string id_text = req.matches.size() > 1 ? req.matches[1].str() : std::string();
+    std::uint32_t slot        = 0;
+    try {
+        slot = static_cast<std::uint32_t>(std::stoul(id_text));
+    } catch (const std::exception&) {
+        fail(400, "invalid_slot", "slot id is not a number");
+        return;
+    }
+    if (slot >= options_.max_concurrency) {
+        fail(400, "invalid_slot",
+             "slot " + id_text + " is outside this server's " +
+                 std::to_string(options_.max_concurrency) + " slots");
+        return;
+    }
+    const std::string action = req.get_param_value("action");
+
+    // Body: {"filename": NAME} for save/restore, plus optional {"if_digest": DIGEST} on save
+    // and erase - a precondition that the slot still holds the session the client means,
+    // checked atomically with the operation (mismatch = 409 slot_session_mismatch).
+    std::string filename;
+    std::string if_digest;
+    try {
+        const nlohmann::json body =
+            req.body.empty() ? nlohmann::json::object() : nlohmann::json::parse(req.body);
+        filename  = body.value("filename", std::string());
+        if_digest = body.value("if_digest", std::string());
+    } catch (const std::exception&) {
+        fail(400, "invalid_request", "request body is not valid JSON");
+        return;
+    }
+
+    if (action == "erase") {
+        try {
+            const std::uint32_t erased = service_->slot_erase(slot, if_digest);
+            log_line("slot erase id=" + id_text + " n_erased=" + std::to_string(erased));
+            res.set_content(nlohmann::json{{"id_slot", slot}, {"n_erased", erased}}.dump(),
+                            "application/json");
+        } catch (const ninfer::RequestError& engine_error) {
+            fail(409, "slot_busy", engine_error.what());
+        } catch (const ninfer::SlotSessionMismatch& mismatch) {
+            fail(409, "slot_session_mismatch", mismatch.what());
+        }
+        return;
+    }
+    if (action != "save" && action != "restore") {
+        fail(400, "invalid_action", "action must be save, restore, or erase");
+        return;
+    }
+    const std::optional<std::string> sanitized = sanitize_slot_filename(filename);
+    if (!sanitized) {
+        fail(400, "invalid_filename",
+             "filename must be 1-" + std::to_string(kSlotFilenameMaxBytes) +
+                 " chars of [A-Za-z0-9._-] and must not start with a dot");
+        return;
+    }
+    const std::string path = options_.slot_save_path + "/" + *sanitized;
+
+    try {
+        if (action == "save") {
+            const ninfer::SlotSaveResult saved = service_->slot_save(slot, path, if_digest);
+            log_line("slot save id=" + id_text + " file=" + *sanitized +
+                     " n_saved=" + std::to_string(saved.tokens) +
+                     " n_written=" + std::to_string(saved.bytes) +
+                     " session=" + saved.session_digest + " in " +
+                     format_seconds(saved.seconds) + " s");
+            res.set_content(
+                nlohmann::json{{"id_slot", slot},
+                               {"filename", *sanitized},
+                               {"n_saved", saved.tokens},
+                               {"n_written", saved.bytes},
+                               {"session_digest", saved.session_digest},
+                               {"timings", {{"save_ms", saved.seconds * 1000.0}}}}
+                    .dump(),
+                "application/json");
+        } else {
+            const ninfer::SlotRestoreResult restored = service_->slot_restore(slot, path);
+            log_line("slot restore id=" + id_text + " file=" + *sanitized +
+                     " n_restored=" + std::to_string(restored.tokens) +
+                     " n_read=" + std::to_string(restored.bytes) +
+                     " session=" + restored.session_digest + " in " +
+                     format_seconds(restored.seconds) + " s");
+            res.set_content(
+                nlohmann::json{{"id_slot", slot},
+                               {"filename", *sanitized},
+                               {"n_restored", restored.tokens},
+                               {"n_read", restored.bytes},
+                               {"session_digest", restored.session_digest},
+                               {"timings", {{"restore_ms", restored.seconds * 1000.0}}}}
+                    .dump(),
+                "application/json");
+        }
+    } catch (const ninfer::RequestError& engine_error) {
+        fail(409, "slot_busy", engine_error.what());
+    } catch (const ninfer::SlotSessionMismatch& mismatch) {
+        fail(409, "slot_session_mismatch", mismatch.what());
+    } catch (const std::invalid_argument& engine_error) {
+        fail(400, "slot_" + action + "_failed", engine_error.what());
+    }
 }
 
 void HttpServer::handle_chat_completions(const httplib::Request& req, httplib::Response& res) {
@@ -546,7 +692,7 @@ void HttpServer::handle_chat_completions(const httplib::Request& req, httplib::R
                 return req.is_connection_alive && !req.is_connection_alive();
             });
             log_request_done(log_context, outcome);
-            const CompletionUsage usage{outcome.prompt_tokens, outcome.completion_tokens};
+            const CompletionUsage usage = usage_with_timings(outcome);
             std::string response_body;
             if (!outcome.tool_calls.empty()) {
                 response_body = make_chat_completion_tool_response(
@@ -603,6 +749,7 @@ void HttpServer::handle_chat_completions(const httplib::Request& req, httplib::R
 
                 const GenerationOutcome outcome = service_->run(stream->prepared, &output);
                 log_request_done(log_context, outcome);
+                const CompletionUsage usage = usage_with_timings(outcome);
                 const std::string_view remaining = unstreamed_content(outcome);
                 if (!outcome.tool_calls.empty()) {
                     if (!remaining.empty()) {
@@ -614,9 +761,9 @@ void HttpServer::handle_chat_completions(const httplib::Request& req, httplib::R
                     write_stream_item(sink, *stream,
                                       make_chat_chunk_tool_calls(
                                           id, model, created, outcome.tool_calls, include_usage));
-                    write_stream_item(
-                        sink, *stream,
-                        make_chat_chunk_final(id, model, created, "tool_calls", include_usage));
+                    write_stream_item(sink, *stream,
+                                      make_chat_chunk_final(id, model, created, "tool_calls",
+                                                            include_usage, usage));
                 } else {
                     if (tool_capable && !remaining.empty()) {
                         write_stream_item(sink, *stream,
@@ -628,10 +775,9 @@ void HttpServer::handle_chat_completions(const httplib::Request& req, httplib::R
                         sink, *stream,
                         make_chat_chunk_final(id, model, created,
                                               finish_reason_wire(outcome.finish_reason),
-                                              include_usage));
+                                              include_usage, usage));
                 }
                 if (include_usage) {
-                    const CompletionUsage usage{outcome.prompt_tokens, outcome.completion_tokens};
                     write_stream_item(sink, *stream,
                                       make_chat_chunk_usage(id, model, created, usage));
                 }

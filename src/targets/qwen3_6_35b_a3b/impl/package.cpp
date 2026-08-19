@@ -92,6 +92,7 @@ Package::Frontend Package::make_frontend(const LoadedModel& model,
     if (model.impl_ == nullptr) { throw std::invalid_argument("loaded model is empty"); }
     return qwen3_8::make_frontend(model.impl_->data.frontend,
                                   model.impl_->data.runtime.features.vision,
+                                  model.impl_->data.runtime.features.vision_max_tokens,
                                   prefix_checkpoint_policy);
 }
 

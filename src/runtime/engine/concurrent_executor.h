@@ -13,6 +13,7 @@
 #include "runtime/generation/generation_budget.h"
 #include "targets/qwen3_8/export/ninfer/targets/qwen3_8/frontend.h"
 #include "targets/qwen3_8/export/ninfer/targets/qwen3_8/prepared_prompt.h"
+#include "targets/qwen3_8/export/ninfer/targets/qwen3_8/runtime.h"
 
 #include <algorithm>
 #include <array>
@@ -32,6 +33,7 @@
 #include <span>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <thread>
 #include <unordered_map>
 #include <utility>
@@ -304,6 +306,68 @@ public:
             instance_.program->reset_memory_peaks();
             instance_.request_memory.reset_peak();
         } catch (...) {}
+    }
+
+    // Session persistence entry points. Each claims the execution mutex, so GPU copies land at
+    // a request boundary; the worker resumes as soon as the device round trip completes. A lane
+    // with an active request is refused rather than drained. A non-empty expected_digest is a
+    // precondition on the lane's resident session, checked atomically with the operation.
+    [[nodiscard]] targets::qwen3_8::RetainedSessionSnapshot
+    save_retained_lane(std::uint32_t lane, std::string_view model_binding,
+                       std::string_view expected_digest) {
+        std::scoped_lock lock(execution_mutex_);
+        require_idle_lane(lane);
+        require_session_digest(lane, expected_digest);
+        return instance_.program->save_retained_lane(lane, model_binding);
+    }
+
+    [[nodiscard]] std::pair<std::uint32_t, std::string>
+    restore_retained_lane(std::uint32_t lane, std::span<const std::uint8_t> snapshot,
+                          std::string_view model_binding) {
+        std::scoped_lock lock(execution_mutex_);
+        require_idle_lane(lane);
+        if (instance_.program->has_retained_lane(lane)) {
+            instance_.program->evict_retained_lane(lane);
+            invalidate_lane_plans(lane);
+        }
+        const std::uint32_t tokens =
+            instance_.program->restore_retained_lane(lane, snapshot, model_binding);
+        invalidate_lane_plans(lane);
+        return {tokens, instance_.program->retained_lane_digest(lane)};
+    }
+
+    std::uint32_t erase_retained_lane(std::uint32_t lane, std::string_view expected_digest) {
+        std::scoped_lock lock(execution_mutex_);
+        require_idle_lane(lane);
+        require_session_digest(lane, expected_digest);
+        const std::uint32_t tokens = instance_.program->retained_lane_depth(lane);
+        if (instance_.program->has_retained_lane(lane)) {
+            instance_.program->evict_retained_lane(lane);
+            invalidate_lane_plans(lane);
+        }
+        return tokens;
+    }
+
+    // Truthful per-lane occupancy read at a request boundary: an active request's prompt size,
+    // or the retained session's depth and identifying digest.
+    [[nodiscard]] std::vector<SlotState> slot_states() const {
+        std::scoped_lock lock(execution_mutex_);
+        std::vector<SlotState> states(max_concurrency_);
+        for (std::uint32_t lane = 0; lane < max_concurrency_; ++lane) {
+            SlotState& state    = states[lane];
+            const auto& request = slots_[lane];
+            if (request != nullptr) {
+                state.processing    = true;
+                state.prompt_tokens = request->prompt_summary.prompt_tokens;
+                if (request->begin) { state.cached_tokens = request->begin->reused_prompt_tokens; }
+            } else if (instance_.program->has_retained_lane(lane)) {
+                state.retained       = true;
+                state.prompt_tokens  = instance_.program->retained_lane_depth(lane);
+                state.cached_tokens  = state.prompt_tokens;
+                state.session_digest = instance_.program->retained_lane_digest(lane);
+            }
+        }
+        return states;
     }
 
 private:
@@ -652,6 +716,22 @@ private:
         }
         publication_cv_.notify_all();
         if (publication_worker_.joinable()) { publication_worker_.join(); }
+    }
+
+    void require_idle_lane(std::uint32_t lane) const {
+        if (lane >= max_concurrency_) {
+            throw std::invalid_argument("slot id is outside the Engine lane count");
+        }
+        if (slots_[lane] != nullptr) {
+            throw RequestError(RequestErrorKind::Overloaded, "slot is processing a request");
+        }
+    }
+
+    void require_session_digest(std::uint32_t lane, std::string_view expected_digest) const {
+        if (expected_digest.empty()) { return; }
+        if (instance_.program->retained_lane_digest(lane) != expected_digest) {
+            throw SlotSessionMismatch("slot session does not match if_digest");
+        }
     }
 
     void publish_runtime_stats() {
@@ -1015,6 +1095,9 @@ private:
             result.timings = instance_.program->generation_timings_lane(*request->lane);
             result.timings.prepare_seconds = request->prepare_seconds;
             result.speculative = instance_.program->speculative_stats_lane(*request->lane);
+            result.slot        = static_cast<std::int32_t>(*request->lane);
+            // Empty unless the lane retained the finished session (aborts and cancels clear it).
+            result.session_digest = instance_.program->retained_lane_digest(*request->lane);
         }
         if (request->continuation.source != ContinuationSource::None) {
             request->continuation.final_miss_reason = ContinuationMissReason::None;
@@ -1791,19 +1874,29 @@ private:
         }
     }
 
+    // Lane choice maximizes reusable prefix; ties break toward the lane whose occupation costs
+    // least to replace - an empty lane before any retained session, then the shallowest
+    // retained session - so a fresh request never clobbers a deep resident session while a
+    // cheaper lane is available.
     [[nodiscard]] std::optional<LaneChoice>
     find_admission_lane(const std::shared_ptr<Request>& request) {
         std::optional<LaneChoice> selected;
         std::uint32_t selected_reuse = 0;
+        std::uint32_t selected_cost  = 0;
+        const auto prefer            = [&](std::uint32_t reuse, std::uint32_t cost) {
+            return !selected || reuse > selected_reuse ||
+                   (reuse == selected_reuse && cost < selected_cost);
+        };
         for (std::uint32_t lane = 0; lane < max_concurrency_; ++lane) {
             if (slots_[lane] != nullptr) { continue; }
             ensure_lane_plan(request, lane);
             const Plan& plan          = *request->lane_plans[lane];
             const std::uint32_t reuse = plan.summary().reusable_prompt_tokens;
-            if (instance_.program->can_admit_lane(lane, plan) &&
-                (!selected || reuse > selected_reuse)) {
+            const std::uint32_t cost  = instance_.program->retained_lane_depth(lane);
+            if (instance_.program->can_admit_lane(lane, plan) && prefer(reuse, cost)) {
                 selected       = LaneChoice{.lane = lane};
                 selected_reuse = reuse;
+                selected_cost  = cost;
             }
         }
         if (selected) { return selected; }
@@ -1813,13 +1906,15 @@ private:
             ensure_lane_plan(request, lane);
             const Plan& plan          = *request->lane_plans[lane];
             const std::uint32_t reuse = plan.summary().reusable_prompt_tokens;
+            const std::uint32_t cost  = instance_.program->retained_lane_depth(lane);
             if (instance_.program->can_admit_lane_after_retained_eviction(lane, plan) &&
-                (!selected || reuse > selected_reuse)) {
+                prefer(reuse, cost)) {
                 selected = LaneChoice{
                     .lane           = lane,
                     .evict_retained = true,
                 };
                 selected_reuse = reuse;
+                selected_cost  = cost;
             }
         }
         return selected;

@@ -502,12 +502,16 @@ dense body GEMM Ops, in three stages:
 
 | Configuration | Prefill | Cumulative |
 |---|---:|---:|
-| BF16 routes | 1,701.4 tok/s | 1.000× |
-| INT8 `linear_swiglu` (Q4) | 1,976.4 tok/s | 1.162× |
-| INT8 `linear_add` (Q5) | 2,147.3 tok/s | 1.262× |
-| INT8 `attn_input_proj` + `gdn_input_proj` | **2,409.2 tok/s** | **1.415×** |
+| BF16 routes | 1,739.0 tok/s | 1.000× |
+| INT8 `linear_swiglu` (Q4) | 2,035.9 tok/s | 1.171× |
+| INT8 `linear_add` (Q5) | 2,214.9 tok/s | 1.274× |
+| INT8 `attn_input_proj` + `gdn_input_proj` | **2,496.1 tok/s** | **1.435×** |
 
-`--prefill-chunk 2048` adds a further 0.6% (2,423.2 tok/s); 4096 does not improve on it.
+All four rows are measured on the current build. An earlier ladder taken before the causal-boundary
+split in the attention prefill kernel read 1,701.4 / 1,976.4 / 2,147.3 / 2,409.2 tok/s (1.415×
+cumulative); that split lifted both arms, the BF16 baseline by 2.2% and the INT8 build by 3.6%.
+
+`--prefill-chunk 2048` adds a further 0.6%; 4096 does not improve on it.
 
 ### Activation-compute profile
 

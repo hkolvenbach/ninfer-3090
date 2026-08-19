@@ -614,6 +614,44 @@ Json base_chunk(const std::string& id, const std::string& model, std::int64_t cr
         {"id", id}, {"object", "chat.completion.chunk"}, {"created", created}, {"model", model}};
 }
 
+// llama.cpp-compatible `timings` block: consumed by proxies (llama-swap) to
+// populate per-request Prefill/Decode rates, draft acceptance, cache hits and
+// phase durations. Shape matches llama.cpp's server `timings` JSON so existing
+// metric parsers work unchanged.
+// Slot identity next to `timings`: which lane served the request and, when that lane retained
+// the finished session, its digest - what a client needs to target /slots operations safely.
+void add_slot_identity(Json& payload, const CompletionUsage& usage) {
+    if (usage.id_slot >= 0) { payload["id_slot"] = usage.id_slot; }
+    if (!usage.session_digest.empty()) { payload["session_digest"] = usage.session_digest; }
+}
+
+void add_timings(Json& payload, const CompletionUsage& usage) {
+    if (!usage.has_timings) { return; }
+    Json timings = {
+        {"prompt_n", usage.prompt_tokens},
+        {"predicted_n", usage.completion_tokens},
+        {"prompt_ms", usage.prefill_seconds * 1000.0},
+        {"predicted_ms", usage.decode_seconds * 1000.0},
+    };
+    if (usage.prefill_seconds > 0.0) {
+        timings["prompt_per_second"] = usage.prompt_tokens / usage.prefill_seconds;
+    }
+    if (usage.decode_seconds > 0.0) {
+        timings["predicted_per_second"] = usage.completion_tokens / usage.decode_seconds;
+    }
+    if (usage.ttft_seconds > 0.0) {
+        timings["ttft_ms"] = usage.ttft_seconds * 1000.0;
+    }
+    if (usage.cache_hit_tokens > 0) {
+        timings["cache_n"] = usage.cache_hit_tokens;
+    }
+    if (usage.draft_tokens > 0) {
+        timings["draft_n"]     = usage.draft_tokens;
+        timings["draft_n_accepted"] = usage.accepted_tokens;
+    }
+    payload["timings"] = std::move(timings);
+}
+
 Json tool_calls_json(const std::vector<ToolCall>& tool_calls, bool include_index) {
     Json out = Json::array();
     for (std::size_t i = 0; i < tool_calls.size(); ++i) {
@@ -738,7 +776,7 @@ std::string make_chat_completion_response(const std::string& id, const std::stri
                                           const CompletionUsage& usage) {
     Json message = {{"role", "assistant"}, {"content", content}};
     if (!reasoning.empty()) { message["reasoning_content"] = reasoning; }
-    const Json payload = {
+    Json payload = {
         {"id", id},
         {"object", "chat.completion"},
         {"created", created},
@@ -749,6 +787,8 @@ std::string make_chat_completion_response(const std::string& id, const std::stri
         {"usage", Json{{"prompt_tokens", usage.prompt_tokens},
                        {"completion_tokens", usage.completion_tokens},
                        {"total_tokens", usage.prompt_tokens + usage.completion_tokens}}}};
+    add_timings(payload, usage);
+    add_slot_identity(payload, usage);
     return payload.dump();
 }
 
@@ -761,7 +801,7 @@ std::string make_chat_completion_tool_response(const std::string& id, const std:
                     {"content", content.empty() ? Json(nullptr) : Json(content)},
                     {"tool_calls", tool_calls_json(tool_calls, false)}};
     if (!reasoning.empty()) { message["reasoning_content"] = reasoning; }
-    const Json payload = {
+    Json payload = {
         {"id", id},
         {"object", "chat.completion"},
         {"created", created},
@@ -772,6 +812,8 @@ std::string make_chat_completion_tool_response(const std::string& id, const std:
         {"usage", Json{{"prompt_tokens", usage.prompt_tokens},
                        {"completion_tokens", usage.completion_tokens},
                        {"total_tokens", usage.prompt_tokens + usage.completion_tokens}}}};
+    add_timings(payload, usage);
+    add_slot_identity(payload, usage);
     return payload.dump();
 }
 
@@ -821,11 +863,13 @@ std::string make_chat_chunk_tool_calls(const std::string& id, const std::string&
 
 std::string make_chat_chunk_final(const std::string& id, const std::string& model,
                                   std::int64_t created, const char* finish_reason,
-                                  bool include_usage) {
+                                  bool include_usage, const CompletionUsage& usage) {
     Json payload       = base_chunk(id, model, created);
     payload["choices"] = Json::array(
         {Json{{"index", 0}, {"delta", Json::object()}, {"finish_reason", finish_reason}}});
     if (include_usage) { payload["usage"] = nullptr; }
+    add_timings(payload, usage);
+    add_slot_identity(payload, usage);
     return sse_event(payload);
 }
 
@@ -836,29 +880,33 @@ std::string make_chat_chunk_usage(const std::string& id, const std::string& mode
     payload["usage"]   = Json{{"prompt_tokens", usage.prompt_tokens},
                               {"completion_tokens", usage.completion_tokens},
                               {"total_tokens", usage.prompt_tokens + usage.completion_tokens}};
+    add_timings(payload, usage);
+    add_slot_identity(payload, usage);
     return sse_event(payload);
 }
 
 std::string sse_done() { return "data: [DONE]\n\n"; }
 
 std::string make_models_list(const std::string& model_id, std::int64_t created,
-                             std::uint32_t context_window) {
+                             std::uint32_t context_window, bool vision) {
     const Json payload = {{"object", "list"},
                           {"data", Json::array({Json{{"id", model_id},
                                                      {"object", "model"},
                                                      {"created", created},
                                                      {"owned_by", "ninfer"},
-                                                     {"context_window", context_window}}})}};
+                                                     {"context_window", context_window},
+                                                     {"modalities", Json{{"vision", vision}}}}})}};
     return payload.dump();
 }
 
 std::string make_model_object(const std::string& model_id, std::int64_t created,
-                              std::uint32_t context_window) {
+                              std::uint32_t context_window, bool vision) {
     const Json payload = {{"id", model_id},
                           {"object", "model"},
                           {"created", created},
                           {"owned_by", "ninfer"},
-                          {"context_window", context_window}};
+                          {"context_window", context_window},
+                          {"modalities", Json{{"vision", vision}}}};
     return payload.dump();
 }
 

@@ -24,6 +24,7 @@
 #include <optional>
 #include <span>
 #include <string>
+#include <string_view>
 #include <vector>
 
 namespace ninfer::targets::qwen3_8::detail::NINFER_QWEN38_RUNTIME_NS {
@@ -244,6 +245,13 @@ public:
     [[nodiscard]] bool import_continuation_lane(std::uint32_t lane,
                                                 const cache::ContinuationImage& image,
                                                 const PreparedPromptData& prompt) noexcept;
+    [[nodiscard]] std::uint32_t retained_lane_depth(std::uint32_t lane) const noexcept;
+    [[nodiscard]] std::string retained_lane_digest(std::uint32_t lane) const;
+    [[nodiscard]] qwen3_8::RetainedSessionSnapshot
+    save_retained_lane(std::uint32_t lane, std::string_view model_binding);
+    [[nodiscard]] std::uint32_t restore_retained_lane(std::uint32_t lane,
+                                                      std::span<const std::uint8_t> snapshot,
+                                                      std::string_view model_binding);
     [[nodiscard]] GenerationTimings generation_timings_lane(std::uint32_t lane) const noexcept;
     [[nodiscard]] SpeculativeStats speculative_stats_lane(std::uint32_t lane) const noexcept;
 

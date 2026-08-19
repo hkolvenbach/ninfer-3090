@@ -596,7 +596,7 @@ DecoderState terminal_state(DecoderState state) {
 class Frontend::Impl {
 public:
     Impl(const FrontendResources& resources, bool registered_checkpoint, bool vision_enabled_,
-         PrefixCheckpointPolicy prefix_checkpoint_policy_)
+         std::uint32_t vision_max_tokens_, PrefixCheckpointPolicy prefix_checkpoint_policy_)
         : chat_template(compile_chat_template(resources)),
           tokenizer(std::make_shared<const fi::Tokenizer>(
               fi::TokenizerResources{.tokenizer_json         = resources.tokenizer_json,
@@ -604,6 +604,10 @@ public:
                                      .generation_config_json = resources.generation_config_json})),
           processor(processor_options(resources)), vision_enabled(vision_enabled_),
           prefix_checkpoint_policy(prefix_checkpoint_policy_) {
+        // The vision encode workspace is sized to vision_max_tokens; keep the processor
+        // budget in lockstep so oversized media fails as MediaBudgetExceeded before it
+        // reaches the encoder.
+        if (vision_max_tokens_ > 0) { processor.max_vision_tokens = vision_max_tokens_; }
         if (registered_checkpoint) { validate_registered_tokenizer(*tokenizer); }
         for (const int token : tokenizer->default_stop_token_ids()) {
             if (!tokenizer->is_valid_token(token)) {
@@ -812,14 +816,17 @@ Frontend& Frontend::operator=(Frontend&&) noexcept = default;
 Frontend::~Frontend()                              = default;
 
 Frontend make_frontend(const FrontendResources& resources, bool vision_enabled,
+                       std::uint32_t vision_max_tokens,
                        PrefixCheckpointPolicy prefix_checkpoint_policy) {
-    return Frontend(std::make_shared<const Frontend::Impl>(resources, true, vision_enabled,
-                                                           prefix_checkpoint_policy));
+    return Frontend(std::make_shared<const Frontend::Impl>(
+        resources, true, vision_enabled, vision_max_tokens, prefix_checkpoint_policy));
 }
 
 Frontend FrontendTestAccess::create_component(const FrontendResources& resources,
-                                              bool vision_enabled) {
+                                              bool vision_enabled,
+                                              std::uint32_t vision_max_tokens) {
     return Frontend(std::make_shared<const Frontend::Impl>(resources, false, vision_enabled,
+                                                           vision_max_tokens,
                                                            PrefixCheckpointPolicy::RollingTool));
 }
 

@@ -112,3 +112,67 @@ acceptance at depth. **Deployed config since 2026-08-17: `rk4v4-e8` at the full
 native 262,144 context** - the 24 GB card now serves the same context window as the
 32 GB 5090. `rk2v4-e8` adds slack, not context (262,144 is the model's own limit);
 it stays available for a future vision-plus-long-context profile.
+
+## Second wave (their 2026-08-18 evening push, assessed 2026-08-18)
+
+Sixteen commits (`0a925796..6d3fd165`), all with claimed bit-exact parity and a
+green 84/84 suite on their side. Disposition per group:
+
+- **`--vision-max-tokens` (6d3fd165): ported.** The vision scratchpad drops from a
+  hardcoded 32768 tokens to a configurable default of 8192 and frees about 1.5 GiB.
+  Cherry-picked clean. Their commit leaves the processor budget
+  (`max_vision_tokens`, still 32768) out of sync with the shrunken workspace: a
+  request with 8K-32K image tokens passes the budget check and reaches the
+  undersized encoder. This fork wires the budget to the same limit
+  (`fix(frontend)` follow-up commit), so the failure is a clean
+  `media_budget_exceeded`. With the port, `rk4v4-e8` serves the full native
+  262,144 context with `--vision` at 780 MiB slack - the 208K practical line and
+  the vision-against-context tradeoff are gone.
+- **CUDA-graph allowance tightening (c85db47a): skipped.** They replace their old
+  1 GiB SM86/SM89 per-lane padding with flat 64 MiB (ordinary) / 256-320 MiB (MTP)
+  allowances. This branch already carries the per-topology-class accounting, which
+  measures 8 MiB / 86 MiB for the same profiles - tighter than their new flat
+  values. Their commit is a catch-up, not a win.
+- **Causal-tile partitioned prefill attention (c5f70526): ported 2026-08-19
+  (commit 694e01f0), re-implemented inside the retuned kernel.** Our baseline
+  already skipped masking on interior tiles (`full_score_tile`), so their
+  headline could not transfer whole; what did transfer is the structural split:
+  a FullTile-tagged instantiation of the key-block body with unconditional
+  staging, no masking, and no softmax zero-selects, dispatched per block from a
+  precomputed `n_full_blocks`. Their bf16 kernel and common-header changes were
+  taken verbatim (identical base). Measured on the INT8 `d256-h24-kv4` append
+  shape at W=1024: 144 to 165 TFLOP/s at 32K-224K context (-12 to -13%
+  latency), 200 to 171 us shallow, registers stay at 128 with no spills,
+  84/84 tests bit-exact. End-to-end serve prefill: +1.1% at 51K on INT8 KV
+  (attention wall share of the hybrid-GDN model is only ~10% there and the
+  share grows with depth), within noise on the deployed `rk4v4-e8` mode - E8
+  staging time is lattice-decode compute, not the removed guards. The biggest
+  serve-level beneficiary is the INT8-KV 5090 deployment; porting this to
+  ninfer-5090 is queued.
+- **Q4/Q5/Q6/W8 dequantization micro-optimizations (73f3d7be, 8f298555, b8ddda48,
+  d9d701bc): rejected on measurement (2026-08-19).** All four cherry-pick clean
+  and pass the 84-test suite, but on this Linux CUDA 13.1.2 `sm_89` build they
+  regress the Q4/Q5 MMA rowsplit path hard. Measured medians at T=1024
+  (`ninfer_q5_linear_add_bench --k 17408`, `ninfer_q4_linear_swiglu_bench`,
+  suite shapes):
+
+  | State | Q5 down k=17408 | Fused Q4 swiglu |
+  |---|---:|---:|
+  | pre-wave baseline | 1494.9 us (122.1 TFLOP/s) | 3166.2 us (115.3 TFLOP/s) |
+  | + 73f3d7be (Q4/Q5 hoist) | 1631.2 us (-9.1%) | 3436.5 us (-8.5%) |
+  | + 8f298555, b8ddda48 | 1618.9 us (flat) | 3394.6 us (flat) |
+  | + d9d701bc (shuffle) | 2281.5 us (**-52.6%**) | 3123.1 us (+1.4% net) |
+
+  The suite confirms the pattern on production shapes: `gdn_output_gate` Q5
+  -38 to -49%, `draft_head` Q4 -5 to -9%, vision Q4/Q5 projections -13 to -54%,
+  Q6/W8 and every small-T SIMT path neutral. The only net winner is the fused
+  swiglu at +1.4% (~0.5% end-to-end), and it is inseparable from the losses
+  without splitting the shared decode atoms per kernel. Suspected cause of the
+  mismatch with their results: their WDDM and MSVC commits indicate a Windows
+  toolchain, and the shuffle and `bfe.s32` patterns compile to different SASS
+  there. The picks were dropped from this branch after the bisect.
+- **GDN / conv1d / 2D-memcpy decode-tail work (52fc4aec, fa629318, b860bd5f,
+  fa767237, d520f7bf, cf586d09, 4d79043e): low priority.** Decode on this card
+  measures bandwidth-saturated end to end; expected gain is 1-3%.
+- **Windows WDDM/D3D12 residency and MSVC flags (a35acf6a, aa8a1c98): not
+  applicable.** All `_WIN32`-guarded.

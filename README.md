@@ -115,6 +115,23 @@ docker build --tag ninfer-4090:sm89 .
 
 Then start one of the three profiles. The API is available at `http://127.0.0.1:8080/v1`.
 
+The profiles as written run one generation slot. `--max-concurrency 2` is measured
+and worthwhile on the 4090: the second lane costs about 390 MiB (state pools plus a
+doubled CUDA-graph allowance) while the KV page pool stays shared, so a lone session
+still uses the full context; single-stream decode is unregressed and two sessions
+decode batched at roughly 1.5x aggregate throughput, each lane keeping its own
+resident prefix. Prefill still serializes across lanes, so a deep cold prefill
+delays the other lane's first token.
+
+Extra requests beyond the slots wait in the admission queue, and the queue deadline
+defaults to 30 seconds. A deep prefill can hold a slot longer than that, so
+parallel agent clients would fail with `request_queue_timeout`. The
+`--pending-timeout-ms 600000` line raises the deadline to 10 minutes. On a
+streaming request the timeout arrives as an in-band SSE error event after HTTP 200;
+a client that does not parse error events sees a stream that ends without a
+`finish_reason`. See [docs/serving.md](docs/serving.md) for the full queue
+contract.
+
 ### Text-only, full 262K native context (E8 4-bit KV, default)
 
 The E8 Conway-Sloane lattice KV mode (`rk4v4-e8`, ported from
@@ -142,6 +159,7 @@ ninfer-serve /opt/ninfer/models/qwen3_8_27b.ninfer \
   --host 0.0.0.0 --port 8080 \
   --max-context 262144 --kv-capacity 262144 \
   --max-concurrency 1 --max-pending-requests 16 \
+  --pending-timeout-ms 600000 \
   --prefill-chunk 1024 --kv-dtype rk4v4-e8 \
   --spec mtp --draft-tokens 3 --lm-head-draft \
   --prefix-checkpoint-policy rolling-tool \
@@ -170,6 +188,7 @@ docker run --rm --gpus all --publish 8080:8080 \
   --host 0.0.0.0 --port 8080 \
   --max-context 172032 --kv-capacity 172032 \
   --max-concurrency 1 --max-pending-requests 16 \
+  --pending-timeout-ms 600000 \
   --prefill-chunk 1024 --kv-dtype int8 \
   --spec mtp --draft-tokens 3 --lm-head-draft \
   --continuation-cache l1-l2-l3 \
@@ -178,7 +197,12 @@ docker run --rm --gpus all --publish 8080:8080 \
   --preserve-thinking
 ```
 
-### With vision, 96K context
+### With vision, full 262K context (E8 4-bit KV)
+
+The vision scratchpad defaults to 8192 tokens (`--vision-max-tokens`, ported from
+the same fork as the E8 KV modes) instead of the former hardcoded 32768. The
+smaller scratchpad frees about 1.5 GiB, so the full native context fits next to
+vision on 4-bit keys:
 
 ```bash
 docker run --rm --gpus all --publish 8080:8080 \
@@ -186,15 +210,24 @@ docker run --rm --gpus all --publish 8080:8080 \
   ninfer-4090:sm89 \
   ninfer-serve /opt/ninfer/models/qwen3_8_27b.ninfer \
   --host 0.0.0.0 --port 8080 \
-  --max-context 98304 --kv-capacity 98304 \
+  --max-context 262144 --kv-capacity 262144 \
   --max-concurrency 1 --max-pending-requests 16 \
-  --prefill-chunk 1024 --kv-dtype int8 \
+  --pending-timeout-ms 600000 \
+  --prefill-chunk 1024 --kv-dtype rk4v4-e8 \
   --spec mtp --draft-tokens 3 --lm-head-draft \
   --continuation-cache l1-l2-l3 \
   --continuation-cache-dir /var/cache/ninfer \
   --continuation-cache-filesystem-reserve-mib 4096 \
   --vision --preserve-thinking
 ```
+
+The scratchpad bounds the image tokens per request, not the conversation depth:
+a 51K-token conversation with an attached image completes normally. One
+1024x1024 image costs 1026 vision tokens, so the default fits about seven
+maximum-size images per request. The server rejects a request over the limit
+with `media_budget_exceeded` before the request reaches the encoder. For dense
+video workloads, raise the limit with `--vision-max-tokens`. Each additional
+1024 tokens of scratchpad costs about 62 MiB of VRAM.
 
 ### The tradeoff
 
@@ -205,16 +238,26 @@ KV precision, vision, and maximum context trade against each other on a 24 GB ca
 | Text-only, MTP3 | `rk4v4-e8` | 262144 (256K) | 5.08 GiB | 1.37 GiB |
 | Text-only, MTP3 | `rk2v4-e8` | 262144 (256K) | 4.01 GiB | 2.43 GiB |
 | Text-only, MTP3 | `int8` | 172032 (168K) | 6.31 GiB | 136 MiB |
-| With `--vision`, MTP3 | `int8` | 98304 (96K) | - | ~1 GiB |
+| With `--vision`, MTP3 | `rk4v4-e8` | 262144 (256K) | 5.41 GiB | 780 MiB |
+| With `--vision` (32K scratchpad), MTP3 | `rk2v4-e8` | 262144 (256K) | 5.85 GiB | 329 MiB |
+| With `--vision` (32K scratchpad), MTP3 | `rk4v4-e8` | 212992 (208K) | 6.06 GiB | 108 MiB |
+| With `--vision` (32K scratchpad), MTP3 | `int8` | 98304 (96K) | - | ~1 GiB |
 
 262,144 is the model's own context limit, so `rk2v4-e8` (2-bit keys, 96.2% cosine)
-buys no additional context over `rk4v4-e8` here - only slack, which may matter for a
-future vision-plus-long-context profile. It passes the same retrieval gates
-(single-needle at 260K, 5-needle at 118K, exact code details at 168K) at a 10%
-decode tax (120.5 tok/s on the shallow code probe). The INT8 text-only ceiling is
-near 176K: 172032 starts, and 196608 is rejected at startup with a byte-exact
-deficit. The server validates memory before it listens, so an oversized context
-fails fast instead of at request time.
+buys no additional context over `rk4v4-e8` in the text-only profile - only slack.
+That slack is what pays for vision. With the former hardcoded 32,768-token vision
+scratchpad, vision cost about 2.1 GiB (1.83 GiB of runtime buffers plus a
+0.28 GiB tower): INT8 could only afford it at 96K, 4-bit keys topped out at
+212992, and only 2-bit keys fit the full 262,144. The default 8192-token
+scratchpad cuts the cost to about 0.6 GiB, and the full native 262,144 now fits
+alongside vision on 4-bit keys with 780 MiB of slack. The vision
+modes answer a two-swatch color oracle exactly at temperature 0, including with
+the image buried under 52,700 tokens of text on `rk2v4-e8`. `rk2v4-e8` also passes
+the text retrieval gates (single-needle at 260K, 5-needle at 118K, exact code
+details at 168K) at a 10% decode tax (120.5 tok/s on the shallow code probe). The
+INT8 text-only ceiling is near 176K: 172032 starts, and 196608 is rejected at
+startup with a byte-exact deficit. The server validates memory before it listens,
+so an oversized context fails fast instead of at request time.
 
 For a native build, follow the [Linux build guide](docs/rtx-3090-linux.md) with
 `CMAKE_CUDA_ARCHITECTURES=89` (the default in this fork). The build requires CUDA 12.8 or newer,
@@ -238,8 +281,23 @@ The default build registers only Qwen3.8-27B. Enable the optional Qwen3.6-35B-A3
   (109 to 143 TFLOP/s on the `d256-h24-kv4` INT8 append shape); serve prefill gains 5-7% at
   88K-128K. Needle-in-a-haystack retrieval stays exact at both depths and all 84 suite tests
   pass, which bounds the fp16-accumulation numerics change.
+- **Causal-tile partitioned key-block traversal.** Interior key blocks (wholly below the causal
+  diagonal for the whole CTA tile) run a separate instantiation of the key-block body: KV stages
+  with unconditional copies and the softmax drops its masking selects; boundary blocks keep the
+  exact masked path. The idea comes from the
+  [UDPSendToFailed fork](https://github.com/UDPSendToFailed/ninfer-4090) (c5f70526),
+  re-implemented inside the retuned schedule above. Kernel: 144 to 165 TFLOP/s at 32K-224K
+  context on the INT8 append shape (-12 to -13% latency), register count unchanged, bit-exact.
+  End-to-end this is bounded by the attention wall share of this hybrid-GDN model: about +1%
+  serve prefill at 51K on INT8 KV, within noise on the E8 modes, whose staging time is dominated
+  by lattice decode rather than the removed guards.
 - **`/v1/models` reports `context_window`.** Clients without access to a llama.cpp `/props` or a
   vLLM `max_model_len` can size prompts from the models payload.
+- **llama.cpp-compatible `timings` on chat completions.** Responses and final stream chunks carry
+  a top-level `timings` block (`prompt_n`/`predicted_n`, per-second rates, `ttft_ms`, `cache_n`,
+  `draft_n`/`draft_n_accepted`), so proxies such as llama-swap show per-request prefill and decode
+  rates, MTP draft acceptance, and prefix-cache hits. Contributed by the
+  [shantanusingh16 fork](https://github.com/shantanusingh16/ninfer-4090) of this repository.
 - **`GET /metrics`.** Prometheus counters under llama.cpp-compatible names
   (`llamacpp:prompt_tokens_total`, `llamacpp:prompt_seconds_total`,
   `llamacpp:tokens_predicted_total`, `llamacpp:tokens_predicted_seconds_total`,
@@ -253,9 +311,24 @@ The default build registers only Qwen3.8-27B. Enable the optional Qwen3.6-35B-A3
   automatic exact stable-prefix aliases share fixed system/tool prefixes, and every restore remains
   gated by full artifact/runtime and prepared-prefix identity. See
   [Tiered continuation cache](docs/continuation-cache.md).
-- **`GET /slots`.** A llama.cpp-shaped slot table built from in-flight requests, for dashboards
-  that poll slot state. Entries are HTTP-layer FIFO positions; per-slot cache detail is unknown
-  mid-flight and reported as zero.
+- **`GET /slots`.** A llama.cpp-shaped slot table read from the engine's real lane state: busy
+  slots report their request's prompt and reused-prefix sizes, idle retained slots report the
+  resident session's depth and its identifying `session_digest`. Truthful per-slot attribution
+  holds at any `--max-concurrency`.
+- **Slot session save/restore.** `--slot-save-path DIR` (off by default) enables llama.cpp-style
+  `POST /slots/{id}?action=save|restore|erase`: one idle slot's complete resident session -
+  paged Text and MTP KV, GDN linear-attention state, turn checkpoint, and prefix identity -
+  moves to or from disk, and a restored slot reuses the cache across server restarts instead of
+  re-prefilling (a 6.9k-token session restores in about 0.1 s against a multi-second reprefill).
+  Sessions are identified by a stable `session_digest`; chat completions carry `id_slot` and the
+  digest next to `timings`, and `save`/`erase` accept an `if_digest` precondition checked
+  atomically, so a client always persists exactly the session it means. Restore extends the
+  saved frontier (or its turn checkpoint); the GDN state cannot rewind further, and the DFlash
+  backend is not supported. Details in [docs/serving.md](docs/serving.md).
+- **Reuse-aware lane choice.** When prefix reuse ties (typically zero for a fresh session),
+  admission picks the lane whose occupation costs least to replace - an empty lane before any
+  retained session, then the shallowest - so a burst request no longer evicts a deep resident
+  session while a free lane exists.
 - **NVFP4-A4 test gating.** The A4 activation tests skip on hardware without FP4 tensor cores
   instead of aborting. The full remaining suite passes on the RTX 4090.
 - **E8 lattice KV quantization (ported).** The `rk8v4`/`rk4v4`/`rk4v4-e8`/`rk2v4-e8` KV modes
@@ -265,6 +338,10 @@ The default build registers only Qwen3.8-27B. Enable the optional Qwen3.6-35B-A3
   bit-exactly against the upstream microbenchmark (96.155% / 98.678% cosine); their 1 GiB
   CUDA-graph allowance bump was deliberately not taken (it would evict the INT8 168K profile).
   Method and measurements in [docs/udp-fork-comparison.md](docs/udp-fork-comparison.md).
+- **Configurable vision scratchpad (ported).** `--vision-max-tokens` comes from the same fork
+  and sizes the vision encode workspace (default 8192 tokens, formerly hardcoded 32768). This
+  fork additionally wires the processor media budget to the same limit, so an over-limit
+  request fails as `media_budget_exceeded` instead of reaching an undersized encoder.
 
 ## Known limits on the RTX 4090
 
@@ -277,8 +354,13 @@ The default build registers only Qwen3.8-27B. Enable the optional Qwen3.6-35B-A3
   residency tables (the former hard abort above chunk 1024 is fixed), and chunks through 2688
   stay on split-K. Larger chunks route to the unsplit schedule, which is marginally less
   accurate at its onset (about 1e-5 relative).
-- Concurrency above one request is untested in this fork. The published cohort results in the
+- `--max-concurrency 2` is measured on the 4090 (see Quick start); higher lane counts are
+  untested here, and the published cohort results in the
   [3090 base](https://github.com/Don-Chad/ninfer-3090) do not transfer directly.
+- Prefill is strictly serialized across lanes with no chunk-level interleaving, and decode
+  starves while any prefill runs: a short request submitted behind a 31k-token cold prefill
+  measured a 13.5 s first token. Concurrency pays off for decode and for per-lane resident
+  prefixes, not for prefill fairness.
 - The limits of the base engine apply: one process, one GPU, one model, bounded FIFO admission,
   no multi-GPU execution, no weight offload.
 

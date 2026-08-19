@@ -14,6 +14,12 @@ rejected). Those are the authorities. This file is retained as the supporting re
 derivation, per-kernel budgets, tuning sweeps, and the reasoning behind each closed decision. Where
 it disagrees with a permanent reference, the permanent reference wins.
 
+Every throughput figure below was measured before the causal-boundary split in the attention
+prefill kernel. That split lifted both arms of the ladder, so the absolute numbers here are the
+record of the Phase 1 experiment as it was run, not the current build. The re-measured ladder
+(1,739.0 → 2,496.1 tok/s, **1.435×**) is in `performance.md`. The step ratios and every attribution,
+budget, and rejection argument below are unaffected.
+
 In scope:
 
 - text prefill throughput for `qwen3.8-27b/groupwise-int` on RTX 4090 (`sm_89`, CUDA 13.2);

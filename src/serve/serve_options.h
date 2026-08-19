@@ -26,6 +26,7 @@ struct ServeOptions {
     std::string api_key;                          // empty => no auth
     std::optional<std::string> model_id_override; // unset => artifact identity.model_id
     std::string request_log_jsonl;                // empty => structured request logging disabled
+    std::string slot_save_path;                   // empty => /slots save/restore/erase disabled
     std::uint32_t max_context              = 8192;
     KvCapacityPolicy kv_capacity           = KvCapacityPolicy::explicit_capacity(8192);
     std::uint32_t max_concurrency          = 1;
@@ -41,6 +42,7 @@ struct ServeOptions {
     SpeculativeOptions speculative;
     PrefixCheckpointPolicy prefix_checkpoint_policy = PrefixCheckpointPolicy::RollingTool;
     ContinuationCacheOptions continuation_cache;
+    std::uint32_t vision_max_tokens = 8192;
     bool enable_vision      = false;
     bool use_cuda_graph     = true;
     bool allow_prefix_reuse = true;

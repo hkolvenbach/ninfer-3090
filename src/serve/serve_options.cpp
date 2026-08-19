@@ -109,12 +109,12 @@ std::string serve_usage_text(const char* argv0) {
            "[--model-id ID] [--max-context N] [--kv-capacity N|auto] [--max-concurrency N] "
            "[--max-pending-requests N] [--pending-timeout-ms N] "
            "[--prefill-chunk N] [--log-stats-interval-ms N] [--device N] "
-           "[--max-request-mib N] [--request-log-jsonl FILE] "
+           "[--max-request-mib N] [--request-log-jsonl FILE] [--slot-save-path DIR] "
            "[--response-store-max-records N] [--response-store-max-mib N] "
            "[--kv-dtype bf16|int8|rk8v4|rk4v4|rk4v4-e8|rk2v4-e8] [--spec mtp|dflash --draft-tokens "
            "N] "
            "[--default-max-tokens N] "
-           "[--vision] [--no-cuda-graph] [--no-prefix-reuse] "
+           "[--vision] [--vision-max-tokens N] [--no-cuda-graph] [--no-prefix-reuse] "
            "[--prefix-checkpoint-policy stable-turn|rolling-tool] "
            "[--continuation-cache off|l1|l1-l2|l1-l2-l3] "
            "[--continuation-cache-policy adaptive] [--continuation-cache-dir DIR] "
@@ -136,11 +136,15 @@ std::string serve_usage_text(const char* argv0) {
            " when omitted\n"
            "       --max-request-mib defaults to 384 and is enforced before JSON parsing\n"
            "       --request-log-jsonl appends full-precision server/request records\n"
+           "       --slot-save-path enables llama.cpp-style session persistence: POST "
+           "/slots/{id}?action=save|restore|erase with {\"filename\": NAME} moves one idle "
+           "slot's resident session to or from DIR (disabled when omitted)\n"
            "       --model-id overrides the artifact identity.model_id reported by the server\n"
            "       Responses state is process-local and bounded to 1024 records / 256 MiB by "
            "default\n"
            "       --log-stats-interval-ms defaults to 5000; 0 disables periodic throughput logs\n"
            "       --vision enables media and loads the fixed Vision GPU allocations\n"
+           "       --vision-max-tokens sets the Vision scratchpad token capacity (default 8192)\n"
            "       --kv-capacity auto leaves " +
            std::to_string(kDefaultKvCapacityHeadroomBytes / (1024ULL * 1024ULL)) +
            " MiB of sizing headroom\n"
@@ -234,6 +238,11 @@ ServeOptions parse_serve_options(int argc, char** argv) {
             if (options.request_log_jsonl.empty()) {
                 throw std::invalid_argument("--request-log-jsonl must not be empty");
             }
+        } else if (arg == "--slot-save-path") {
+            options.slot_save_path = require_value("--slot-save-path");
+            if (options.slot_save_path.empty()) {
+                throw std::invalid_argument("--slot-save-path must not be empty");
+            }
         } else if (arg == "--response-store-max-records") {
             const int records = parse_nonnegative_int(require_value("--response-store-max-records"),
                                                       "response-store-max-records");
@@ -264,6 +273,13 @@ ServeOptions parse_serve_options(int argc, char** argv) {
             default_max_tokens_explicit = true;
         } else if (arg == "--vision") {
             options.enable_vision = true;
+        } else if (arg == "--vision-max-tokens" || arg == "--vision-limit") {
+            const int val = parse_nonnegative_int(require_value(arg.c_str()), "vision-max-tokens");
+            if (val <= 0) {
+                throw std::invalid_argument(std::string(arg) + " must be positive");
+            }
+            options.vision_max_tokens = static_cast<std::uint32_t>(val);
+            options.enable_vision     = true;
         } else if (arg == "--no-cuda-graph") {
             options.use_cuda_graph = false;
         } else if (arg == "--no-prefix-reuse") {
