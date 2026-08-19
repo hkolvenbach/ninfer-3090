@@ -353,6 +353,7 @@ RenderedChat CompiledChatTemplate::render(const std::vector<ChatMessage>& messag
     const long last_query_index = last_real_user_query(messages);
     std::optional<std::size_t> stable_turn_byte_offset;
     std::optional<std::size_t> rolling_tool_byte_offset;
+    std::optional<std::size_t> user_turn_byte_offset;
     bool has_completed_tool_history = false;
 
     int image_count = 0;
@@ -369,6 +370,9 @@ RenderedChat CompiledChatTemplate::render(const std::vector<ChatMessage>& messag
         const std::string content = trim_ascii_whitespace(
             message.rendered_content(options.add_vision_id, &image_count, &video_count));
         if (message.role == "user") {
+            if (static_cast<long>(i) == last_query_index) {
+                user_turn_byte_offset = rendered.size();
+            }
             rendered += "<|im_start|>user\n";
             rendered += content;
             rendered += "<|im_end|>\n";
@@ -456,6 +460,7 @@ RenderedChat CompiledChatTemplate::render(const std::vector<ChatMessage>& messag
         .text                              = std::move(rendered),
         .stable_prefix_byte_offset         = stable_prefix_byte_offset,
         .turn_rewrite_byte_offset          = turn_rewrite_byte_offset,
+        .user_turn_byte_offset             = user_turn_byte_offset,
         .checkpoint_hints                  = std::move(checkpoint_hints)};
 }
 

@@ -98,6 +98,7 @@ struct ProcessedInput {
     std::vector<VisionItem> vision_items;
     std::optional<std::uint32_t> stable_prefix_boundary;
     std::optional<std::uint32_t> turn_rewrite_boundary;
+    std::optional<std::uint32_t> user_turn_boundary;
     struct CheckpointHint {
         SemanticCheckpointKind kind = SemanticCheckpointKind::StablePrefix;
         std::uint32_t boundary      = 0;
@@ -112,6 +113,7 @@ struct EncodedChat {
     std::vector<int> input_ids;
     std::optional<std::uint32_t> stable_prefix_boundary;
     std::optional<std::uint32_t> turn_rewrite_boundary;
+    std::optional<std::uint32_t> user_turn_boundary;
     std::vector<ProcessedInput::CheckpointHint> checkpoint_hints;
 };
 

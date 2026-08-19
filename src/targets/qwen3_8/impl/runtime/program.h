@@ -5,6 +5,7 @@
 #include "core/arena.h"
 #include "core/gdn_replay_records.h"
 #include "core/pinned_transfer.h"
+#include "core/linear_attention_state.h"
 #include "ninfer/ops/sampling.h"
 #include "core/decode_graph.h"
 #include "runtime/cache/continuation_cache.h"
@@ -58,6 +59,7 @@ struct RequestBasePlanImpl<NINFER_QWEN38_VARIANT> {
     std::shared_ptr<const qwen3_8::VisionControl> vision_control;
     std::size_t vision_transient_bytes = 0;
     std::optional<std::uint32_t> turn_rewrite_boundary;
+    std::optional<std::uint32_t> user_turn_boundary;
     std::optional<std::uint32_t> stable_prefix_boundary;
     bool allow_prefix_reuse = false;
 };
@@ -74,6 +76,8 @@ struct RequestPlanImpl<NINFER_QWEN38_VARIANT> {
     NINFER_QWEN38_RUNTIME_NS::TurnCheckpointAction turn_checkpoint_action =
         NINFER_QWEN38_RUNTIME_NS::TurnCheckpointAction::Drop;
     std::optional<std::uint32_t> turn_checkpoint_capture_frontier;
+    std::optional<std::uint32_t> user_turn_capture_frontier;
+    bool keep_user_turn_anchor = false;
     std::optional<std::uint32_t> stable_checkpoint_capture_frontier;
     ops::SamplingConfig sampling;
     std::uint32_t text_kv_page_entitlement    = 0;
@@ -113,6 +117,18 @@ enum class Lifecycle : std::uint8_t {
 struct TurnCheckpoint {
     bool valid             = false;
     std::uint32_t frontier = 0;
+};
+
+// Second, host-resident anchor pinned at the opener of the last real user query. The device
+// TurnCheckpoint tracks the newest generation opener and therefore dies whenever a client
+// rewrites the tail of an earlier user message; this one sits upstream of that edit. It is held
+// on the host because it is read at most once per user turn, so a device slot (147 MiB per lane)
+// would buy microseconds that nothing waits for.
+struct UserTurnAnchor {
+    bool valid             = false;
+    std::uint32_t frontier = 0;
+    LinearAttentionStateImage linear_state;
+    std::vector<std::uint8_t> tail_hidden;
 };
 
 struct SequenceKVBundle {
@@ -161,6 +177,7 @@ struct SequenceState {
     bool tail_hidden_valid        = false;
     bool retained                 = false;
     TurnCheckpoint turn_checkpoint;
+    UserTurnAnchor user_turn_anchor;
     std::optional<cache::ContinuationImage> stable_continuation;
 };
 
@@ -179,6 +196,7 @@ struct RequestControl {
         std::unique_ptr<schedule::VisionPrefillSession> vision;
         runtime::TransientRegion transient;
         std::optional<std::uint32_t> turn_checkpoint_capture_frontier;
+        std::optional<std::uint32_t> user_turn_capture_frontier;
         std::optional<std::uint32_t> stable_checkpoint_capture_frontier;
         std::uint32_t base               = 0;
         std::uint32_t cursor             = 0;

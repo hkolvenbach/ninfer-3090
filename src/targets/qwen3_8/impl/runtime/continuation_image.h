@@ -319,9 +319,11 @@ inline std::optional<std::string> stable_alias(
 
 inline std::optional<std::uint32_t>
 next_prefill_checkpoint(std::uint32_t cursor, std::optional<std::uint32_t> stable,
-                        std::optional<std::uint32_t> turn) noexcept {
+                        std::optional<std::uint32_t> turn,
+                        std::optional<std::uint32_t> user_turn) noexcept {
     std::optional<std::uint32_t> next;
     if (stable && *stable > cursor) next = stable;
+    if (user_turn && *user_turn > cursor && (!next || *user_turn < *next)) next = user_turn;
     if (turn && *turn > cursor && (!next || *turn < *next)) next = turn;
     return next;
 }

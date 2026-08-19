@@ -888,6 +888,7 @@ PreparedPrompt Frontend::prepare(PromptInput input) const {
         result.prepare.patch_bytes            = processed.stats.patch_bytes;
         result.identity.stable_prefix_boundary = processed.stable_prefix_boundary;
         result.identity.turn_rewrite_boundary  = processed.turn_rewrite_boundary;
+        result.identity.user_turn_boundary     = processed.user_turn_boundary;
         result.identity.checkpoint_hints.reserve(processed.checkpoint_hints.size());
         for (const fi::ProcessedInput::CheckpointHint& hint : processed.checkpoint_hints) {
             result.identity.checkpoint_hints.push_back(
@@ -900,6 +901,7 @@ PreparedPrompt Frontend::prepare(PromptInput input) const {
         result.token_ids        = std::move(encoded.input_ids);
         result.identity.stable_prefix_boundary = encoded.stable_prefix_boundary;
         result.identity.turn_rewrite_boundary = encoded.turn_rewrite_boundary;
+        result.identity.user_turn_boundary    = encoded.user_turn_boundary;
         result.identity.checkpoint_hints.reserve(encoded.checkpoint_hints.size());
         for (const fi::ProcessedInput::CheckpointHint& hint : encoded.checkpoint_hints) {
             result.identity.checkpoint_hints.push_back(

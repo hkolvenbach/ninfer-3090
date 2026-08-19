@@ -55,6 +55,9 @@ struct PromptIdentity {
     std::optional<std::uint32_t> stable_prefix_boundary;
     // Kept as the single policy-selected rewrite frontier for existing execution paths.
     std::optional<std::uint32_t> turn_rewrite_boundary;
+    // Opener of the last real user query; sits before that message's content so it survives a
+    // client rewriting the message tail (floating synthetic reminders).
+    std::optional<std::uint32_t> user_turn_boundary;
     // Ordered semantic candidates let cache layers retain the stable anchors and rolling history.
     std::vector<PromptCheckpointHint> checkpoint_hints;
 };

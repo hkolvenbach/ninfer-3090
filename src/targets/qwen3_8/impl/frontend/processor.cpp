@@ -33,6 +33,7 @@ void adjust_rendered_boundaries_for_replacement(RenderedChat& rendered, std::siz
     };
     if (rendered.stable_prefix_byte_offset) { adjust(*rendered.stable_prefix_byte_offset); }
     if (rendered.turn_rewrite_byte_offset) { adjust(*rendered.turn_rewrite_byte_offset); }
+    if (rendered.user_turn_byte_offset) { adjust(*rendered.user_turn_byte_offset); }
     for (SemanticCheckpointByteHint& hint : rendered.checkpoint_hints) {
         adjust(hint.byte_offset);
     }
@@ -567,6 +568,10 @@ EncodedChat encode_rendered_chat(const Tokenizer& tokenizer, const RenderedChat&
         encoded.turn_rewrite_boundary =
             encode_boundary(*rendered.turn_rewrite_byte_offset, false, "turn rewrite prefix");
     }
+    if (rendered.user_turn_byte_offset && *rendered.user_turn_byte_offset > 0) {
+        encoded.user_turn_boundary =
+            encode_boundary(*rendered.user_turn_byte_offset, false, "user turn prefix");
+    }
     encoded.checkpoint_hints.reserve(rendered.checkpoint_hints.size());
     std::optional<std::uint32_t> previous;
     for (const SemanticCheckpointByteHint& hint : rendered.checkpoint_hints) {
@@ -651,6 +656,7 @@ ProcessedInput Processor::process(const std::vector<ChatMessage>& messages,
     output.input_ids             = std::move(encoded.input_ids);
     output.stable_prefix_boundary = encoded.stable_prefix_boundary;
     output.turn_rewrite_boundary = encoded.turn_rewrite_boundary;
+    output.user_turn_boundary    = encoded.user_turn_boundary;
     output.checkpoint_hints = std::move(encoded.checkpoint_hints);
     output.token_types.resize(output.input_ids.size(), 0);
     for (std::size_t i = 0; i < output.input_ids.size(); ++i) {

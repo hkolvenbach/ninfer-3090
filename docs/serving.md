@@ -716,16 +716,26 @@ therefore resets the prefix instead of reusing placeholder-token KV. Media wholl
 prefix skips Vision execution, while new suffix media is encoded normally. The completion log
 reports the reused token count as `cache=`.
 
-The shared family runtime distinguishes `full_reset`, `append_frontier`, and
-`restore_turn_checkpoint`. A turn checkpoint includes the recurrent and selected
-speculative-backend continuation state required to recompute a rewritten suffix; matching KV
-tokens alone never authorize a partial hit. The default `rolling-tool` policy replaces that
-checkpoint at the latest generation opener after completed tool-call results, so serial tool loops
-recompute only their newest suffix. `stable-turn` retains the first assistant opener after the last
-real user query, preserving the earlier rewrite anchor used when closed-turn thinking is removed.
-Both policies remain subject to exact prepared-prefix identity. The JSONL completion record exposes
-the selected path as `prefix_reuse_path` and server-start records expose
+The shared family runtime distinguishes `full_reset`, `append_frontier`,
+`restore_turn_checkpoint`, and `restore_user_turn_anchor`. A turn checkpoint includes the recurrent
+and selected speculative-backend continuation state required to recompute a rewritten suffix;
+matching KV tokens alone never authorize a partial hit. The default `rolling-tool` policy replaces
+that checkpoint at the latest generation opener after completed tool-call results, so serial tool
+loops recompute only their newest suffix. `stable-turn` retains the first assistant opener after the
+last real user query, preserving the earlier rewrite anchor used when closed-turn thinking is
+removed. Both policies remain subject to exact prepared-prefix identity. The JSONL completion record
+exposes the selected path as `prefix_reuse_path` and server-start records expose
 `prefix_checkpoint_policy`.
+
+A lane holds a second, independent anchor at the opener of the last real user query, restored as
+`restore_user_turn_anchor`. Both checkpoint policies place their anchor after that message's
+content, so a client that rewrites the tail of an earlier user message - for example one that moves
+a synthetic reminder block onto whichever user message is currently last - invalidates every deeper
+anchor and would otherwise recompute the whole history. The user-turn anchor sits upstream of that
+edit and is stationary for the duration of a turn, so it is captured once when a new user query
+arrives and retained across the tool loop that follows. It is held in host memory rather than a
+device slot because it is read at most once per turn, and it is lane-local: continuation images
+carry no user-turn anchor, and a restored image starts without one.
 Changing reasoning effort changes the rendered prompt and therefore does not reuse a prefix whose
 effort instruction differs.
 

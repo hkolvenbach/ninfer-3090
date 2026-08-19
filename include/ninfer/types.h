@@ -391,6 +391,9 @@ enum class PrefixReusePath : std::uint8_t {
     FullReset,
     AppendAtFrontier,
     RestoreTurnCheckpoint,
+    // Restored from the host-resident anchor at the last user query's opener. Shallower than a
+    // turn checkpoint, but it survives a client rewriting the tail of that message.
+    RestoreUserTurnAnchor,
 };
 
 enum class ContinuationSource : std::uint8_t { None, L1, L2, L3 };

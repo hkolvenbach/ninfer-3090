@@ -523,6 +523,11 @@ runtime::PrefillStepResult ProgramImplCore::start_prefill_lane(std::uint32_t lan
          sequence.turn_checkpoint.frontier != request_plan.reuse_base)) {
         throw std::logic_error("planned turn checkpoint is unavailable");
     }
+    if (request_plan.reuse == ReusePath::RestoreUserTurnAnchor &&
+        (!sequence.user_turn_anchor.valid ||
+         sequence.user_turn_anchor.frontier != request_plan.reuse_base)) {
+        throw std::logic_error("planned user turn anchor is unavailable");
+    }
     if (request_plan.turn_checkpoint_action == TurnCheckpointAction::KeepExisting &&
         (!prompt.identity.turn_rewrite_boundary || !sequence.turn_checkpoint.valid ||
          sequence.turn_checkpoint.frontier != *prompt.identity.turn_rewrite_boundary)) {
@@ -607,10 +612,22 @@ runtime::PrefillStepResult ProgramImplCore::start_prefill_lane(std::uint32_t lan
             trim_sequence_kv(sequence, base, backend_kv_valid(sequence));
             resize_sequence_kv_entitlement(sequence, request_plan.text_kv_page_entitlement,
                                            request_plan.backend_kv_page_entitlement);
-            decoder->linear_attention.copy_slot(
-                LinearStateSlots::turn_checkpoint_state_slot(sequence.lane, max_concurrency),
-                LinearStateSlots::current_state_slot(sequence.lane, max_concurrency),
-                device.stream);
+            if (request_plan.reuse == ReusePath::RestoreUserTurnAnchor) {
+                import_linear_attention_state(
+                    decoder->linear_attention,
+                    LinearStateSlots::current_state_slot(sequence.lane, max_concurrency),
+                    sequence.user_turn_anchor.linear_state, continuation_transfer, device.stream);
+                // The MTP bridge reads the previous hidden from turn_checkpoint_hidden, so the
+                // anchor lands there and the two restore paths stay identical downstream.
+                copy_tensor_to_device(sequence.turn_checkpoint_hidden,
+                                      sequence.user_turn_anchor.tail_hidden, continuation_transfer,
+                                      device.stream);
+            } else {
+                decoder->linear_attention.copy_slot(
+                    LinearStateSlots::turn_checkpoint_state_slot(sequence.lane, max_concurrency),
+                    LinearStateSlots::current_state_slot(sequence.lane, max_concurrency),
+                    device.stream);
+            }
             sequence.ledger.resize(base);
         }
 
@@ -630,6 +647,7 @@ runtime::PrefillStepResult ProgramImplCore::start_prefill_lane(std::uint32_t lan
         if (request_plan.turn_checkpoint_action != TurnCheckpointAction::KeepExisting) {
             sequence.turn_checkpoint = {};
         }
+        if (!request_plan.keep_user_turn_anchor) { sequence.user_turn_anchor = {}; }
         request.timings            = {};
         request.pending            = {};
         sequence.mtp_draft_count   = 0;
@@ -658,6 +676,7 @@ runtime::PrefillStepResult ProgramImplCore::start_prefill_lane(std::uint32_t lan
             .vision                           = nullptr,
             .transient                        = transient,
             .turn_checkpoint_capture_frontier = request_plan.turn_checkpoint_capture_frontier,
+            .user_turn_capture_frontier       = request_plan.user_turn_capture_frontier,
             .stable_checkpoint_capture_frontier =
                 request_plan.stable_checkpoint_capture_frontier,
             .base                             = base,
@@ -1661,7 +1680,11 @@ bool ProgramImplCore::import_continuation_lane(std::uint32_t lane,
         sequence.tail_hidden_valid = true;
         sequence.turn_checkpoint =
             TurnCheckpoint{.valid = boundary.valid, .frontier = boundary.frontier};
-        sequence.retained = true;
+        // A continuation image carries no user-turn anchor. Leaving the previous occupant's
+        // anchor in place would let prefix_matches accept it against the newly restored ledger
+        // and splice in another conversation's recurrent state.
+        sequence.user_turn_anchor = {};
+        sequence.retained         = true;
         request.lifecycle = Lifecycle::Complete;
         return true;
     } catch (...) {
@@ -1696,6 +1719,7 @@ void ProgramImplCore::clear_lane(SequenceState& sequence, RequestControl& reques
     sequence.tail_hidden_valid       = false;
     sequence.retained                = false;
     sequence.turn_checkpoint         = {};
+    sequence.user_turn_anchor        = {};
     sequence.stable_continuation.reset();
     request.pending                  = {};
 }
@@ -2362,9 +2386,11 @@ runtime::PrefillStepResult ProgramImplCore::advance_prefill(SequenceState& seque
                 throw std::logic_error("staged MTP bridge is outside the reusable suffix");
             }
             mark_workspace_usage(workspace_plan.mtp_prefill);
-            const Tensor& previous_hidden = staged.reuse == ReusePath::RestoreTurnCheckpoint
-                                                ? sequence.turn_checkpoint_hidden
-                                                : sequence.tail_hidden;
+            const Tensor& previous_hidden =
+                staged.reuse == ReusePath::RestoreTurnCheckpoint ||
+                        staged.reuse == ReusePath::RestoreUserTurnAnchor
+                    ? sequence.turn_checkpoint_hidden
+                    : sequence.tail_hidden;
             const schedule::MtpBridgeInput bridge{
                 .previous_hidden = &previous_hidden,
                 .position        = checked_i32(staged.base - 1, "MTP bridge position"),
@@ -2398,7 +2424,8 @@ runtime::PrefillStepResult ProgramImplCore::advance_prefill(SequenceState& seque
             const std::optional<std::uint32_t> capture_frontier =
                 image::next_prefill_checkpoint(staged.cursor,
                                                staged.stable_checkpoint_capture_frontier,
-                                               staged.turn_checkpoint_capture_frontier);
+                                               staged.turn_checkpoint_capture_frontier,
+                                               staged.user_turn_capture_frontier);
             if (staged.vision) {
                 mark_workspace_usage(workspace_plan.vision_encode);
                 result = schedule::prefill_multimodal_chunk(
@@ -2421,6 +2448,21 @@ runtime::PrefillStepResult ProgramImplCore::advance_prefill(SequenceState& seque
             if (staged.prepare_mtp) { sequence.mtp_kv_valid = staged.cursor; }
             if (speculative_backend == SpeculativeBackend::DFlash) {
                 sequence.dflash_context_frontier = staged.cursor;
+            }
+
+            if (staged.user_turn_capture_frontier &&
+                staged.cursor == *staged.user_turn_capture_frontier) {
+                UserTurnAnchor anchor;
+                anchor.linear_state = export_linear_attention_state(
+                    decoder->linear_attention,
+                    LinearStateSlots::turn_checkpoint_state_slot(sequence.lane, max_concurrency),
+                    continuation_transfer, device.stream);
+                anchor.tail_hidden = copy_tensor_to_host(sequence.turn_checkpoint_hidden,
+                                                         continuation_transfer, device.stream);
+                anchor.frontier          = staged.cursor;
+                anchor.valid             = true;
+                sequence.user_turn_anchor = std::move(anchor);
+                staged.user_turn_capture_frontier.reset();
             }
 
             if (staged.stable_checkpoint_capture_frontier &&

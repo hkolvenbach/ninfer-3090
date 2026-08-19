@@ -162,13 +162,29 @@ ProgramImplCore::plan_request_base(const PreparedPromptData& prompt,
         stable_identity.truncate(candidate);
         base->stable_prefix_boundary = candidate;
     }
+    if (prompt.identity.user_turn_boundary) {
+        const std::uint32_t candidate = *prompt.identity.user_turn_boundary;
+        if (candidate == 0 || candidate >= base->summary.prompt_tokens) {
+            throw std::invalid_argument("user turn boundary must lie inside the prompt");
+        }
+        base->user_turn_boundary = candidate;
+    }
     if (base->stable_prefix_boundary && base->turn_rewrite_boundary &&
         *base->stable_prefix_boundary > *base->turn_rewrite_boundary) {
         throw std::invalid_argument("stable prefix boundary must not follow the rewrite boundary");
     }
+    // The user-turn anchor is only useful strictly between the stable prefix and the rewrite
+    // frontier: outside that window it duplicates an anchor the lane already holds.
+    if (base->user_turn_boundary &&
+        ((base->stable_prefix_boundary &&
+          *base->user_turn_boundary <= *base->stable_prefix_boundary) ||
+         (base->turn_rewrite_boundary &&
+          *base->user_turn_boundary >= *base->turn_rewrite_boundary))) {
+        base->user_turn_boundary.reset();
+    }
     const std::size_t cold_prefill_splits =
         (base->vision_control != nullptr ? base->vision_control->items.size() : 0ULL) +
-        (base->turn_rewrite_boundary ? 1ULL : 0ULL) +
+        (base->turn_rewrite_boundary ? 1ULL : 0ULL) + (base->user_turn_boundary ? 1ULL : 0ULL) +
         (base->stable_prefix_boundary &&
                  base->stable_prefix_boundary != base->turn_rewrite_boundary
              ? 1ULL
@@ -213,6 +229,16 @@ RequestPlan ProgramImplCore::plan_request_for_lane(std::uint32_t lane,
                                                    sequence.turn_checkpoint.frontier)) {
             plan->reuse      = ReusePath::RestoreTurnCheckpoint;
             plan->reuse_base = sequence.turn_checkpoint.frontier;
+        } else if (speculative_backend != SpeculativeBackend::DFlash &&
+                   sequence.user_turn_anchor.valid && sequence.user_turn_anchor.frontier != 0 &&
+                   sequence.user_turn_anchor.frontier < prompt.token_ids.size() &&
+                   qwen3_8::detail::prefix_matches(prompt, sequence.ledger,
+                                                   sequence.prefix_identity,
+                                                   sequence.user_turn_anchor.frontier)) {
+            // Both device anchors sit after the last user message's content, so a client that
+            // rewrites that message's tail invalidates them while this one still holds.
+            plan->reuse      = ReusePath::RestoreUserTurnAnchor;
+            plan->reuse_base = sequence.user_turn_anchor.frontier;
         }
     }
 
@@ -221,7 +247,8 @@ RequestPlan ProgramImplCore::plan_request_for_lane(std::uint32_t lane,
             plan->reuse == ReusePath::AppendAtFrontier && sequence.tail_hidden_valid &&
             decoder->mtp_cache() != nullptr &&
             (plan->reuse_base == 0 || sequence.mtp_kv_valid >= plan->reuse_base - 1);
-        const bool checkpoint_ready = plan->reuse == ReusePath::RestoreTurnCheckpoint &&
+        const bool checkpoint_ready = (plan->reuse == ReusePath::RestoreTurnCheckpoint ||
+                                       plan->reuse == ReusePath::RestoreUserTurnAnchor) &&
                                       decoder->mtp_cache() != nullptr &&
                                       sequence.mtp_kv_valid >= plan->reuse_base - 1;
         if (plan->reuse != ReusePath::FullReset && !append_ready && !checkpoint_ready) {
@@ -261,6 +288,19 @@ RequestPlan ProgramImplCore::plan_request_for_lane(std::uint32_t lane,
         plan->turn_checkpoint_capture_frontier = desired;
     }
 
+    // The user-turn anchor is stationary for the whole turn, so within a tool loop it is kept
+    // rather than recaptured; it only moves when a new user query arrives.
+    const std::optional<std::uint32_t> user_turn = base.user_turn_boundary;
+    plan->keep_user_turn_anchor =
+        user_turn && plan->reuse != ReusePath::FullReset && sequence.user_turn_anchor.valid &&
+        sequence.user_turn_anchor.frontier == *user_turn &&
+        qwen3_8::detail::prefix_matches(prompt, sequence.ledger, sequence.prefix_identity,
+                                        *user_turn);
+    if (user_turn && !plan->keep_user_turn_anchor && *user_turn > plan->reuse_base &&
+        speculative_backend != SpeculativeBackend::DFlash) {
+        plan->user_turn_capture_frontier = user_turn;
+    }
+
     plan->summary.reusable_prompt_tokens = plan->reuse_base;
     if (speculative_backend == SpeculativeBackend::Mtp) {
         if (plan->reuse == ReusePath::FullReset) {
@@ -270,7 +310,8 @@ RequestPlan ProgramImplCore::plan_request_for_lane(std::uint32_t lane,
             plan->mtp_bridge  = plan->reuse_base < plan->summary.prompt_tokens
                                     ? MtpBridgeMode::BeforeSuffix
                                     : MtpBridgeMode::AfterExactHit;
-        } else if (plan->reuse == ReusePath::RestoreTurnCheckpoint) {
+        } else if (plan->reuse == ReusePath::RestoreTurnCheckpoint ||
+                   plan->reuse == ReusePath::RestoreUserTurnAnchor) {
             plan->prepare_mtp = true;
             plan->mtp_bridge  = MtpBridgeMode::BeforeSuffix;
         }
@@ -299,6 +340,7 @@ RequestPlan ProgramImplCore::plan_request_for_lane(std::uint32_t lane,
     const std::size_t prefill_splits =
         (plan->vision ? plan->vision->uses.size() : 0ULL) +
         (plan->turn_checkpoint_capture_frontier ? 1ULL : 0ULL) +
+        (plan->user_turn_capture_frontier ? 1ULL : 0ULL) +
         (plan->stable_checkpoint_capture_frontier &&
                  plan->stable_checkpoint_capture_frontier !=
                      plan->turn_checkpoint_capture_frontier

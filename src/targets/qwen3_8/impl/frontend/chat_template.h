@@ -93,6 +93,10 @@ struct RenderedChat {
     std::string text;
     std::optional<std::size_t> stable_prefix_byte_offset;
     std::optional<std::size_t> turn_rewrite_byte_offset;
+    // Opener of the last real user query. Unlike the turn-rewrite frontier this sits *before*
+    // that message's content, so it survives a client rewriting the message's tail - the
+    // floating-reminder pattern that otherwise invalidates every deeper anchor.
+    std::optional<std::size_t> user_turn_byte_offset;
     // These offsets mark model-state-safe semantic frontiers, not arbitrary message ends.
     std::vector<SemanticCheckpointByteHint> checkpoint_hints;
 };

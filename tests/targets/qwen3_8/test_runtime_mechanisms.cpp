@@ -547,14 +547,24 @@ void test_stable_alias_identity() {
 
 void test_multiple_checkpoint_planning() {
     namespace image = q36::detail::continuation;
-    expect(image::next_prefill_checkpoint(0, 3, 7) == 3,
+    expect(image::next_prefill_checkpoint(0, 3, 7, std::nullopt) == 3,
            "prefill plans the stable checkpoint before a later turn checkpoint");
-    expect(image::next_prefill_checkpoint(3, std::nullopt, 7) == 7,
+    expect(image::next_prefill_checkpoint(3, std::nullopt, 7, std::nullopt) == 7,
            "prefill plans the later turn checkpoint after stable export");
-    expect(!image::next_prefill_checkpoint(7, std::nullopt, 7),
+    expect(!image::next_prefill_checkpoint(7, std::nullopt, 7, std::nullopt),
            "prefill does not recapture a completed checkpoint");
-    expect(image::next_prefill_checkpoint(0, 3, 3) == 3,
+    expect(image::next_prefill_checkpoint(0, 3, 3, std::nullopt) == 3,
            "coincident stable and turn boundaries use one device snapshot");
+    // The user-turn anchor always sits between the stable prefix and the rewrite frontier, so a
+    // cold prefill must land on all three in ascending order.
+    expect(image::next_prefill_checkpoint(0, 3, 7, 5) == 3,
+           "stable prefix precedes the user turn anchor");
+    expect(image::next_prefill_checkpoint(3, std::nullopt, 7, 5) == 5,
+           "user turn anchor precedes the turn checkpoint");
+    expect(image::next_prefill_checkpoint(5, std::nullopt, 7, std::nullopt) == 7,
+           "turn checkpoint follows a captured user turn anchor");
+    expect(image::next_prefill_checkpoint(0, std::nullopt, 7, 5) == 5,
+           "user turn anchor is planned without a stable prefix");
 }
 
 } // namespace
