@@ -105,12 +105,20 @@ intermediate artifacts are excluded unless requested or themselves the deliverab
 ## Current product contract
 
 NInfer is a from-scratch C++/CUDA inference engine for maximum single-GPU inference performance on
-a small set of explicitly registered checkpoint artifacts. The supported identities are
+a small set of explicitly registered checkpoint artifacts. The registered identities are
 `qwen3.8-27b/groupwise-int`, `qwen3.8-27b/nvfp4`, and
-`qwen3.6-35b-a3b/groupwise-int`. The current implementation is compiled for `sm_120a` and tuned
-and measured on NVIDIA GeForce RTX 5090. All identities execute Text, image/video Vision, MTP,
-prefix reuse, CLI, OpenAI/Anthropic serving, and measurement through the same public `.ninfer`
-Engine route; the 35B-A3B target additionally supports text-only DFlash.
+`qwen3.6-35b-a3b/groupwise-int`. This fork is compiled for `sm_89` and tuned and measured on
+NVIDIA GeForce RTX 4090; `CMakeLists.txt` rejects any other `CMAKE_CUDA_ARCHITECTURES`. The
+`nvfp4` identity remains registered and its artifact contracts remain authoritative, but NVFP4 A4
+execution requires Blackwell FP4 tensor cores and throws on this target
+(`src/ops/nvfp4_sm86_stubs.cpp`); treat it as a contract to keep coherent, not an executable route
+to measure here. The executable identities run Text, image/video Vision, MTP, prefix reuse,
+tiered continuation reuse, CLI, OpenAI/Anthropic serving, and measurement through the same public
+`.ninfer` Engine route; the 35B-A3B target additionally supports text-only DFlash.
+
+KV storage is selected at startup from BF16, INT8, and the rotated/E8-lattice codecs
+(`rk8v4`, `rk4v4`, `rk4v4-e8`, `rk2v4-e8`). `rk4v4-e8` is the shipping default and serves the
+model's full native 262,144-token context on 24 GB.
 
 The current workload is one GPU and one resident model instance with a startup-fixed one to eight
 active requests. The Engine forms one compact decode batch at every round boundary and uses bounded
@@ -154,11 +162,16 @@ explicitly changed product contract requires them.
 Read only current authorities relevant to a live decision in the task. The following list is a
 routing map, not a mandatory reading list:
 
-- `README.md` and executable `--help`: delivered capabilities and exact commands;
+- `README.md`, `Makefile`, and executable `--help`: delivered capabilities and exact commands;
 - `docs/README.md`: public documentation map;
 - `docs/cli.md`: CLI input, output, sampling, MTP, and runtime options;
-- `docs/serving.md`: OpenAI/Anthropic HTTP behavior;
-- `docs/performance.md`: published performance methodology and results;
+- `docs/serving.md`: OpenAI/Anthropic HTTP behavior, prefix-reuse paths, and slot endpoints;
+- `docs/continuation-cache.md`: L1/L2/L3 tier semantics, session routing, stable-prefix aliases,
+  persistence formats, identity gating, sizing, and metrics;
+- `docs/performance.md`: published performance methodology and results, including the `sm_89`
+  long-context prefill section and its measurement hazards;
+- `docs/llamacpp-comparison.md` and `docs/udp-fork-comparison.md`: cross-engine and sibling-fork
+  measurement records, each valid only for the dated configuration it names;
 - `docs/maintainer/concurrent-inference-architecture.md`: bounded ingress, request/slot lifecycle,
   scheduling, batched execution, CUDA Graph, and speculative-concurrency semantics;
 - `docs/maintainer/paged-kv-cache.md`: shared KV capacity, page ownership, retention, physical
@@ -171,7 +184,15 @@ routing map, not a mandatory reading list:
   dimensions, and state semantics;
 - `docs/maintainer/op-development.md`: Op admission, contracts, implementation ownership,
   qualification, and performance evidence rules;
+- `docs/maintainer/linear-benchmark.md` and `replayssm-gdn.md`: registered linear suites, the
+  measured INT8 ceiling, and GDN state semantics;
 - `include/ninfer/engine.h` and `include/ninfer/types.h`: in-tree C++ product interface.
+
+Two files under `docs/maintainer/` are not authorities and must not be read as the implementation
+map: `softmax-attention.md` describes an unfinished target-state cutover, and
+`prefill-throughput-plan.md` is retained supporting analysis whose stable conclusions are already
+mirrored into `performance.md`, `op-development.md`, `linear-benchmark.md`, and
+`softmax-attention.md`.
 
 Do not survey unrelated references for completeness. Read additional documents only when they
 govern a live decision in the current task.
@@ -189,7 +210,8 @@ them, but must update the corresponding active authorities and affected implemen
 - `src/core` owns device primitives, tensors/views, checked layouts, arenas, graph RAII, physical
   KV-cache containers, and raw transfer mechanisms.
 - `src/artifact` owns generic `.ninfer` framing, descriptors, binding primitives, and
-  materialization. It has no checkpoint execution semantics.
+  materialization, including complete-artifact SHA-256 identity and its validated local
+  fingerprint sidecars. It has no checkpoint execution semantics.
 - `src/ops` owns every semantically closed Op implementation, including fused, fixed-shape, and
   device-specialized paths. Op ownership follows the mathematical or state-transition contract,
   not its first model caller or demonstrated cross-target reuse.
@@ -209,6 +231,12 @@ them, but must update the corresponding active authorities and affected implemen
   `src/ops`.
 - `src/runtime` owns common contracts, generated-token transaction/publication policy, and the
   public Engine PIMPL. It does not own model mathematics or target state.
+- `src/runtime/cache` owns the target-independent continuation tiers: L2 host images, session and
+  stable-prefix aliases, bounded session history, L3 content-addressed persistence, and lazy
+  descriptor resolution. Candidate selection, retained-lane (L1) policy, publication workers, and
+  rollback handling belong to `src/runtime/engine`. The serialization, compatibility, preflight,
+  and import/export of actual Qwen continuation state belong to `src/targets/qwen3_8`; the cache
+  moves opaque images and never interprets model state.
 - `src/media/decode` consumes already-owned bytes. URL/path/data acquisition belongs to
   `src/product/media_acquire`, CLI, or serving and is not linked into a target.
 - `src/product/prompt_input` owns the shared product-side JSON/message-to-owning-input adapter.
@@ -256,8 +284,27 @@ lower-precision intermediate when that is the natural qualified implementation. 
 route is checked directly against the same oracle with a criterion appropriate to its output and
 implementation profile; pairwise implementation parity is supplementary evidence only.
 
+An activation-compute profile that is coarser than the Op's declared input precision is a semantic
+boundary, not a free implementation choice. Group-64 symmetric INT8 activation quantization is
+reachable only through `LinearPolicy::AllowA8` and is checked against the same independent oracle
+as its A16 peer under its own A8 criterion, never a widened A16 one; `A16Only` catalogs stay
+bit-identical. Two invariants constrain any such profile. It must be admitted from an explicit
+phase — the current A8 catalogs are admitted from `TextPhase::Prefill` only, so committed decode
+and speculative-verify numerics are unchanged and CUDA Graph capture is unaffected. And it must be
+registered as one route over the whole token domain, so a token's output never depends on the
+width of the call or the column it occupied; that call invariance is what lets prefix reuse and
+continuation restore replay a cached prefix, and a token-count threshold that broke it would not be
+admissible even if it were faster.
+
+Prefix reuse and continuation restore reproduce the input semantics of full prefill, not its
+arithmetic. They decompose a prompt into different prefill calls, so the FP32 GDN recurrence
+accumulates over different chunk boundaries. Do not write a test or a claim that asserts
+token-for-token equality between a restored path and a cold prefill; assert the observable contract
+instead. A cold prefill remains bit-reproducible across runs.
+
 Where relevant to the changed behavior, account for numeric-format decode, BF16 fusion order, FP32
-GDN state, BF16/INT8 KV, MTP accept/commit state, arena lifetime, and CUDA Graph address stability.
+GDN state, BF16/INT8/lattice-codec KV, the A8 activation boundary, MTP accept/commit state,
+continuation-image identity and serialization, arena lifetime, and CUDA Graph address stability.
 This is a risk map, not a checklist for every numerical task.
 
 ## Performance work
@@ -270,6 +317,12 @@ Use whole-inference profiling when end-to-end attribution remains unresolved. Us
 only after a relevant kernel has been identified and a kernel-level answer could materially change
 the current design or implementation decision. Do not collect additional profiling data once the
 relevant alternatives can be distinguished and the requested claim has adequate support.
+
+Two hazards invalidate a prefill measurement on this target if ignored: the continuation cache must
+be off and prefix reuse disabled, because a repeated prompt otherwise restores state instead of
+prefilling; and SM clock and power should be logged, because sustained prefill on a 24 GB RTX 4090
+can throttle and be misread as a kernel regression. Read `prefill_tok_s` from the structured
+request log rather than HTTP round-trip timing, which includes prepare and vision time.
 
 Retain concise context sufficient to interpret a reported result: relevant hardware/toolchain,
 artifact identity at the descriptive level, workload or command, and summarized measurements. Raw
@@ -309,21 +362,27 @@ These are conventional project resources, not a checklist of resources every tas
 | repository | current checkout |
 | Python 3.11 | `python3` in the selected maintainer environment |
 | BF16 source checkpoint | explicit local checkpoint directory |
-| product artifact | `out/qwen3_8_27b.ninfer` |
-| conversion report | `out/qwen3_8_27b.ninfer.conversion.json` |
-| normal build | `build/` |
+| product artifact | `models/qwen3_8_27b.ninfer` |
+| conversion report | `models/qwen3_8_27b.ninfer.conversion.json` |
+| normal build | `build-sm89/`, configured through `make configure` |
+| prefill measurement driver | `scripts/prefill_probe.py` |
 | profiler output | `profiles/ncu/`, `profiles/nsys/`, `profiles/bench/` |
-| hardware/toolchain | RTX 5090, `sm_120a`, CUDA 13.1 |
+| hardware/toolchain | RTX 4090, `sm_89`, CUDA 12.8 or newer (the image builds 13.2) |
 
 Use the selected Python 3.11 interpreter explicitly. Do not install or upgrade dependencies unless
 the task requires it. Never select an artifact by glob, modification time, or an unqualified
 “latest” name. Large artifacts, source checkpoints, and profiler outputs are local prerequisites;
 do not download or regenerate them unless that work is in scope.
 
+The `Makefile` wraps the normal cycle (`make configure`, `make build`, `make test`) and reads
+overrides from an untracked `Makefile.local`. Tests that need the real artifact read
+`NINFER_WEIGHTS` and skip without it; the GPU must have enough free memory for the Op suites, which
+otherwise fail with `cudaErrorMemoryAllocation` rather than a numerical error.
+
 ```bash
 PYTHON=python3
 MODEL=/path/to/Qwen3.8-27B
-NINFER_WEIGHTS=out/qwen3_8_27b.ninfer
+NINFER_WEIGHTS=models/qwen3_8_27b.ninfer
 ```
 
 ## Commits

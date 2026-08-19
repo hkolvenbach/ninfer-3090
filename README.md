@@ -2,59 +2,131 @@
 
 NInfer-4090 runs **Qwen3.8-27B** on one 24 GB NVIDIA GeForce RTX 4090. It is an `sm_89` port of
 [NInfer-3090](https://github.com/Don-Chad/ninfer-3090), which derives from
-[Neroued/ninfer](https://github.com/Neroued/ninfer), a specialized C++20/CUDA inference engine.
-The engine loads the official groupwise `.ninfer` artifact, serves OpenAI- and
-Anthropic-compatible APIs, and supports paged KV, compatible-prefix reuse, a tiered persistent
-continuation cache, CUDA Graphs, MTP speculative decoding, reasoning-effort control, and ReplaySSM
-state transactions.
+[Neroued/ninfer](https://github.com/Neroued/ninfer), a specialized C++20/CUDA inference engine
+written from scratch — no PyTorch, no TensorRT, no llama.cpp. The engine loads the official
+groupwise `.ninfer` artifact and serves OpenAI- and Anthropic-compatible APIs from a single
+process, with paged KV, compatible-prefix reuse, CUDA Graphs, MTP speculative decoding,
+reasoning-effort control, and ReplaySSM state transactions for the model's Gated DeltaNet layers.
 
 This fork targets `sm_89` and Linux. Blackwell-only NVFP4/W4A4 execution is unavailable; the
-engine uses the same groupwise-int path as the 3090 base. The Windows path and the
-Qwen3.6-35B-A3B target are inherited but untested on the RTX 4090.
+engine uses the same groupwise-int path as the 3090 base.
+
+## Highlights
+
+The work specific to this branch, each with the measurement that established it:
+
+- **The full native 262,144-token (262K) context on 24 GB.** The E8 Conway-Sloane lattice KV mode
+  is the shipping default and leaves 1.37 GiB of slack. Retrieval stays exact through 260K
+  (single-needle, 5-needle, and exact-code-detail probes), and vision fits alongside it.
+  [Details](#the-tradeoff)
+- **1.415x long-context prefill.** Every dense body GEMM now routes through INT8 tensor cores
+  (`mma.m16n8k32.s32.s8.s8.s32`) during prefill: 1,701.4 → **2,409.2 tok/s** on a 115,125-token
+  prompt. Decode is untouched — the INT8 activation catalog is admitted in prefill only, so
+  committed decode numerics stay bit-identical to the previous build.
+  [Details](#long-context-prefill)
+- **Tiered continuation cache.** Complete Qwen state — paged KV, Gated DeltaNet recurrence, hidden
+  state, turn checkpoints, MTP state — moves between retained GPU lanes, host RAM, and a
+  restart-persistent content-addressed store. In one recorded agent session, 44 restores returned
+  2.76 M cached tokens for about 2.9 s of synchronous work each, against an estimated 22-42 minutes
+  to recompute them. [Details](docs/continuation-cache.md)
+- **Prefix anchors that survive client-side history rewrites.** A lane holds two independent
+  anchors: a rolling checkpoint that advances past completed tool results, and a user-turn anchor
+  pinned upstream of the last user message's content. On a 46.7k-token session whose client moves a
+  reminder block onto the newest user message every turn, reuse went from 0 to 46,552 tokens and
+  TTFT from 16,654 ms to 587 ms. [Details](#prefix-reuse-and-anchors)
+- **Agent-ready serving.** Hardened OpenAI Responses and Chat Completions surfaces, `/slots` with
+  disk save/restore, `GET /metrics` under llama.cpp-compatible names, and a llama.cpp-compatible
+  `timings` block so proxies read per-request prefill, decode, and draft-acceptance rates.
+  [Details](#what-this-fork-changes)
 
 ## Measured results on the RTX 4090
 
-Conditions: single request, greedy decoding, CUDA Graphs on, INT8 KV, `--prefill-chunk 1024`,
-official 16.96 GiB Qwen3.8-27B artifact. The code-generation decode row and the prefill rows
-are measured from the `ninfer-serve` `/metrics` counters (computed prefill only); the other
-decode rows use the `ninfer` CLI.
+Conditions: single request, greedy decoding, CUDA Graphs on, `--prefill-chunk 1024`, official
+16.96 GiB Qwen3.8-27B artifact. Prefill rows come from the `ninfer-serve` structured request log
+(computed prefill only); the decode rows use the `ninfer` CLI except the code-generation row, which
+comes from `/metrics`.
 
-| Test | Result |
-|---|---|
-| Decode, code generation, MTP3 | **148.6 tok/s** at 81.0% draft acceptance |
-| Decode, bench corpus, MTP3 | 106.5 tok/s at 48.7% acceptance |
-| Decode, no speculation | 50.5 tok/s |
-| Decode at 128K depth, no speculation | 39.6 tok/s |
-| 64K needle-in-a-haystack | exact answer, 1,849 tok/s prefill |
-| 128K needle-in-a-haystack | exact answer, 1,561 tok/s prefill |
-| Vision, chart reading | 3 of 3 oracle facts, 22 ms vision tower |
-| Ops test suite | 78 of 78 runnable tests pass on `sm_89` |
+| Test | KV mode | Result |
+|---|---|---|
+| Prefill at 115K depth | `rk4v4-e8` | **2,409.2 tok/s** |
+| Decode, code generation, MTP3 | `int8` | **148.6 tok/s** at 81.0% draft acceptance |
+| Decode, bench corpus, MTP3 | `int8` | 106.5 tok/s at 48.7% acceptance |
+| Decode, no speculation | `int8` | 50.5 tok/s |
+| Decode at 128K depth, no speculation | `int8` | 39.6 tok/s |
+| 64K needle-in-a-haystack | `int8` | exact answer, 1,849 tok/s prefill |
+| 128K needle-in-a-haystack | `int8` | exact answer, 1,561 tok/s prefill |
+| Vision, chart reading | `int8` | 3 of 3 oracle facts, 22 ms vision tower |
+| Test suite | - | 91 of 91 ctest targets pass on `sm_89`; 5 gate on the real artifact or FP4 hardware |
 
-MTP acceptance, and with it the decoded rate, tracks how predictable the output is: structured
-code accepts about 81% of draft tokens, the mixed bench corpus about 49%.
+MTP acceptance, and with it the decoded rate, tracks how predictable the output is: structured code
+accepts about 81% of draft tokens, the mixed bench corpus about 49%.
 
-The shipping default has since moved from INT8 KV to the E8 4-bit KV mode, which serves the
-model's full native 262,144-token context on this card. Retrieval stays exact through 260K
-(single-needle, 5-needle, and exact-code-detail probes), MTP acceptance at depth is unchanged,
-and the costs against the INT8 numbers above are a 5.7% decode tax and 1-2% of prefill; see
-[Quick start](#text-only-full-262k-native-context-e8-4-bit-kv-default) for the measured deltas.
+The two needle rows were measured before the INT8 prefill routes landed and are the older BF16
+prefill path. The decode rows are unaffected by that change: the INT8 activation catalog is gated
+to `TextPhase::Prefill`, so decode and speculative verify keep the BF16 catalog and are
+bit-identical to the previous build.
+
+The shipping default has since moved from INT8 KV to the E8 4-bit KV mode, which serves the model's
+full native 262,144-token context on this card. MTP acceptance at depth is unchanged, and the costs
+against the INT8 numbers above are a 5.7% decode tax and 1-2% of prefill; see
+[Quick start](#text-only-full-262144-token-native-context-e8-4-bit-kv-default) for the measured
+deltas.
 
 For scale: llama.cpp on the same card decodes the Qwen3.8-27B `UD-Q4_K_XL` GGUF at about
 46 tok/s in a 144K-context configuration where the MTP buffers do not fit. The upstream engine
 on an RTX 5090 measures 172 tok/s on the same code-generation prompts with a 400 W power cap
 (the upstream README quotes about 200), so this card lands within 14% of it under MTP.
 
+### Long-context prefill
+
+INT8 tensor-core routes replaced the BF16 routes on all six dense body GEMM Ops, in three stages.
+Measured on a 115,125-token prompt with `rk4v4-e8` KV, `--prefill-chunk 1024`, the continuation
+cache off, and prefix reuse disabled, reading `prefill_tok_s` from the structured request log:
+
+| Configuration | Prefill | Cumulative |
+|---|---:|---:|
+| BF16 routes | 1,701.4 tok/s | 1.000x |
+| INT8 `linear_swiglu` (Q4) | 1,976.4 tok/s | 1.162x |
+| INT8 `linear_add` (Q5) | 2,147.3 tok/s | 1.262x |
+| INT8 `attn_input_proj` + `gdn_input_proj` | **2,409.2 tok/s** | **1.415x** |
+
+`--prefill-chunk 2048` adds a further 0.6% (2,423.2 tok/s); 4096 does not improve on it. Repeat
+measurements of one configuration reproduce to within 0.12%.
+
+The routes are registered over every prefill token count, which keeps a token's projection output
+independent of the width of the call that produced it — the property prefix reuse depends on. The
+cost is that short prompts also take INT8, where the tuned small-`T` BF16 routes were faster:
+
+| Prompt tokens | BF16 projections | INT8 projections |
+|---:|---:|---:|
+| 99 | 185.5 tok/s | 177.3 tok/s |
+| 229 | 447.2 tok/s | 434.1 tok/s |
+| 770 | 1,311.4 tok/s | 1,334.5 tok/s |
+| 2,827 | 2,316.0 tok/s | 2,535.7 tok/s |
+| 8,105 | 2,760.0 tok/s | 3,186.5 tok/s |
+
+Break-even is near 770 tokens; the worst case is about 15 ms on a 229-token prompt.
+
+Method, per-kernel budgets, and the accuracy screening are in
+[Performance](docs/performance.md#rtx-4090-sm_89-long-context-prefill).
+
 ### Depth sweep against llama.cpp
+
+> The NInfer prefill column below was measured on 2026-08-17, before the INT8 prefill routes.
+> Prefill has since improved 1.415x at 115K depth, so these rows understate the current build. The
+> two engines have not been re-measured at matched depth on the same day, so no prefill lead is
+> claimed here. The decode rows are current.
 
 Both engines were measured on the same card. llama.cpp build 10358 ran `llama bench` on the
 `UD-Q4_K_XL` GGUF (16.68 GiB) with q8_0 KV cache, flash attention, and `-ub 1024 -b 4096`,
-which matches its deployed configuration, on 2026-08-15. The NInfer side was re-measured on
+which matches its deployed configuration, on 2026-08-15. The NInfer side was measured on
 2026-08-17 on the deployed E8 262K configuration through the `/metrics` counters; the
 llama.cpp configuration did not change between the dates. Two caveats: the artifacts differ
 by about 2% in size, and `llama bench` is a bare kernel loop while the NInfer numbers
 include the full server path.
 
-Marginal rates at depth:
+Marginal rates at depth. Depth labels in this section are binary — `32K` is 32,768 tokens and
+`256K` is the full 262,144-token context:
 
 | Depth | llama.cpp pp2048 | llama.cpp tg32 | NInfer decode, no speculation |
 |---:|---:|---:|---:|
@@ -65,9 +137,9 @@ Marginal rates at depth:
 | 256K | no entry | no entry | 36.6 |
 
 Wall time to prefill one full prompt (llama.cpp integrated from the marginal rates, NInfer
-measured):
+measured on the pre-INT8 build):
 
-| Prompt | llama.cpp | NInfer |
+| Prompt | llama.cpp | NInfer (pre-INT8) |
 |---:|---:|---:|
 | 32K | 12.5 s (2,630 tok/s) | 14.5 s (2,027 tok/s) |
 | 64K | 28.3 s (2,317 tok/s) | 31.7 s (1,857 tok/s) |
@@ -75,11 +147,9 @@ measured):
 | 192K | no entry | 127.9 s (1,381 tok/s) |
 | 256K | no entry | 191.7 s (1,228 tok/s) |
 
-The llama.cpp prefill lead narrows with depth. Server-measured, it prefills a 64K prompt in
-28.7 s against 31.7 s (a 10% lead) and a 128K prompt in 71.6 s against 74.5 s (4%); the
-server path costs llama.cpp 2-4% over the bare-loop estimates above. Everything past its
-144K ceiling is NInfer-only. Decode inverts the shallow picture. NInfer leads by 10%
-shallow and by 27% at 128K without speculation, and the MTP3 gap grows with depth:
+Everything past llama.cpp's 144K ceiling is NInfer-only. Decode inverts the shallow picture:
+NInfer leads by 10% shallow and by 27% at 128K without speculation, and the MTP3 gap grows with
+depth:
 
 | Workload | llama.cpp `draft-mtp` | NInfer MTP3 (E8) |
 |---|---:|---:|
@@ -92,11 +162,10 @@ shallow and by 27% at 128K without speculation, and the MTP3 gap grows with dept
 The NInfer rows in this table use the 2026-08-17 generated corpora; acceptance on them runs
 a few points below the 2026-08-15 payloads (code 78% against 81%), which accounts for the
 difference from the headline 148.6 tok/s. The llama.cpp MTP rows required a reduced
-131,584-token context; the draft buffers push VRAM
-to 23.8 of 24 GiB, and the deployed 144K llama.cpp configuration cannot fit them at all.
-NInfer serves 172,032 tokens with MTP in the same VRAM at INT8 KV, and the full native
-262,144 with the E8 4-bit KV default. Acceptance matches per content type, so the decode gap
-is engine time, not draft quality.
+131,584-token context; the draft buffers push VRAM to 23.8 of 24 GiB, and the deployed 144K
+llama.cpp configuration cannot fit them at all. NInfer serves 172,032 tokens with MTP in the same
+VRAM at INT8 KV, and the full native 262,144 with the E8 4-bit KV default. Acceptance matches per
+content type, so the decode gap is engine time, not draft quality.
 
 Full configurations, method, and raw numbers:
 [NInfer against llama.cpp](docs/llamacpp-comparison.md).
@@ -132,12 +201,12 @@ a client that does not parse error events sees a stream that ends without a
 `finish_reason`. See [docs/serving.md](docs/serving.md) for the full queue
 contract.
 
-### Text-only, full 262K native context (E8 4-bit KV, default)
+### Text-only, full 262,144-token native context (E8 4-bit KV, default)
 
 The E8 Conway-Sloane lattice KV mode (`rk4v4-e8`, ported from
 [UDPSendToFailed/ninfer-4090](https://github.com/UDPSendToFailed/ninfer-4090); see
 [the fork comparison](docs/udp-fork-comparison.md)) fits the model's entire native
-262,144-token context on 24 GB with 1.4 GiB to spare:
+262,144-token context on 24 GB with 1.37 GiB to spare:
 
 ```bash
 docker run --rm --gpus all --publish 8080:8080 \
@@ -178,7 +247,7 @@ Measured against INT8 KV on this build: identical MTP acceptance at 111K depth
 probe), prefill within 1-2% at matched depth, and exact single-needle, 5-needle, and
 code-detail retrieval through 260K tokens.
 
-### Text-only, 168K context (INT8 KV, maximum precision)
+### Text-only, 172,032-token context (INT8 KV, maximum precision)
 
 ```bash
 docker run --rm --gpus all --publish 8080:8080 \
@@ -197,7 +266,7 @@ docker run --rm --gpus all --publish 8080:8080 \
   --preserve-thinking
 ```
 
-### With vision, full 262K context (E8 4-bit KV)
+### With vision, full 262,144-token context (E8 4-bit KV)
 
 The vision scratchpad defaults to 8192 tokens (`--vision-max-tokens`, ported from
 the same fork as the E8 KV modes) instead of the former hardcoded 32768. The
@@ -235,33 +304,47 @@ KV precision, vision, and maximum context trade against each other on a 24 GB ca
 
 | Profile | KV mode | Context | KV runtime | Startup slack |
 |---|---|---:|---:|---:|
-| Text-only, MTP3 | `rk4v4-e8` | 262144 (256K) | 5.08 GiB | 1.37 GiB |
-| Text-only, MTP3 | `rk2v4-e8` | 262144 (256K) | 4.01 GiB | 2.43 GiB |
-| Text-only, MTP3 | `int8` | 172032 (168K) | 6.31 GiB | 136 MiB |
-| With `--vision`, MTP3 | `rk4v4-e8` | 262144 (256K) | 5.41 GiB | 780 MiB |
-| With `--vision` (32K scratchpad), MTP3 | `rk2v4-e8` | 262144 (256K) | 5.85 GiB | 329 MiB |
-| With `--vision` (32K scratchpad), MTP3 | `rk4v4-e8` | 212992 (208K) | 6.06 GiB | 108 MiB |
-| With `--vision` (32K scratchpad), MTP3 | `int8` | 98304 (96K) | - | ~1 GiB |
+| Text-only, MTP3 | `rk4v4-e8` | 262,144 | 5.08 GiB | 1.37 GiB |
+| Text-only, MTP3 | `rk2v4-e8` | 262,144 | 4.01 GiB | 2.43 GiB |
+| Text-only, MTP3 | `int8` | 172,032 | 6.31 GiB | 136 MiB |
+| With `--vision`, MTP3 | `rk4v4-e8` | 262,144 | 5.41 GiB | 780 MiB |
+| With `--vision` (32K scratchpad), MTP3 | `rk2v4-e8` | 262,144 | 5.85 GiB | 329 MiB |
+| With `--vision` (32K scratchpad), MTP3 | `rk4v4-e8` | 212,992 | 6.06 GiB | 108 MiB |
+| With `--vision` (32K scratchpad), MTP3 | `int8` | 98,304 | - | ~1 GiB |
 
 262,144 is the model's own context limit, so `rk2v4-e8` (2-bit keys, 96.2% cosine)
 buys no additional context over `rk4v4-e8` in the text-only profile - only slack.
 That slack is what pays for vision. With the former hardcoded 32,768-token vision
 scratchpad, vision cost about 2.1 GiB (1.83 GiB of runtime buffers plus a
-0.28 GiB tower): INT8 could only afford it at 96K, 4-bit keys topped out at
-212992, and only 2-bit keys fit the full 262,144. The default 8192-token
+0.28 GiB tower): INT8 could only afford it at 98,304, 4-bit keys topped out at
+212,992, and only 2-bit keys fit the full 262,144. The default 8192-token
 scratchpad cuts the cost to about 0.6 GiB, and the full native 262,144 now fits
 alongside vision on 4-bit keys with 780 MiB of slack. The vision
 modes answer a two-swatch color oracle exactly at temperature 0, including with
 the image buried under 52,700 tokens of text on `rk2v4-e8`. `rk2v4-e8` also passes
 the text retrieval gates (single-needle at 260K, 5-needle at 118K, exact code
 details at 168K) at a 10% decode tax (120.5 tok/s on the shallow code probe). The
-INT8 text-only ceiling is near 176K: 172032 starts, and 196608 is rejected at
+INT8 text-only ceiling is near 176K: 172,032 starts, and 196,608 is rejected at
 startup with a byte-exact deficit. The server validates memory before it listens,
 so an oversized context fails fast instead of at request time.
 
+### Native build
+
 For a native build, follow the [Linux build guide](docs/rtx-3090-linux.md) with
-`CMAKE_CUDA_ARCHITECTURES=89` (the default in this fork). The build requires CUDA 12.8 or newer,
-GCC 13, and CMake 3.28 or newer; the Docker image builds with CUDA 13.1.
+`CMAKE_CUDA_ARCHITECTURES=89` (the only value this fork accepts). The build requires CUDA 12.8 or
+newer, GCC 13, and CMake 3.28 or newer; the Docker image builds with CUDA 13.2.
+
+The repository ships a `Makefile` wrapper for the common cycle, which configures into `build-sm89`
+with Ninja and a bounded compile pool for the template-heavy CUDA translation units:
+
+```bash
+make configure      # cmake -S . -B build-sm89 -G Ninja ...
+make build          # or plain `make`
+make test           # build, then ctest
+```
+
+Override `BUILD_DIR`, `JOBS`, `BUILD_TESTING`, `BUILD_BENCHMARKS`, or the target-package switches on
+the command line, or persist them in an untracked `Makefile.local`.
 
 The default build registers only Qwen3.8-27B. Enable the optional Qwen3.6-35B-A3B package with
 `-DNINFER_BUILD_QWEN3_6_35B_A3B=ON`, or with
@@ -270,16 +353,30 @@ The default build registers only Qwen3.8-27B. Enable the optional Qwen3.6-35B-A3
 
 ## What this fork changes
 
+### Execution and performance
+
 - **`sm_89` retarget.** The CMake architecture pin, the runtime compute-capability check, and the
   NVFP4 stub gate now select `sm_89`. Most SM86 kernel schedules run unmodified on Ada; the
   INT8 attention prefill schedule is retuned (below).
+- **INT8 tensor-core prefill routes.** Every dense body GEMM of `qwen3.8-27b/groupwise-int` —
+  `linear_swiglu` (Q4), `linear_add` (Q5 at k=6144 and k=17408), and the fused `attn_input_proj`
+  and `gdn_input_proj` pairs — routes through `mma.m16n8k32.s32.s8.s8.s32` during prefill, on a
+  shared group-64 symmetric INT8 activation quantization. 1,701.4 → 2,409.2 tok/s at 115K depth
+  (1.415x); see [Long-context prefill](#long-context-prefill). Three properties bound it:
+  admission is gated to `TextPhase::Prefill`, so committed decode numerics and CUDA Graph capture
+  are unchanged; each catalog is registered as one route over every token count, so a token's
+  output never depends on the width of the call; and quantized activations stage in caller-owned
+  arenas tiled at 4,096 tokens, so transient capacity is independent of context length. The
+  activation quantization is a declared semantic boundary with its own FP64-oracle criterion, not
+  a bit-exact transform — measured relative Frobenius error 1.59e-02 against 2.97e-03 for BF16 on
+  identical shapes. Consequences are recorded under [Known limits](#known-limits-on-the-rtx-4090).
 - **Ada-retuned INT8 attention prefill.** The SM120 schedule spills registers on Ada and pays the
   consumer half-rate penalty for f32-accumulate HMMA. Arch-gated for `sm_89`: the full
   128-register budget, eight paired producer warps over `Bc` column halves with one named-barrier
   exchange per key tile, byte-permute V dequantization (bit-identical), and fp16-accumulated PV
   tiles folded into the fp32 running accumulator each tile. The kernel gains 30% at 64K depth
   (109 to 143 TFLOP/s on the `d256-h24-kv4` INT8 append shape); serve prefill gains 5-7% at
-  88K-128K. Needle-in-a-haystack retrieval stays exact at both depths and all 84 suite tests
+  88K-128K. Needle-in-a-haystack retrieval stays exact at both depths and all suite tests
   pass, which bounds the fp16-accumulation numerics change.
 - **Causal-tile partitioned key-block traversal.** Interior key blocks (wholly below the causal
   diagonal for the whole CTA tile) run a separate instantiation of the key-block body: KV stages
@@ -291,6 +388,70 @@ The default build registers only Qwen3.8-27B. Enable the optional Qwen3.6-35B-A3
   End-to-end this is bounded by the attention wall share of this hybrid-GDN model: about +1%
   serve prefill at 51K on INT8 KV, within noise on the E8 modes, whose staging time is dominated
   by lattice decode rather than the removed guards.
+- **E8 lattice KV quantization (ported).** The `rk8v4`/`rk4v4`/`rk4v4-e8`/`rk2v4-e8` KV modes
+  and the 262K-to-1M visible-keys envelope lift from the
+  [UDPSendToFailed/ninfer-4090](https://github.com/UDPSendToFailed/ninfer-4090) sibling fork,
+  merged under this fork's retuned `sm_89` attention prefill schedule. The E8 codec verifies
+  bit-exactly against the upstream microbenchmark (96.155% / 98.678% cosine); their 1 GiB
+  CUDA-graph allowance bump was deliberately not taken (it would evict the INT8 168K profile).
+  Method and measurements in [docs/udp-fork-comparison.md](docs/udp-fork-comparison.md).
+
+### Long-context state reuse
+
+- **Tiered continuation cache.** Complete Qwen state — paged Text and MTP KV, Gated DeltaNet
+  recurrent state, continuation hidden state, and turn checkpoints — can move from retained GPU
+  lanes (L1) to byte-bounded host images (L2) and a restart-persistent, content-addressed local
+  store (L3), with independent per-tier TTLs, quotas, a filesystem reserve, and atomic
+  publication. `prompt_cache_key` routes session heads, automatic exact stable-prefix aliases
+  share fixed system/tool prefixes, cold builders coalesce, and publication is asynchronous so it
+  never blocks hot L1 reuse. Every restore is gated by complete artifact SHA-256, runtime layout,
+  canonical token/position/media identity, and an exact prefix preflight. See
+  [Tiered continuation cache](docs/continuation-cache.md).
+- **Configurable rolling tool checkpoints.** `--prefix-checkpoint-policy rolling-tool` (the new
+  default) advances the turn checkpoint to the latest generation opener after completed tool-call
+  results, so a serial tool loop recomputes only its newest suffix. `stable-turn` retains the
+  previous behavior — the first assistant opener after the last real user query. Both remain
+  subject to exact prepared-prefix identity.
+- **User-turn prefix anchor.** A lane now carries a second, independent anchor pinned at the
+  opener of the last real user query, upstream of that message's content. Clients that rewrite the
+  tail of the newest user message — opencode's `SessionReminders.apply` appends an unpersisted
+  `<system-reminder>` block there, moving roughly 360 tokens every turn — invalidate the turn
+  checkpoint along with the execution frontier and otherwise fall back to the bare system+tools
+  prefix. Measured on a 113k-token session, the first request of every turn reused only 13,127
+  tokens and spent about 50 s in prefill. The planner now orders three candidates by depth
+  (frontier, turn checkpoint, user turn) and reports the selection as `restore_user_turn_anchor`.
+  The anchor is captured once per turn through the existing chunk-landing mechanism, held in host
+  memory rather than a third device slot (which would have cost 147 MiB per lane), and is
+  lane-local — continuation images carry none, and `import_continuation_lane` and `clear_lane`
+  clear it, so a restored image cannot splice another conversation's recurrent state into the
+  lane. On a 46.7k-token session reproducing the rewrite: reuse 0 → 46,552 tokens against a
+  ceiling of 46,562, TTFT 16,654 ms → 587 ms.
+- **Slot session save/restore.** `--slot-save-path DIR` (off by default) enables llama.cpp-style
+  `POST /slots/{id}?action=save|restore|erase`: one idle slot's complete resident session -
+  paged Text and MTP KV, GDN linear-attention state, turn checkpoint, and prefix identity -
+  moves to or from disk, and a restored slot reuses the cache across server restarts instead of
+  re-prefilling (a 6.9k-token session restores in about 0.1 s against a multi-second reprefill).
+  Sessions are identified by a stable `session_digest`; chat completions carry `id_slot` and the
+  digest next to `timings`, and `save`/`erase` accept an `if_digest` precondition checked
+  atomically, so a client always persists exactly the session it means. Restore extends the
+  saved frontier (or its turn checkpoint); the GDN state cannot rewind further, and the DFlash
+  backend is not supported. Details in [docs/serving.md](docs/serving.md).
+- **Reuse-aware lane choice.** When prefix reuse ties (typically zero for a fresh session),
+  admission picks the lane whose occupation costs least to replace - an empty lane before any
+  retained session, then the shallowest - so a burst request no longer evicts a deep resident
+  session while a free lane exists.
+
+### Serving surface
+
+- **Hardened OpenAI Responses and Chat Completions.** Public reasoning is exposed through native
+  `summary_text` Items and semantic Responses SSE events; stored `item_reference` inputs resolve
+  exactly with atomic lookup, LRU cleanup, and bounded index accounting; reconstructed
+  continuations preserve natural Engine prefix reuse and report exact cached input tokens;
+  `prompt_cache_key` is accepted as an SDK routing hint with `cache_write_tokens` reported as
+  zero; persistence is the streaming success point, so a cancelled request is not stored; and
+  unsupported capabilities — non-viable tool choices, strict tools, nonempty `logit_bias`, unknown
+  fields — fail explicitly instead of being silently accepted. Cancellation is represented as
+  `response.failed` with `request_cancelled`. Request logs are at schema v12.
 - **`/v1/models` reports `context_window`.** Clients without access to a llama.cpp `/props` or a
   vLLM `max_model_len` can size prompts from the models payload.
 - **llama.cpp-compatible `timings` on chat completions.** Responses and final stream chunks carry
@@ -306,50 +467,58 @@ The default build registers only Qwen3.8-27B. Enable the optional Qwen3.6-35B-A3
   excluded, as in llama.cpp. Additional `ninfer:` series report request totals, prefix-cache
   hits, MTP draft/acceptance totals, and continuation-cache lookup, restore, persistence, L1, L2,
   and L3 occupancy/activity.
-- **Tiered continuation cache.** Complete Qwen state can move from retained GPU lanes to host RAM
-  and a restart-persistent local content-addressed store. `prompt_cache_key` routes session heads,
-  automatic exact stable-prefix aliases share fixed system/tool prefixes, and every restore remains
-  gated by full artifact/runtime and prepared-prefix identity. See
-  [Tiered continuation cache](docs/continuation-cache.md).
 - **`GET /slots`.** A llama.cpp-shaped slot table read from the engine's real lane state: busy
   slots report their request's prompt and reused-prefix sizes, idle retained slots report the
   resident session's depth and its identifying `session_digest`. Truthful per-slot attribution
   holds at any `--max-concurrency`.
-- **Slot session save/restore.** `--slot-save-path DIR` (off by default) enables llama.cpp-style
-  `POST /slots/{id}?action=save|restore|erase`: one idle slot's complete resident session -
-  paged Text and MTP KV, GDN linear-attention state, turn checkpoint, and prefix identity -
-  moves to or from disk, and a restored slot reuses the cache across server restarts instead of
-  re-prefilling (a 6.9k-token session restores in about 0.1 s against a multi-second reprefill).
-  Sessions are identified by a stable `session_digest`; chat completions carry `id_slot` and the
-  digest next to `timings`, and `save`/`erase` accept an `if_digest` precondition checked
-  atomically, so a client always persists exactly the session it means. Restore extends the
-  saved frontier (or its turn checkpoint); the GDN state cannot rewind further, and the DFlash
-  backend is not supported. Details in [docs/serving.md](docs/serving.md).
-- **Reuse-aware lane choice.** When prefix reuse ties (typically zero for a fresh session),
-  admission picks the lane whose occupation costs least to replace - an empty lane before any
-  retained session, then the shallowest - so a burst request no longer evicts a deep resident
-  session while a free lane exists.
+- **Configurable vision scratchpad (ported).** `--vision-max-tokens` comes from the
+  [UDPSendToFailed fork](https://github.com/UDPSendToFailed/ninfer-4090) and sizes the vision
+  encode workspace (default 8192 tokens, formerly hardcoded 32768). This fork additionally wires
+  the processor media budget to the same limit, so an over-limit request fails as
+  `media_budget_exceeded` instead of reaching an undersized encoder.
+- **Vision modality in `/v1/models`.** The models payload reports whether the running server was
+  started with `--vision`.
+
+### Build and packaging
+
+- **Self-contained Docker image.** A CUDA 13.2 build stage compiles the CLI and server and copies
+  them into the matching runtime image. `models/qwen3_8_27b.ninfer` is embedded when present,
+  otherwise downloaded, and its published SHA-256 is verified either way, so the container needs
+  no host model mount. CMake and Ninja outputs persist in a toolchain-keyed BuildKit cache, so an
+  incremental source change rebuilds only affected objects.
+- **Split CUDA compilation units.** The GQA decode token widths (1 through 6) and the seven exact
+  W8 small-`T` projection geometries compile as independent static archives behind lightweight
+  runtime dispatchers, with a four-slot Ninja pool for the heavy translation units and relocatable
+  device code disabled where kernels are TU-local. Peak `ptxas` memory and wall-clock build time
+  drop with no change to runtime dispatch behavior.
+- **Compile-time target package selection.** `NINFER_BUILD_QWEN3_8_27B` and
+  `NINFER_BUILD_QWEN3_6_35B_A3B` compose the closed registry; a build with neither is rejected at
+  configure time. The 27B target, its reference implementation, converter, and parity tools moved
+  from the `qwen3_6` to the `qwen3_8` family namespace.
 - **NVFP4-A4 test gating.** The A4 activation tests skip on hardware without FP4 tensor cores
   instead of aborting. The full remaining suite passes on the RTX 4090.
-- **E8 lattice KV quantization (ported).** The `rk8v4`/`rk4v4`/`rk4v4-e8`/`rk2v4-e8` KV modes
-  and the 262K-to-1M visible-keys envelope lift from the
-  [UDPSendToFailed/ninfer-4090](https://github.com/UDPSendToFailed/ninfer-4090) sibling fork,
-  merged under this fork's retuned `sm_89` attention prefill schedule. The E8 codec verifies
-  bit-exactly against the upstream microbenchmark (96.155% / 98.678% cosine); their 1 GiB
-  CUDA-graph allowance bump was deliberately not taken (it would evict the INT8 168K profile).
-  Method and measurements in [docs/udp-fork-comparison.md](docs/udp-fork-comparison.md).
-- **Configurable vision scratchpad (ported).** `--vision-max-tokens` comes from the same fork
-  and sizes the vision encode workspace (default 8192 tokens, formerly hardcoded 32768). This
-  fork additionally wires the processor media budget to the same limit, so an over-limit
-  request fails as `media_budget_exceeded` instead of reaching an undersized encoder.
 
 ## Known limits on the RTX 4090
 
-- Prefill trails llama.cpp by 16-24% on full 32K-128K prompts under matched conditions (see
-  the depth sweep above). The rate is flat across `--prefill-chunk` 1024 to 2688, so the
-  chunk size is not the lever. With the attention schedule retuned, the remaining gap sits in
-  the custom quantized GEMMs, which run about 10% below cuBLAS on Ada. Decode is where this
-  engine leads.
+- **Prefill against llama.cpp is unresolved.** The published comparison predates the INT8 prefill
+  routes, which raised NInfer prefill 1.415x at 115K depth, and the two engines have not been
+  re-measured at matched depth since. The rate is flat across `--prefill-chunk` 1024 to 2688, so
+  chunk size is not the lever. Everything past llama.cpp's 144K ceiling is NInfer-only, and
+  decode is where this engine clearly leads.
+- **The prefill activation profile moves greedy output.** Group-64 INT8 activation quantization is
+  a semantic boundary, so a prompt's prefill is not bit-identical to the BF16 build. Screening
+  against a BF16-projection build: 7 of 12 short prompts byte-identical, all 5 divergences
+  paraphrases with no factual or arithmetic error, and 5/5 retrieval at five depths of a
+  139,910-token prompt with byte-identical answers. AIME/GPQA were not re-run, so task-level
+  reasoning accuracy under this profile is unverified.
+- **Prefix reuse reproduces the input semantics of full prefill, not its arithmetic.** The two
+  paths decompose a prompt into different prefill calls, so the FP32 GDN recurrence accumulates
+  over different chunk boundaries. They were never bitwise identical; the INT8 profile makes the
+  difference observable in generated tokens. A cold prefill remains bit-reproducible across runs.
+- **Short prompts regress about 3-4% below 250 tokens** (roughly 15 ms on a 229-token prompt),
+  because the INT8 catalogs cover every token count. A token-count threshold would recover it but
+  would make a token's projection output depend on the width of its call, which widens rather than
+  narrows how far prefix reuse can drift.
 - Keep `--prefill-chunk` at 2688 or below. This fork carries measured `sm_89` cooperative
   residency tables (the former hard abort above chunk 1024 is fixed), and chunks through 2688
   stay on split-K. Larger chunks route to the unsplit schedule, which is marginally less
@@ -361,6 +530,8 @@ The default build registers only Qwen3.8-27B. Enable the optional Qwen3.6-35B-A3
   starves while any prefill runs: a short request submitted behind a 31k-token cold prefill
   measured a 13.5 s first token. Concurrency pays off for decode and for per-lane resident
   prefixes, not for prefill fairness.
+- The Windows path and the Qwen3.6-35B-A3B target are inherited from the 3090 base but untested
+  on the RTX 4090.
 - The limits of the base engine apply: one process, one GPU, one model, bounded FIFO admission,
   no multi-GPU execution, no weight offload.
 
@@ -375,6 +546,24 @@ upstream engine, not the file. The published Qwen3.8 file SHA-256 is
 `eec39564993d6e9c7d5e383382a760f093465c9d163ec9a1bd6b80199514bf3e`, which the Docker build
 verifies. Continuation compatibility includes SHA-256 of the complete artifact, so modified or
 repacked artifact bytes safely miss existing entries even when model dimensions match.
+
+## Prefix reuse and anchors
+
+A lane can resume a conversation from one of three frontiers, chosen deepest-first and reported in
+the JSONL completion record as `prefix_reuse_path`:
+
+| Path | Resumes from |
+|---|---|
+| `append_frontier` | the exact execution frontier — the prompt is a pure extension |
+| `restore_turn_checkpoint` | the generation opener placed by `--prefix-checkpoint-policy` |
+| `restore_user_turn_anchor` | the opener of the last real user query, upstream of its content |
+| `full_reset` | nothing compatible; the prompt is prefilled cold |
+
+A turn checkpoint carries the recurrent and speculative-backend state needed to recompute a
+rewritten suffix; matching KV tokens alone never authorize a partial hit. Beyond these lane-local
+anchors, the [tiered continuation cache](docs/continuation-cache.md) can restore a complete
+continuation from host RAM or disk when no lane holds it. Full contract in
+[docs/serving.md](docs/serving.md).
 
 ## Reasoning effort
 
@@ -400,10 +589,12 @@ JSONL request logs. See [HTTP serving](docs/serving.md) and [CLI usage](docs/cli
   [v0.6.1 release notes](RELEASE_NOTES_0.6.1.md) describe the inherited state.
 - [UDPSendToFailed/ninfer-4090](https://github.com/UDPSendToFailed/ninfer-4090) - a sibling
   RTX 4090 port from the same 3090 base. The rotated and E8-lattice KV-cache quantization
-  modes (`rk8v4`, `rk4v4`, `rk4v4-e8`, `rk2v4-e8`), the E8 codecs, and the 1M visible-keys
-  envelope are their work, cherry-picked here with authorship preserved. The full 262K
-  default profile exists because of it; see
+  modes (`rk8v4`, `rk4v4`, `rk4v4-e8`, `rk2v4-e8`), the E8 codecs, the configurable vision
+  scratchpad, and the 1M visible-keys envelope are their work, cherry-picked here with authorship
+  preserved. The full 262K default profile exists because of it; see
   [the fork comparison](docs/udp-fork-comparison.md).
+- [shantanusingh16/ninfer-4090](https://github.com/shantanusingh16/ninfer-4090) - the
+  llama.cpp-compatible `timings` block on chat completions.
 - [jram4/ninfer-4090](https://github.com/jram4/ninfer-4090) - an earlier RTX 4090 port of a July
   2026 snapshot. Its Ada dispatch tuning targets a kernel organization that upstream has since
   replaced, so this fork starts from the current 3090 base instead.
