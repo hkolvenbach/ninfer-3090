@@ -260,6 +260,12 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
     };
 
     const auto text_common_root = [&](WorkspaceLayoutBuilder& layout, std::int32_t tokens) {
+        // `TextContext::bind_uniform_adapter` takes the per-chunk bank selector from this arena
+        // before the roots and holds it for the whole chunk, so it is reserved here and in this
+        // order. It is a single int32, but the arena aligns to 256 bytes and the capacity is
+        // fitted exactly to this plan, so an unreserved selector shifts every later allocation
+        // and overflows the peak stage.
+        if (plan.features.lora()) { (void)layout.alloc(DType::I32, {1}); }
         (void)workspace_recipe::text_prefill_roots<TextConfig>(
             layout, tokens, plan.features.vision ? 3 : 0, plan.features.vision ? tokens : 0);
     };

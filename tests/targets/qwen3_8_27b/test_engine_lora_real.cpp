@@ -7,7 +7,10 @@
 // prefill chunk produced, so it can only move if prefill ran with the adapter.
 #include "ninfer/engine.h"
 
+#include <cstddef>
 #include <cstdlib>
+#include <filesystem>
+#include <system_error>
 #include <iostream>
 #include <optional>
 #include <string>
@@ -26,13 +29,46 @@ constexpr const char* kTrainedName = "trained";
 // A real chat turn, not a synthetic token run. The first assistant token has to be genuinely
 // contested for an argmax comparison to have any sensitivity, and the public API exposes no
 // logprobs to compare instead.
-ninfer::PromptInput chat_prompt() {
+constexpr const char* kMathPrompt =
+    "Let a and b be real numbers with a + b = 5 and a * b = 3. Find a^5 - b^5.";
+
+ninfer::PromptInput chat_prompt(const char* text = kMathPrompt) {
     ninfer::ChatMessage message;
     message.role = "user";
     message.parts.push_back(ninfer::MessagePart{
-        .kind = ninfer::MessagePartKind::Text,
-        .text = "Let a and b be real numbers with a + b = 5 and a * b = 3. Find a^5 - b^5.",
-        .media = {}});
+        .kind = ninfer::MessagePartKind::Text, .text = text, .media = {}});
+    ninfer::PromptInput input;
+    input.messages.push_back(std::move(message));
+    input.options.enable_thinking = false;
+    return input;
+}
+
+// A self-contained image, so the check needs no fixture file.
+std::vector<std::uint8_t> gradient_ppm() {
+    std::vector<std::uint8_t> ppm;
+    const std::string header = "P6\n64 64\n255\n";
+    ppm.insert(ppm.end(), header.begin(), header.end());
+    for (int index = 0; index < 64 * 64; ++index) {
+        ppm.push_back(static_cast<std::uint8_t>(index & 0xff));
+        ppm.push_back(static_cast<std::uint8_t>((index * 3) & 0xff));
+        ppm.push_back(static_cast<std::uint8_t>((index * 7) & 0xff));
+    }
+    return ppm;
+}
+
+ninfer::PromptInput vision_prompt() {
+    ninfer::MessagePart image;
+    image.kind              = ninfer::MessagePartKind::Media;
+    image.media.kind        = ninfer::MediaKind::Image;
+    image.media.bytes       = gradient_ppm();
+    image.media.media_type  = "image/x-portable-pixmap";
+    image.media.source_name = "inline.ppm";
+
+    ninfer::ChatMessage message;
+    message.role = "user";
+    message.parts.push_back(std::move(image));
+    message.parts.push_back(ninfer::MessagePart{
+        .kind = ninfer::MessagePartKind::Text, .text = "What is visible?", .media = {}});
     ninfer::PromptInput input;
     input.messages.push_back(std::move(message));
     input.options.enable_thinking = false;
@@ -105,6 +141,233 @@ int verify_zero_adapter_is_neutral(ninfer::Engine& engine) {
     return 0;
 }
 
+// One compact decode batch carrying a different adapter on each lane.
+//
+// Per-row adapter routing is the only genuinely new mechanism in the feature, and it cannot be
+// checked at batch 1: every row would carry the same value. Four equal-length requests are not
+// enough either. `program_impl.h` fills the ingress over a compact `row` index and dereferences
+// `lanes[row]`, so while the active lane set is {0,1,2,3} the row and the lane id coincide and
+// indexing by the wrong one is indistinguishable. Staggering the output lengths retires lanes at
+// different rounds, which leaves the surviving lane set non-contiguous and forces row != lane for
+// most of the run.
+int verify_mixed_adapter_batch(ninfer::Engine& engine) {
+    struct Arm {
+        std::optional<std::string> adapter;
+        std::uint32_t tokens;
+    };
+    const std::vector<Arm> arms{{std::nullopt, 2}, {kTrainedName, 8}, {kZeroName, 4},
+                                {kTrainedName, 6}};
+
+    // Sequential references first, one request in flight at a time.
+    std::vector<std::vector<ninfer::TokenId>> sequential;
+    sequential.reserve(arms.size());
+    for (const Arm& arm : arms) { sequential.push_back(run(engine, arm.tokens, arm.adapter)); }
+    // Without a real difference between the arms, a routing fault would be undetectable below.
+    if (sequential[0] == std::vector<ninfer::TokenId>(sequential[1].begin(),
+                                                      sequential[1].begin() + 2)) {
+        std::cerr << "mixed-batch check is inert: base and trained agree on this prompt\n";
+        return 1;
+    }
+
+    // Submitting every request before waiting on any is what puts them in one round; `submit`
+    // establishes queue membership synchronously and `wait` consumes independently.
+    std::vector<ninfer::GenerationHandle> handles;
+    handles.reserve(arms.size());
+    for (const Arm& arm : arms) {
+        handles.push_back(
+            engine.submit(engine.prepare(chat_prompt()), greedy(arm.tokens, arm.adapter)));
+    }
+    for (std::size_t index = 0; index < handles.size(); ++index) {
+        const ninfer::GenerationResult result = handles[index].wait();
+        if (result.generated_token_ids != sequential[index]) {
+            std::cerr << "lane " << index
+                      << " of a mixed-adapter batch does not match its sequential "
+                         "single-adapter run\n";
+            return 1;
+        }
+    }
+    return 0;
+}
+
+// Prefix reuse is isolated per adapter: KV and the FP32 GDN recurrent state encode the weights
+// that produced them, so a prefix built under one adapter is not reusable under another.
+//
+// Each direction needs a prompt no other arm has ever prefilled. `allow_prefix_reuse` gates only
+// whether a request *consumes* reuse, not whether it leaves a retained prefix behind, so a shared
+// prompt would let the consumer legitimately reuse a same-adapter prefix planted earlier and the
+// check would report a leak that is not one. The positive control matters as much as the negative
+// one: asserting "no reuse" alone would pass in an engine where reuse never engages.
+int verify_prefix_reuse_isolation(ninfer::Engine& engine, const char* text,
+                                  const std::optional<std::string>& producer,
+                                  const std::optional<std::string>& consumer, const char* label) {
+    constexpr std::uint32_t kTokens = 4;
+    auto warm = [&](const std::optional<std::string>& adapter) {
+        ninfer::RequestOptions options       = greedy(kTokens, adapter);
+        options.execution.allow_prefix_reuse = true;
+        return engine.generate(engine.prepare(chat_prompt(text)), options);
+    };
+
+    warm(producer);
+    const ninfer::GenerationResult repeat = warm(producer);
+    if (repeat.reused_prompt_tokens == 0) {
+        std::cerr << label << ": prefix reuse never engaged, so the isolation check is inert\n";
+        return 1;
+    }
+    const ninfer::GenerationResult crossed = warm(consumer);
+    if (crossed.reused_prompt_tokens != 0) {
+        std::cerr << label << ": reused " << crossed.reused_prompt_tokens
+                  << " prompt tokens from a prefix built under a different adapter\n";
+        return 1;
+    }
+    std::cout << "  " << label << ": same-adapter reuse " << repeat.reused_prompt_tokens
+              << " tokens, crossing reused 0\n";
+    return 0;
+}
+
+int verify_prefix_reuse_is_adapter_isolated(ninfer::Engine& engine) {
+    if (const int result = verify_prefix_reuse_isolation(
+            engine, "Compute the sum of the first 40 positive odd integers.", kTrainedName,
+            std::nullopt, "adapter prefix -> base request");
+        result != 0) {
+        return result;
+    }
+    return verify_prefix_reuse_isolation(
+        engine, "Compute the product of the first 6 positive prime numbers.", std::nullopt,
+        kTrainedName, "base prefix -> adapter request");
+}
+
+// Multimodal prefill applies the adapter through the same `configure_text_card` call as the text
+// path, but the two had never been executed together, and that call site is the exact shape of
+// the defect this file was written for. The vision tower itself carries no adapter - the bank
+// holds decoder layers only - so what is checked here is that the adapter reaches the decoder
+// while it consumes image tokens.
+int verify_vision_applies_adapter(ninfer::Engine& engine) {
+    constexpr std::uint32_t kTokens = 12;
+    auto caption = [&](std::optional<std::string> adapter) {
+        return engine
+            .generate(engine.prepare(vision_prompt()), greedy(kTokens, std::move(adapter)))
+            .generated_token_ids;
+    };
+    const std::vector<ninfer::TokenId> base    = caption(std::nullopt);
+    const std::vector<ninfer::TokenId> adapted = caption(kTrainedName);
+    if (base.empty() || adapted.empty()) {
+        std::cerr << "a multimodal request generated nothing\n";
+        return 1;
+    }
+    if (base == adapted) {
+        std::cerr << "the adapter did not change multimodal output at all: prefill over image "
+                     "tokens ignored the selected adapter\n";
+        return 1;
+    }
+    // Whether the *first* token moves depends on how strongly this particular adapter bears on a
+    // caption, which is a property of the adapter rather than of the engine. Report it instead of
+    // asserting it, so the check stays a statement about adapter application.
+    std::cout << "  vision: adapter changed the caption; first token "
+              << (base[0] == adapted[0] ? "unchanged" : "moved") << '\n';
+    return 0;
+}
+
+// A saved slot must carry the adapter that produced it. The image holds KV and FP32 GDN state
+// that encode that adapter's weights, and the restored lane is a prefix-reuse candidate the
+// moment it lands, so losing the identity hands one adapter's state to a request using other
+// weights. The positive arm is what distinguishes a restored identity from a blanked one: if the
+// lane came back as base, the negative arm alone would still pass.
+int verify_slot_restore_keeps_adapter_identity(ninfer::Engine& engine) {
+    constexpr std::uint32_t kTokens = 4;
+    const char* text = "Compute the greatest common divisor of 1071 and 462.";
+    const std::filesystem::path path =
+        std::filesystem::temp_directory_path() / "ninfer_lora_slot_identity.bin";
+    auto warm = [&](const std::optional<std::string>& adapter) {
+        ninfer::RequestOptions options       = greedy(kTokens, adapter);
+        options.execution.allow_prefix_reuse = true;
+        return engine.generate(engine.prepare(chat_prompt(text)), options);
+    };
+
+    const ninfer::GenerationResult produced = warm(kTrainedName);
+    if (produced.slot < 0 || produced.session_digest.empty()) {
+        std::cerr << "the adapter request did not retain a session to save\n";
+        return 1;
+    }
+    int failures = 0;
+    try {
+        (void)engine.save_slot(static_cast<std::uint32_t>(produced.slot), path.string());
+        // Drop the producing lane's copy, so the restored lane is the only holder of this
+        // prompt's state and the positive arm below cannot be satisfied by some other lane.
+        (void)engine.erase_slot(static_cast<std::uint32_t>(produced.slot));
+
+        // Restore into a lane whose last request was base, so the lane's own adapter field is -1
+        // and disagrees with the image. Restoring into the producing lane proves nothing: that
+        // lane already carries the right value, so a restore that dropped the identity entirely
+        // would still look correct.
+        const ninfer::GenerationResult unadapted = warm(std::nullopt);
+        if (unadapted.slot < 0) {
+            std::cerr << "the base request did not report a slot\n";
+            return 1;
+        }
+        const auto lane = static_cast<std::uint32_t>(unadapted.slot);
+        (void)engine.restore_slot(lane, path.string());
+
+        const ninfer::GenerationResult same = warm(kTrainedName);
+        if (same.reused_prompt_tokens == 0) {
+            std::cerr << "a restored slot did not reuse under the adapter that produced it: the "
+                         "restore lost the adapter identity\n";
+            failures = 1;
+        }
+        const ninfer::GenerationResult crossed = warm(std::nullopt);
+        if (failures == 0 && crossed.reused_prompt_tokens != 0) {
+            std::cerr << "a base request reused " << crossed.reused_prompt_tokens
+                      << " prompt tokens from a slot saved under an adapter\n";
+            failures = 1;
+        }
+        if (failures == 0) {
+            std::cout << "  slot restore: adapter identity survived save/restore into slot " << lane
+                      << '\n';
+        }
+    } catch (...) {
+        std::error_code ignored;
+        std::filesystem::remove(path, ignored);
+        throw;
+    }
+    std::error_code ignored;
+    std::filesystem::remove(path, ignored);
+    return failures;
+}
+
+// A prompt long enough to reach the workspace plan's peak stage.
+//
+// The arena capacity is fitted exactly to the plan, so anything the plan does not reserve shows
+// up only once a request actually reaches that peak - short prompts run inside the slack and look
+// fine. The per-chunk bank selector was such an allocation: one int32, 256 bytes after alignment,
+// enough to push the peak past the capacity and abort the request with std::bad_alloc while the
+// same prompt served from the base weights succeeded.
+// This needs its own Engine, and a deliberately minimal one. With several lanes or Vision
+// enabled the decode stages dominate the workspace peak and leave prefill enough slack to hide an
+// unreserved allocation; at one lane with no Vision, text prefill *is* the peak and the capacity
+// is fitted to it. That single-lane long-context shape is also the product's default.
+int verify_long_prompt_fits_the_workspace(const char* artifact, const char* zero_path,
+                                          const char* trained_path) {
+    ninfer::EngineOptions options;
+    options.artifact_path   = artifact;
+    options.max_context     = 40960;
+    options.kv_capacity     = ninfer::KvCapacityPolicy::explicit_capacity(40960);
+    options.prefill_chunk   = 1024;
+    options.max_concurrency = 1;
+    options.lora_adapters   = {ninfer::LoraAdapterSpec{.name = kZeroName, .path = zero_path},
+                               ninfer::LoraAdapterSpec{.name = kTrainedName, .path = trained_path}};
+    ninfer::Engine engine(options);
+    for (const std::uint32_t tokens : {1024U, 8192U, 32768U}) {
+        std::vector<ninfer::TokenId> ids(tokens, 198);
+        const ninfer::GenerationResult result =
+            engine.generate(engine.prepare_tokens(ids), greedy(1, kTrainedName));
+        if (result.generated_token_ids.size() != 1) {
+            std::cerr << "an adapted " << tokens << "-token prefill did not generate its token\n";
+            return 1;
+        }
+    }
+    std::cout << "  long prompt: adapted prefill reached the workspace peak at 32768 tokens\n";
+    return 0;
+}
+
 int verify_unknown_adapter_is_rejected(ninfer::Engine& engine) {
     try {
         run(engine, 1, "not-registered");
@@ -125,6 +388,10 @@ int exercise(const char* artifact, const char* zero_path, const char* trained_pa
     options.max_context   = 2048;
     options.kv_capacity   = ninfer::KvCapacityPolicy::explicit_capacity(2048);
     options.prefill_chunk = 1024;
+    // Four lanes so a mixed-adapter decode batch is reachable; the prompts are short, so the
+    // shared KV pool is far from its bound.
+    options.max_concurrency = 4;
+    options.enable_vision   = true;
     options.lora_adapters = {ninfer::LoraAdapterSpec{.name = kZeroName, .path = zero_path},
                              ninfer::LoraAdapterSpec{.name = kTrainedName, .path = trained_path}};
 
@@ -132,6 +399,14 @@ int exercise(const char* artifact, const char* zero_path, const char* trained_pa
     if (const int result = verify_registration(engine); result != 0) { return result; }
     if (const int result = verify_prefill_applies_adapter(engine); result != 0) { return result; }
     if (const int result = verify_zero_adapter_is_neutral(engine); result != 0) { return result; }
+    if (const int result = verify_mixed_adapter_batch(engine); result != 0) { return result; }
+    if (const int result = verify_prefix_reuse_is_adapter_isolated(engine); result != 0) {
+        return result;
+    }
+    if (const int result = verify_vision_applies_adapter(engine); result != 0) { return result; }
+    if (const int result = verify_slot_restore_keeps_adapter_identity(engine); result != 0) {
+        return result;
+    }
     if (const int result = verify_unknown_adapter_is_rejected(engine); result != 0) {
         return result;
     }
@@ -155,6 +430,10 @@ int main() {
         return 77;
     }
     if (const int result = exercise(artifact, zero, trained); result != 0) { return result; }
+    if (const int result = verify_long_prompt_fits_the_workspace(artifact, zero, trained);
+        result != 0) {
+        return result;
+    }
     std::cout << "ok\n";
     return 0;
 }

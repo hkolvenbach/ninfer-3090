@@ -1182,9 +1182,6 @@ TextContext::prefill_impl(std::span<const int> ids, const TextPrefill* text_pref
             len = checkpoint_rel - t0;
         }
         work_.reset();
-        // The chunk carries one sequence, so the whole call routes to one bank plane. The
-        // selector is re-materialized after every reset because the workspace is reused.
-        bind_uniform_adapter(ctx_.stream);
 
         VisionChunk vision_chunk;
         const std::uint32_t prompt_t0 = base + static_cast<std::uint32_t>(t0);
@@ -1196,6 +1193,12 @@ TextContext::prefill_impl(std::span<const int> ids, const TextPrefill* text_pref
                 multimodal->vision->prepare_chunk(prompt_t0, static_cast<std::uint32_t>(len));
             len = vision_chunk.length;
         }
+        // The chunk carries one sequence, so the whole call routes to one bank plane. The
+        // selector is re-materialized after every reset because the workspace is reused, and it
+        // must be bound after the Vision encode: that encode shares this arena and resets it when
+        // it finishes an item, which would otherwise free the selector and leave the bank
+        // indexed by whatever later allocation reused those bytes.
+        bind_uniform_adapter(ctx_.stream);
         const bool is_last = finalize_at_end && (t0 + len == T);
         nvtx::ScopedRange chunk_range(nvtx::Name::PrefillChunk, nvtx::Category::Prefill,
                                       static_cast<std::uint64_t>(len));

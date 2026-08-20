@@ -422,7 +422,14 @@ correctness requirement, not an optimization. Three mechanisms enforce it:
   `import_continuation_lane` takes the requesting adapter and stamps it onto the restored
   sequence.
 - `slot_model_binding` folds the registered adapter names into the slot digest, so a slot image
-  cannot be restored into an engine with a different resident adapter set or bank order.
+  cannot be restored into an engine with a different resident adapter set or bank order. The
+  binding pins the *set*; the session record pins *which* of them produced the image. Snapshot
+  version 2 carries `SnapshotSession::adapter`, written from `sequence.adapter` on save and
+  assigned back on restore. Before that field existed the restored lane kept whatever adapter its
+  previous occupant had left behind, which on a fresh lane is `-1`: a slot saved under an adapter
+  restored as base, and the very next base request with a matching prefix reused adapter-encoded
+  KV and GDN state. Because the binding already fixes the name list and its order, the index is
+  sufficient identity and the target never has to learn adapter names.
 
 ### 6.7 Speculative decoding
 
@@ -430,6 +437,20 @@ MTP weights are separate (`mtp/*`) and carry no adapter. Target verify runs the 
 the draft does not. Acceptance rate therefore degrades on an adapted model by an amount
 proportional to the adapter's effect. `MtpDecodeIngress` still needs `adapters[B]` because the
 **target** pass is adapted. This is accepted and documented, not fixed, in v1.
+
+Measured, with `--spec mtp --draft-tokens 3` on the 120-step math adapter over 8 held-out prompts
+at a 96-token budget:
+
+| Model | Rounds | Drafted | Accepted | Tokens/round | Accept rate |
+|---|---:|---:|---:|---:|---:|
+| base | 209 | 623 | 548 | 3.62 | 88.0% |
+| + adapter | 251 | 749 | 506 | 3.02 | 67.6% |
+
+The same 768 generated tokens cost 20% more rounds. This adapter is close to a worst case - its
+salient behaviour is a first-token flip on essentially every prompt, which is exactly the argmax
+disagreement the unadapted draft cannot predict - but the direction is structural, not specific to
+it. Published MTP figures in `performance.md` are base-model figures and do not describe adapted
+serving.
 
 ## 7. Serving and model routing
 
@@ -477,13 +498,38 @@ At `r=16`, all seven sites, per adapter:
 
 Launch overhead is the term to watch, not bandwidth: 144 in-graph node launches at roughly
 0.3–0.5 µs each is on the order of 50–70 µs against a decode step of roughly 19 ms — an estimated
-**0.3–0.4 %**. These are projections. The published claim must come from
-`bench/targets/qwen3_8_27b` at `B=1` and `B=8`, with 0, 1, and 8 adapters registered, following the
-measurement hazards in `performance.md` (continuation cache off, prefix reuse disabled, SM clock
-and power logged).
+**0.3–0.4 %**. That figure is a decode projection and has not been measured. Decode remains the
+open half of this section; the published claim must come from `bench/targets/qwen3_8_27b` at `B=1`
+and `B=8` with 0, 1, and 8 adapters registered.
 
 Base requests served by a LoRA-enabled process pay the launch cost with `adapter_index = -1`,
 because graph topology is fixed at capture. A process started without `--lora` pays nothing.
+
+### 8.1 Prefill, measured
+
+Prefill was outside the model above, and it is the larger term. RTX 4090 `sm_89`, one lane, KV
+`rk4v4-e8`, `prefill_chunk` 1024, continuation cache off and prefix reuse disabled, one warm-up
+request discarded, three repeats, `prefill_tok_s` from the structured request log. SM clock held
+2715–2730 MHz at 465–475 W throughout, so no arm was throttled.
+
+| Prompt tokens | No `--lora` | Bank resident, base request | Adapter selected |
+|---:|---:|---:|---:|
+| 9,411 | 3600 tok/s | 3593 tok/s | 3360 tok/s (**−6.5 %**) |
+| 37,798 | 3250 tok/s | 3254 tok/s | 3054 tok/s (**−6.1 %**) |
+
+Within-arm spread was ≤1 %, so both effects are outside the noise.
+
+Two results. A resident but unselected bank costs nothing measurable in prefill — the 144 extra
+launches amortize over a 1024-token chunk instead of a single decode step. And selecting an
+adapter costs about **6 %** of prefill throughput, roughly an order of magnitude more than the
+decode projection above.
+
+That 6 % is not explained by arithmetic. At `r=16` the added work is `2·T·r·(in+out)` against a
+base `2·T·in·out`, which for these shapes is under 1 % of the adapted GEMMs' FLOPs. The cost is
+shape: a rank-16 GEMM is extremely skinny, so both halves are dominated by streaming the `[T, in]`
+activation in and the `[T, out]` result out rather than by the multiply, and the prefill base GEMMs
+they are compared against are the fast A8 route. Anyone trying to close this gap should attack
+activation traffic — fusing the correction into the base epilogue — not the FLOPs.
 
 ## 9. Synthetic adapter ladder
 
@@ -622,7 +668,7 @@ the feature as a whole, because per-column adapter routing is the one genuinely 
 | 1 | Op unit test — tiers 1/2/3 against the FP32 oracle, bank built in memory, including `adapter_index < 0` | GPU only | `tests/ops/test_lora_delta_add.cpp` and `tests/ops/lora/`, following `tests/ops/op_check.h` and `op_tester.h` |
 | 2 | Converter — synthetic PEFT → `.ninfer`, object inventory, decoded values, rejection of excluded modules | nothing | `tests/targets/qwen3_8_27b/` |
 | 3 | Reference vs engine — a trained adapter, applied at the same sites, read from the PEFT directory so a converter fault cannot be inherited | BF16 checkpoint, a PEFT adapter | `tools/reference/qwen3_8_27b/lora.py`, `--lora` on `cli.py` |
-| 4 | Engine — a trained adapter moves the **first** greedy token; a zero adapter does not, and does not leak | `models/qwen3_8_27b.ninfer` + two co-registerable adapters | `tests/targets/qwen3_8_27b/test_engine_lora_real.cpp` |
+| 4 | Engine — a trained adapter moves the **first** greedy token; a zero adapter does not, and does not leak; a mixed-adapter decode batch matches sequential runs; prefix reuse is isolated in both directions; multimodal prefill applies the adapter; a saved slot keeps its adapter identity; an adapted long prefill fits the workspace | `models/qwen3_8_27b.ninfer` + two co-registerable adapters | `tests/targets/qwen3_8_27b/test_engine_lora_real.cpp` |
 | 5 | Serving — `/v1/models`, 404 on unknown, routing, mixed batch, prefix isolation | `models/qwen3_8_27b.ninfer` | `tests/test_serve_options.cpp`, `test_openai_schema.cpp`, live server |
 | 6 | Performance | GPU, quiet box | `bench/targets/qwen3_8_27b` at `B ∈ {1,8}` with 0/1/8 adapters |
 
@@ -650,7 +696,36 @@ Two properties of layer 4 matter, and both were established by disabling the fix
 
 Because all adapters in one bank share a rank and a site inventory, the zero arm must come from the
 same inventory as the trained arm — a 7-site synthetic beside a 6-site trained adapter is rejected
-at load. A zero-step PEFT adapter converted through the normal path satisfies this.
+at load. A zero-step PEFT adapter converted through the normal path satisfies this, and
+`make_synthetic_lora.py --sites` generates matching synthetics when a fuller bank is wanted.
+
+Every check in layer 4 was confirmed by reverting the code it guards and observing the failure;
+each is written so the arm that fires is the arm that matters. Three properties turned out to be
+load-bearing, and each is a way an earlier version of this test would have passed while broken:
+
+- **Retire lanes at different rounds.** The ingress is filled over a compact `row` index into the
+  active lane list. While that list is `{0,1,2,3}` the row equals the lane id, so indexing by the
+  wrong one is invisible; four equal-length requests prove nothing. Staggered output lengths make
+  the sets diverge.
+- **Give each reuse direction its own prompt.** `allow_prefix_reuse` gates only whether a request
+  *consumes* reuse, not whether it leaves a prefix behind, so an arm that shares a prompt with an
+  earlier same-adapter request will reuse legitimately and look like a leak.
+- **Restore into a lane that did not produce the image.** The producing lane already carries the
+  right adapter, so restoring into it passes whether or not the identity was persisted.
+
+What that coverage found, beyond the prefill defect it was written for:
+
+| Defect | Symptom | Cause |
+|---|---|---|
+| Vision × LoRA use-after-reset | `cudaErrorIllegalAddress` in the GDN recurrent kernel on any adapted multimodal request | `bind_uniform_adapter` allocated the selector from the shared arena, then the Vision encode reset that arena when it finished an item, leaving the bank indexed by whatever later allocation reused those bytes |
+| Slot restore loses adapter identity | a base request reusing adapter-encoded KV after a restore | `SnapshotSession` had no adapter field; the restored lane kept its previous occupant's value |
+| Unreserved selector in the workspace plan | `std::bad_alloc` on every adapted request at long context and one lane, while base succeeded | the plan reserved LoRA *scratch* but not the per-chunk selector; 256 bytes after alignment, against a capacity fitted exactly to the plan |
+
+The last one is the reason layer 4 builds a second, deliberately minimal Engine. With several lanes
+or Vision enabled the decode stages dominate the workspace peak and leave prefill enough slack to
+absorb an unreserved allocation; only at one lane with no Vision is text prefill itself the peak.
+That configuration is also the product default, so the defect affected the most ordinary way to run
+an adapter at long context.
 
 The B3 defect that once blocked layer 3 is fixed: `tools/reference/qwen3_8_27b/bindings.py:276`
 and `:314` now read `W8`, matching `WeightsProfile::GroupwiseIntW8Endpoints`.
@@ -912,7 +987,7 @@ behaviour transfers, not that downstream task quality is unaffected by the base 
 |---|---|
 | B3 blocks the numerical oracle | fix first, in phase 0a |
 | 24 GB is insufficient for 27B QLoRA even text-only | install `fla` + `causal_conv1d`; start at `seq=1024`; fall back to `r=8` and `seq=512` |
-| Prefix-reuse leakage across adapters produces silently wrong output | §6.6 is a correctness requirement with a dedicated tier-3 test, not an optimization |
+| Prefix-reuse leakage across adapters produces silently wrong output | §6.6 is a correctness requirement, covered in both directions by layer 4 with a live positive control, not an optimization |
 | 144 extra launches erode decode throughput more than projected | measured in phase 0d before any training investment; the Op groups four attention sites into one launch specifically to bound this |
 | Adapter trained on excluded modules is silently ignored | `convert_lora.py` hard-rejects rather than dropping |
 | Base-model performance regresses for users who do not use adapters | topology is unchanged when `lora_adapters == 0`; asserted in phase 0d |

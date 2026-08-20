@@ -31,7 +31,10 @@ namespace ninfer::targets::qwen3_8::detail::NINFER_QWEN38_RUNTIME_NS {
 namespace {
 
 constexpr char kSessionSnapshotMagic[8] = {'N', 'I', 'N', 'F', 'S', 'E', 'S', '1'};
-constexpr std::uint32_t kSessionSnapshotVersion = 1;
+// Version 2 records the LoRA adapter that produced the session. A version 1 image cannot be
+// restored: it carries adapter-dependent KV and GDN state with no way to say which adapter that
+// was, and guessing base would hand an adapter's state to an unadapted request.
+constexpr std::uint32_t kSessionSnapshotVersion = 2;
 
 constexpr std::uint32_t kKvFlagPackedV    = 1U << 0;
 constexpr std::uint32_t kKvFlagRotateK    = 1U << 1;
@@ -199,6 +202,10 @@ struct SnapshotSession {
     std::uint32_t turn_checkpoint_frontier = 0;
     std::uint32_t text_pages               = 0;
     std::uint32_t backend_pages            = 0;
+    // Bank index of the adapter that produced this session, or -1 for the base weights. The
+    // model binding already pins the registered name list and its order, so the index resolves
+    // to the same adapter on restore or the binding comparison rejects the image first.
+    std::int32_t adapter = -1;
 };
 
 void write_config(SnapshotWriter& writer, const SnapshotConfig& config) {
@@ -249,6 +256,7 @@ void write_session(SnapshotWriter& writer, const SnapshotSession& session) {
     writer.pod(session.turn_checkpoint_frontier);
     writer.pod(session.text_pages);
     writer.pod(session.backend_pages);
+    writer.pod(session.adapter);
 }
 
 SnapshotSession read_session(SnapshotReader& reader) {
@@ -264,6 +272,7 @@ SnapshotSession read_session(SnapshotReader& reader) {
     session.turn_checkpoint_frontier = reader.pod<std::uint32_t>();
     session.text_pages               = reader.pod<std::uint32_t>();
     session.backend_pages            = reader.pod<std::uint32_t>();
+    session.adapter                  = reader.pod<std::int32_t>();
     return session;
 }
 
@@ -371,6 +380,7 @@ ProgramImplCore::save_retained_lane(std::uint32_t lane, std::string_view model_b
     session.turn_checkpoint_frontier = sequence.turn_checkpoint.frontier;
     session.text_pages               = static_cast<std::uint32_t>(text_pages.size());
     session.backend_pages            = static_cast<std::uint32_t>(backend_pages.size());
+    session.adapter                  = sequence.adapter;
 
     qwen3_8::RetainedSessionSnapshot snapshot;
     snapshot.tokens         = session.tokens;
@@ -528,6 +538,13 @@ std::uint32_t ProgramImplCore::restore_retained_lane(std::uint32_t lane,
     if (session.tokens == 0 || session.tokens > capacity) {
         throw std::invalid_argument("session snapshot depth exceeds the server context");
     }
+    // The restored KV and FP32 GDN state encode the adapter that produced them, so the lane must
+    // carry that identity or prefix reuse would splice it into a request using other weights.
+    const auto resident_adapters =
+        model.lora ? static_cast<std::int32_t>(model.lora->adapters) : 0;
+    if (session.adapter < -1 || session.adapter >= resident_adapters) {
+        throw std::invalid_argument("session snapshot names a LoRA adapter that is not resident");
+    }
     if (session.ledger_frontier != session.tokens ||
         session.execution_frontier > session.tokens ||
         session.tokens - session.execution_frontier > 1 ||
@@ -652,6 +669,7 @@ std::uint32_t ProgramImplCore::restore_retained_lane(std::uint32_t lane,
         sequence.rope_delta               = session.rope_delta;
         sequence.mtp_draft_count          = 0;
         sequence.tail_hidden_valid        = session.tail_hidden_valid != 0;
+        sequence.adapter                  = session.adapter;
         sequence.turn_checkpoint          = TurnCheckpoint{
                      .valid    = session.turn_checkpoint_valid != 0,
                      .frontier = session.turn_checkpoint_frontier,

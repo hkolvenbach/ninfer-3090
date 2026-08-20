@@ -133,7 +133,17 @@ Responses pass the string to the Engine as a session alias. On every candidate, 
 - exact token, token-type, three-axis position, media-ledger, and boundary identity through the
   deepest planner-usable frontier: either the saved execution frontier or its rolling turn
   checkpoint;
-- the complete required segment inventory and encoded layouts.
+- the complete required segment inventory and encoded layouts;
+- the selected LoRA adapter, when the process was started with `--lora`.
+
+Adapter scoping is not one check but three, because KV and GDN state produced under one adapter is
+numerically invalid under another. Every session alias and stable-prefix alias is namespaced by the
+selected adapter, unconditionally — base weights get a scope too, so no unscoped key exists and two
+adapters cannot collide on one string. A resident lane records the adapter that produced it and
+refuses in-place prefix reuse across a mismatch. And a saved slot image carries both the registered
+adapter *set*, folded into the slot binding digest, and the *index* that produced it, in the
+session record. Reusing one `prompt_cache_key` across adapters is therefore a safe miss rather than
+a correctness failure, in either direction.
 
 The complete image is validated before import. Checkpoint fallback then trims paged state and
 restores saved GDN, hidden, and backend checkpoint state before recomputing the divergent suffix.
