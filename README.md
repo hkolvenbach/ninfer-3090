@@ -38,6 +38,12 @@ The work specific to this branch, each with the measurement that established it:
   disk save/restore, `GET /metrics` under llama.cpp-compatible names, and a llama.cpp-compatible
   `timings` block so proxies read per-request prefill, decode, and draft-acceptance rates.
   [Details](#what-this-fork-changes)
+- **Runtime LoRA adapters.** Up to eight externally trained QLoRA adapters are banked beside the
+  base artifact and selected per request by model id, so one process serves the base weights and
+  every adapter at once and mixes them inside a single decode batch. A resident but unselected bank
+  costs nothing measurable in prefill; selecting one costs about 7-8%. Adapter identity is carried
+  through prefix reuse, the continuation cache, and saved slot images, so cached state produced
+  under one adapter can never be replayed under another. [Details](#runtime-lora-adapters)
 
 ## Measured results on the RTX 4090
 
@@ -478,6 +484,52 @@ The default build registers only Qwen3.8-27B. Enable the optional Qwen3.6-35B-A3
   `media_budget_exceeded` instead of reaching an undersized encoder.
 - **Vision modality in `/v1/models`.** The models payload reports whether the running server was
   started with `--vision`.
+
+### Runtime LoRA adapters
+
+Externally trained QLoRA adapters are converted to `.ninfer` and registered at startup. There is no
+weight merging and no reload: the base artifact stays resident and each request selects an adapter
+by name.
+
+```bash
+ninfer-serve models/qwen3_8_27b.ninfer \
+  --lora math=lora/math.lora.ninfer \
+  --lora pirate=lora/pirate.lora.ninfer
+```
+
+This exposes `qwen3.8-27b`, `qwen3.8-27b-math` and `qwen3.8-27b-pirate` on `/v1/models`. Any mix of
+them can be in flight at once, including base requests, and the engine forms one compact decode
+batch across the whole mix. `--lora` is a serving option; the CLI has no adapter selection.
+
+- **Eight adapters, one bank.** Every registered adapter shares one rank and one site inventory, so
+  the bank is a single indexed slab and selection is an index rather than a pointer swap. A
+  mismatched rank or site set is rejected at startup with the disagreeing name.
+- **Seven registered sites.** Query, output-gate, key, value and attention output on the 16
+  full-attention layers; the Gated DeltaNet output projection on the other 48; and the MLP down
+  projection on all 64. At `r=16` that is 42,205,184 parameters and 84.4 MB per adapter. `gate_proj`,
+  `up_proj` and the GDN input projections are structurally excluded — their deltas would have to
+  land inside `silu(g) * u` and inside the fused causal convolution, which no post-hoc additive pass
+  can express.
+- **Adapter-scoped state.** KV and Gated DeltaNet state produced under one adapter is numerically
+  invalid under another, so identity is enforced in three places: a resident lane records the
+  adapter that produced it and refuses cross-adapter prefix reuse, every continuation-cache alias is
+  namespaced by adapter, and a saved slot image carries both the registered adapter set and the
+  index that produced it. Reusing one `prompt_cache_key` across adapters is a safe miss.
+- **Measured cost.** With one adapter selected, prefill runs at 3,307 tok/s on a 9,411-token prompt
+  and 3,017 tok/s on 37,798, against 3,601 and 3,247 for a base request in the same process — about
+  8.2% and 7.1%. A resident bank costs base requests nothing measurable. The cost is activation
+  traffic in a skinny rank-16 GEMM, not arithmetic: the added FLOPs are under 1% of the adapted
+  projections.
+- **Speculative decoding interacts.** The MTP draft head is not adapted, by design, while the target
+  verify pass is, so every token where the adapter flips the argmax is drafted from base weights and
+  rejected. Measured acceptance falls from 88.0% to 66.0%. DFlash and LoRA are mutually exclusive.
+- **Tooling included.** `tools/train/qwen3_8_27b/train_lora.py` trains against the registered table
+  with Unsloth, `tools/convert/qwen3_8_27b/convert_lora.py` converts a PEFT adapter and hard-rejects
+  any unsupported module, and `alpha/rank` is folded at conversion so one trained adapter can be
+  banked at several strengths. See
+  [`docs/maintainer/qwen3.8-27b-lora-adapters.md`](docs/maintainer/qwen3.8-27b-lora-adapters.md),
+  and [`datasets/caveman_pirate/README.md`](datasets/caveman_pirate/README.md) for an end-to-end
+  worked example.
 
 ### Build and packaging
 

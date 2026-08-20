@@ -128,13 +128,16 @@ kernel families times four codecs. That is a separate project.
 **Registered v1 target-module set:**
 
 ```
-["q_proj", "k_proj", "v_proj", "o_proj", "down_proj"]
+["q_proj", "k_proj", "v_proj", "o_proj", "down_proj", "out_proj"]
 ```
 
-plus `linear_attn.out_proj` if the trainer targets it. This covers the complete attention block in
-all 16 full-attention layers, the down projection in all 64 layers, and the output projection in
-all 48 GDN layers. `convert_lora.py` **hard-rejects** an adapter containing any excluded module
-rather than silently dropping it.
+`out_proj` is `linear_attn.out_proj`; PEFT matches on the leaf name and it does not collide with
+`self_attn.o_proj`. Together these cover the complete attention block in all 16 full-attention
+layers, the down projection in all 64 layers, and the output projection in all 48 GDN layers.
+`train_lora.py` targets all six, so a trained adapter carries the complete registered table.
+`convert_lora.py` **hard-rejects** an adapter containing any excluded module rather than silently
+dropping it, and derives the site set from the objects actually present, so a narrower adapter
+converts but cannot share a bank with a complete one.
 
 ### 3.1 Registered sites
 
@@ -149,6 +152,42 @@ rather than silently dropping it.
 | `mlp/down` | 64 | `[r,17408]` | `[5120,r]` | `x[5120,T]` |
 
 At `r=16`: **42,205,184 parameters**, **84.4 MB** BF16, **368 tensor objects** per adapter.
+
+### 3.2 Why the table includes `gdn/output`
+
+Only 16 of the 64 layers are full attention. Without `gdn/output` the adapted token-mixing path
+reaches those 16 and the remaining 48 carry `mlp/down` alone, so three quarters of the model gets a
+single adapted projection. The site was registered from the start but the trainer did not target it
+until it was measured, which left trained adapters unable to share a bank with the project's own
+7-site fixtures.
+
+Adding it costs **+25.8 %** parameters (33,554,432 → 42,205,184), **+50 %** `lora_apply` calls per
+step (96 → 144, because each GDN layer gains a second call), and the prefill throughput in §8.1.
+
+Two paired A/B runs measured what it buys. Each holds rank, alpha, steps, seed, schedule and data
+fixed so the site set is the only variable, both at `r=16` over a 120-step schedule:
+
+| Probe | n | 6-site | 7-site | Paired result |
+|---|---:|---|---|---|
+| Register transfer | 185 | 0.9321 mean | 0.9236 | diff **−0.0085**, 95 % CI [−0.027, +0.009], sign test p = 0.26 |
+| Held-out math accuracy | 100 | 32 % | **37 %** | 7 discordant wins vs 2, McNemar p = 0.18 |
+
+Neither result is significant and they point in opposite directions. Register transfer is a null
+with a tight interval, which is unsurprising: register is largely lexical and `mlp/down` already
+covers all 64 layers, so the GDN correction has little to add there. Capability transfer leans
+positive, as one would expect if the GDN output projection matters to sequence mixing rather than
+to vocabulary, but nine discordant pairs cannot carry a claim.
+
+So the table is complete because the registered contract says it is, and because the token-mixing
+path should not be economized on in three quarters of the layers - not because a quality gain was
+demonstrated. Do not cite these runs as evidence that a 7-site adapter is better; cite them as the
+reason not to expect a large difference at `r=16` on a short schedule.
+
+The register arm reused the `datasets/caveman_pirate` corpus and its scorer as a convenient paired
+probe. It is **not** the persona measurement: it omits the two baselines, the per-stratum headline,
+the competence and JSON gates, and the strength sweep, and it runs at a rank and schedule that
+document specifies against. `docs/maintainer/qwen3.8-27b-persona-adapter.md` is the authority for
+adapter influence; nothing here should be read as a result for it.
 
 ## 4. Adapter artifact contract
 
@@ -443,13 +482,21 @@ at a 96-token budget:
 
 | Model | Rounds | Drafted | Accepted | Tokens/round | Accept rate |
 |---|---:|---:|---:|---:|---:|
-| base | 209 | 623 | 548 | 3.62 | 88.0% |
-| + adapter | 251 | 749 | 506 | 3.02 | 67.6% |
+| base | 209 | 623 | 548 | 3.62 | **88.0%** |
+| + adapter | 53 | 159 | 105 | 2.98 | **66.0%** |
 
-The same 768 generated tokens cost 20% more rounds. This adapter is close to a worst case - its
-salient behaviour is a first-token flip on essentially every prompt, which is exactly the argmax
-disagreement the unadapted draft cannot predict - but the direction is structural, not specific to
-it. Published MTP figures in `performance.md` are base-model figures and do not describe adapted
+Acceptance falls by about a fifth and the draft window yields 2.98 tokens per round instead of
+3.62. This adapter is close to a worst case - its salient behaviour is a first-token flip on
+essentially every prompt, which is exactly the argmax disagreement an unadapted draft cannot
+predict - but the direction is structural, not specific to it.
+
+Read the round counts as scale, not as a speed comparison: the arms do not generate the same text.
+The adapted model answers in terse JSON and stops early, while the base model writes prose to the
+96-token budget, so the base arm simply produces far more tokens. An adapter changes what the model
+says, so no acceptance comparison between an adapted and an unadapted model can hold the output
+distribution fixed. The operational claim - enabling an adapter costs acceptance - is unaffected.
+
+Published MTP figures in `performance.md` are base-model figures and do not describe adapted
 serving.
 
 ## 7. Serving and model routing
@@ -514,10 +561,14 @@ request discarded, three repeats, `prefill_tok_s` from the structured request lo
 
 | Prompt tokens | No `--lora` | Bank resident, base request | Adapter selected |
 |---:|---:|---:|---:|
-| 9,411 | 3600 tok/s | 3593 tok/s | 3360 tok/s (**−6.5 %**) |
-| 37,798 | 3250 tok/s | 3254 tok/s | 3054 tok/s (**−6.1 %**) |
+| 9,411 | 3600 tok/s | 3601 tok/s | 3307 tok/s (**−8.2 %**) |
+| 37,798 | 3250 tok/s | 3247 tok/s | 3017 tok/s (**−7.1 %**) |
 
-Within-arm spread was ≤1 %, so both effects are outside the noise.
+Within-arm spread was ≤1 %, so both effects are outside the noise. These are the complete 7-site
+table. The same protocol against a 6-site adapter, which omits `gdn/output` and so issues 96
+`lora_apply` calls per step instead of 144, gives 3360 and 3054 tok/s, so the GDN correction across
+48 layers accounts for a further **1.2–1.6 %**. A 50 % increase in launches costing under 2 % is
+consistent with launch overhead being amortized across a 1024-token chunk.
 
 Two results. A resident but unselected bank costs nothing measurable in prefill — the 144 extra
 launches amortize over a 1024-token chunk instead of a single decode step. And selecting an
@@ -668,14 +719,16 @@ the feature as a whole, because per-column adapter routing is the one genuinely 
 | 1 | Op unit test — tiers 1/2/3 against the FP32 oracle, bank built in memory, including `adapter_index < 0` | GPU only | `tests/ops/test_lora_delta_add.cpp` and `tests/ops/lora/`, following `tests/ops/op_check.h` and `op_tester.h` |
 | 2 | Converter — synthetic PEFT → `.ninfer`, object inventory, decoded values, rejection of excluded modules | nothing | `tests/targets/qwen3_8_27b/` |
 | 3 | Reference vs engine — a trained adapter, applied at the same sites, read from the PEFT directory so a converter fault cannot be inherited | BF16 checkpoint, a PEFT adapter | `tools/reference/qwen3_8_27b/lora.py`, `--lora` on `cli.py` |
-| 4 | Engine — a trained adapter moves the **first** greedy token; a zero adapter does not, and does not leak; a mixed-adapter decode batch matches sequential runs; prefix reuse is isolated in both directions; multimodal prefill applies the adapter; a saved slot keeps its adapter identity; an adapted long prefill fits the workspace | `models/qwen3_8_27b.ninfer` + two co-registerable adapters | `tests/targets/qwen3_8_27b/test_engine_lora_real.cpp` |
+| 4 | Engine — a trained adapter moves the **first** greedy token; a zero adapter does not, and does not leak; a mixed-adapter decode batch matches sequential runs; prefix reuse is isolated in both directions; multimodal prefill applies the adapter; a saved slot keeps its adapter identity; an adapted long prefill fits the workspace; a `gdn/output`-only adapter moves the output, isolating the correction on the 48 GDN layers | `models/qwen3_8_27b.ninfer`, two co-registerable adapters, and a one-site GDN fixture | `tests/targets/qwen3_8_27b/test_engine_lora_real.cpp` |
 | 5 | Serving — `/v1/models`, 404 on unknown, routing, mixed batch, prefix isolation | `models/qwen3_8_27b.ninfer` | `tests/test_serve_options.cpp`, `test_openai_schema.cpp`, live server |
 | 6 | Performance | GPU, quiet box | `bench/targets/qwen3_8_27b` at `B ∈ {1,8}` with 0/1/8 adapters |
 
 Register new C++ tests through `ninfer_add_test(...)` in `tests/CMakeLists.txt:9-32`. The
 real-artifact tests in `tests/targets/qwen3_8_27b/` read `NINFER_QWEN3_8_27B_WEIGHTS` and skip with
-exit 77 without it; layer 4 additionally needs `NINFER_QWEN3_8_27B_LORA_ZERO` and
-`NINFER_QWEN3_8_27B_LORA_TRAINED`.
+exit 77 without it; layer 4 additionally needs `NINFER_QWEN3_8_27B_LORA_ZERO`,
+`NINFER_QWEN3_8_27B_LORA_TRAINED` and `NINFER_QWEN3_8_27B_LORA_GDN_ONLY`. The first two must share
+one inventory; the third is a one-site fixture built with
+`make_synthetic_lora.py --kind random --sigma 0.2 --sites gdn/output` and gets its own Engine.
 
 Layer 4 exists because the coverage claim that used to stand here was false. It read: a zero adapter
 reproduces the base byte-identically while a dense adapter diverges, therefore "the correction is

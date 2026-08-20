@@ -25,6 +25,7 @@ namespace {
 // numerics are already covered by tests/ops/test_lora_delta_add.cpp.
 constexpr const char* kZeroName    = "zero";
 constexpr const char* kTrainedName = "trained";
+constexpr const char* kGdnName     = "gdn-only";
 
 // A real chat turn, not a synthetic token run. The first assistant token has to be genuinely
 // contested for an argmax comparison to have any sensitivity, and the public API exposes no
@@ -368,6 +369,43 @@ int verify_long_prompt_fits_the_workspace(const char* artifact, const char* zero
     return 0;
 }
 
+// The Gated DeltaNet output correction, in isolation.
+//
+// 48 of the 64 layers are GDN, and `gdn/output` is the only registered site on them besides
+// `mlp/down`, so this correction carries most of the adapted token-mixing path. Every other check
+// here registers a complete adapter, where six other sites move the output too: dropping the GDN
+// correction entirely would leave all of them passing. This registers an adapter whose *only*
+// site is `gdn/output`, so the base and adapted answers can differ for exactly one reason.
+//
+// It needs its own Engine because a one-site adapter cannot share a bank with a seven-site one -
+// every registered adapter must present the same inventory.
+//
+// The fixture is generated at a deliberately large amplitude (`--kind random --sigma 0.2`). At the
+// generator's default 0.02 the correction is real but too small to flip a greedy argmax on a
+// short, confident prompt, which would make this gate report a defect that is not there. The
+// question here is whether the delta reaches the residual at all, so the amplitude is chosen to
+// answer that question unambiguously rather than to resemble a trained adapter.
+int verify_gdn_site_applies(const char* artifact, const char* gdn_only_path) {
+    ninfer::EngineOptions options;
+    options.artifact_path   = artifact;
+    options.max_context     = 2048;
+    options.kv_capacity     = ninfer::KvCapacityPolicy::explicit_capacity(2048);
+    options.prefill_chunk   = 1024;
+    options.max_concurrency = 1;
+    options.lora_adapters   = {ninfer::LoraAdapterSpec{.name = kGdnName, .path = gdn_only_path}};
+
+    ninfer::Engine engine(options);
+    const std::vector<ninfer::TokenId> base    = run(engine, 24, std::nullopt);
+    const std::vector<ninfer::TokenId> adapted = run(engine, 24, kGdnName);
+    if (base == adapted) {
+        std::cerr << "a gdn/output-only adapter left the output unchanged, so the correction on "
+                     "the 48 GDN layers never reached the residual\n";
+        return 1;
+    }
+    std::cout << "  gdn/output: the 48-layer correction alone moves the output\n";
+    return 0;
+}
+
 int verify_unknown_adapter_is_rejected(ninfer::Engine& engine) {
     try {
         run(engine, 1, "not-registered");
@@ -424,14 +462,19 @@ int main() {
     const char* artifact = env_or_null("NINFER_QWEN3_8_27B_WEIGHTS");
     const char* zero     = env_or_null("NINFER_QWEN3_8_27B_LORA_ZERO");
     const char* trained  = env_or_null("NINFER_QWEN3_8_27B_LORA_TRAINED");
-    if (artifact == nullptr || zero == nullptr || trained == nullptr) {
-        std::cout << "skip: NINFER_QWEN3_8_27B_WEIGHTS, NINFER_QWEN3_8_27B_LORA_ZERO and "
-                     "NINFER_QWEN3_8_27B_LORA_TRAINED are all required\n";
+    const char* gdn_only = env_or_null("NINFER_QWEN3_8_27B_LORA_GDN_ONLY");
+    if (artifact == nullptr || zero == nullptr || trained == nullptr || gdn_only == nullptr) {
+        std::cout << "skip: NINFER_QWEN3_8_27B_WEIGHTS, NINFER_QWEN3_8_27B_LORA_ZERO, "
+                     "NINFER_QWEN3_8_27B_LORA_TRAINED and NINFER_QWEN3_8_27B_LORA_GDN_ONLY are "
+                     "all required\n";
         return 77;
     }
     if (const int result = exercise(artifact, zero, trained); result != 0) { return result; }
     if (const int result = verify_long_prompt_fits_the_workspace(artifact, zero, trained);
         result != 0) {
+        return result;
+    }
+    if (const int result = verify_gdn_site_applies(artifact, gdn_only); result != 0) {
         return result;
     }
     std::cout << "ok\n";

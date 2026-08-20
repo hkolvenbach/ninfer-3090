@@ -1,10 +1,15 @@
 """QLoRA training for the registered Qwen3.8-27B LoRA site table.
 
-Trains an adapter that `tools/convert/qwen3_8_27b/convert_lora.py` can convert directly.  The
-target module list is a structural limit rather than a shortcut: `gate_proj`/`up_proj` and the
-Gated DeltaNet input projections are excluded because their deltas would have to land before
-``silu(gate) * up`` and before the fused causal convolution, which no post-hoc additive pass can
-express.  See ``docs/maintainer/qwen3.8-27b-lora-adapters.md`` section 3.
+Trains an adapter that `tools/convert/qwen3_8_27b/convert_lora.py` can convert directly, targeting
+the complete registered site table: all seven sites, 42,205,184 parameters and 368 objects at
+``--rank 16``.  What is absent from that table is a structural limit rather than a shortcut.
+``gate_proj``/``up_proj`` and the Gated DeltaNet input projections are excluded because their
+deltas would have to land before ``silu(gate) * up`` and before the fused causal convolution,
+which no post-hoc additive pass can express.  See
+``docs/maintainer/qwen3.8-27b-lora-adapters.md`` section 3.
+
+Every adapter registered in one engine must share one rank and one site inventory, so an adapter
+trained against an earlier, narrower table cannot be served alongside one trained here.
 
 ``--steps 0`` performs no optimizer step and writes the freshly initialized adapter.  PEFT
 initializes ``lora_B`` to exactly zero, so that adapter is the exact tier-0 identity and is the
@@ -23,13 +28,16 @@ import os
 from pathlib import Path
 
 
-# The registered site table, expressed as the HuggingFace leaf modules that feed it.
+# The complete registered site table, expressed as the HuggingFace leaf modules that feed it.
 # `q_proj` feeds two sites: the converter de-interleaves query and output-gate rows.
-TARGET_MODULES = ["q_proj", "k_proj", "v_proj", "o_proj", "down_proj"]
-
-# `linear_attn.out_proj` is a registered site but shares the `o_proj` leaf name only on the
-# attention layers; PEFT matches on the leaf, so it is named explicitly.
-LINEAR_ATTENTION_OUTPUT = "out_proj"
+#
+# `out_proj` is `linear_attn.out_proj`, and it is what makes this table cover the whole model.
+# Only 16 of the 64 layers are full attention; the other 48 are Gated DeltaNet. Omitting it adapts
+# the token-mixing path in 16 layers and leaves the remaining 48 carrying `mlp.down_proj` alone,
+# so three quarters of the model would get a single adapted projection. PEFT matches on the leaf
+# name, and `linear_attn.out_proj` does not collide with `self_attn.o_proj`, so naming it here
+# targets exactly the 48 GDN layers and nothing else.
+TARGET_MODULES = ["q_proj", "k_proj", "v_proj", "o_proj", "down_proj", "out_proj"]
 
 
 def frozen_base_quantization(model) -> dict:
@@ -68,6 +76,10 @@ def parse_arguments() -> argparse.Namespace:
     parser.add_argument("--prompt-column", default="", help="with --response-column, render a "
                         "two-turn chat into --dataset-field using the model chat template")
     parser.add_argument("--response-column", default="")
+    parser.add_argument("--messages-column", default="", help="render a message list column into "
+                        "the TRL prompt/completion schema with --completion-column; keeps "
+                        "multi-turn history and always takes the loss on the completion only")
+    parser.add_argument("--completion-column", default="completion")
     parser.add_argument("--completion-only", action="store_true",
                         help="mask the prompt and take the loss on the response only")
     # The rendered prompt must match the surface the engine serves. With thinking enabled the
@@ -84,8 +96,6 @@ def parse_arguments() -> argparse.Namespace:
     parser.add_argument("--accumulate", type=int, default=8)
     parser.add_argument("--learning-rate", type=float, default=2e-4)
     parser.add_argument("--seed", type=int, default=3407)
-    parser.add_argument("--include-linear-attention-output", action="store_true",
-                        help="also target linear_attn.out_proj")
     return parser.parse_args()
 
 
@@ -95,8 +105,6 @@ def main() -> int:
         raise SystemExit(f"base checkpoint directory does not exist: {arguments.base}")
 
     targets = list(TARGET_MODULES)
-    if arguments.include_linear_attention_output:
-        targets.append(LINEAR_ATTENTION_OUTPUT)
 
     # bfloat16 throughout: fp16 is rejected for this architecture by Unsloth's loader.
     model, tokenizer = FastModel.from_pretrained(
@@ -131,7 +139,30 @@ def main() -> int:
         else:
             dataset = load_dataset(arguments.dataset, split=arguments.dataset_split)
         text_field: str | None = arguments.dataset_field
-        if arguments.prompt_column and arguments.response_column:
+        if arguments.messages_column:
+            # A message list rather than a single user string, so a multi-turn row keeps its prior
+            # assistant turns - which are already in the target register - as context. The loss is
+            # always completion-only here: this schema exists to teach the response side.
+            #
+            # The list is rendered to a string in this process for the same reason as the
+            # prompt/response path below: TRL's conversational branch routes a `messages` column to
+            # the multimodal processor's `apply_chat_template`, which expects typed content parts
+            # and fails on plain text. Rendering here also keeps one owner for the
+            # training-surface-equals-serving-surface guarantee.
+            def split_messages(batch: dict) -> dict:
+                prompts, completions = [], []
+                for messages, completion in zip(batch[arguments.messages_column],
+                                                batch[arguments.completion_column]):
+                    prompts.append(tokenizer.apply_chat_template(
+                        messages, tokenize=False, add_generation_prompt=True,
+                        enable_thinking=arguments.thinking))
+                    completions.append(completion)
+                return {"prompt": prompts, "completion": completions}
+
+            dataset = dataset.map(split_messages, batched=True,
+                                  remove_columns=dataset.column_names)
+            text_field = None
+        elif arguments.prompt_column and arguments.response_column:
             if arguments.completion_only:
                 # Emit TRL's prompt/completion schema so the loss is taken on the response only.
                 # Training on the concatenation instead lets a long prompt dominate the gradient:
@@ -205,7 +236,10 @@ def main() -> int:
         "dataset": arguments.dataset,
         "data_files": arguments.data_files,
         "dataset_split": arguments.dataset_split,
-        "completion_only_loss": arguments.completion_only,
+        "messages_column": arguments.messages_column,
+        # The messages schema is prompt/completion by construction, so its loss is completion-only
+        # whether or not the flag was passed.
+        "completion_only_loss": bool(arguments.completion_only or arguments.messages_column),
         "thinking": arguments.thinking,
         "frozen_base_quantization": frozen_base_quantization(model),
     }

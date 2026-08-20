@@ -50,6 +50,10 @@ Runtime and Op references:
   authority for externally trained QLoRA adapters converted to `.ninfer`, banked alongside the base
   artifact and selected per request by the served model name. Its contracts are pending migration
   into the artifact, Op, architecture, and serving references.
+- [Unconditional persona adapter (Qwen3.8-27B)](maintainer/qwen3.8-27b-persona-adapter.md) is the
+  authority for the adapter-influence experiment: how the `datasets/caveman_pirate` corpus is
+  stratified so that an unprompted persona measures adapter strength, the seven-site r=32 training
+  configuration, the conversion-time `alpha` strength sweep, and the evaluation protocol.
 
 Artifact and model references:
 
