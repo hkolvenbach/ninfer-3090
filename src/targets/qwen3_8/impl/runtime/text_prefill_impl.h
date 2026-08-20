@@ -38,11 +38,12 @@ DFlashFeatureSink make_dflash_prefill_sink(PrefillContext& state) {
 void configure_text_card(TextContext& card, const ExecutionCore& execution,
                          const ops::SamplingConfig* sampling, std::int32_t current_state_slot,
                          std::int32_t turn_checkpoint_state_slot,
-                         std::uint32_t mtp_proposal_extent) {
+                         std::uint32_t mtp_proposal_extent, std::int32_t adapter) {
     card.set_sampling(sampling);
     card.set_linear_state_slots(current_state_slot, turn_checkpoint_state_slot);
     card.set_gdn_state_action(GdnStateAction::UpdateInPlace, nullptr);
     card.set_mtp_proposal_extent(mtp_proposal_extent);
+    card.set_adapter(adapter);
     if (execution.proposal_head == ProposalHead::Full) {
         card.set_proposal_head(nullptr, nullptr, 0);
         return;
@@ -62,7 +63,8 @@ PrefillChunkResult prefill_text_chunk(PrefillContext& state, std::span<const Tok
                      state.execution.prefill_hidden, state.execution.prefill_chunk,
                      state.text_kv_base, state.mtp_kv, &state.text_cache, state.mtp_cache);
     configure_text_card(card, state.execution, state.sampling, state.current_state_slot,
-                        state.turn_checkpoint_state_slot, state.mtp_proposal_extent);
+                        state.turn_checkpoint_state_slot, state.mtp_proposal_extent,
+                        state.adapter);
     card.set_turn_checkpoint_hidden_output(state.turn_checkpoint_hidden);
     card.set_prefill_turn_checkpoint_frontier(
         turn_checkpoint_capture_frontier
@@ -90,7 +92,8 @@ prefill_multimodal_chunk(PrefillContext& state, const PreparedPromptData& prompt
                      state.execution.prefill_hidden, state.execution.prefill_chunk,
                      state.text_kv_base, state.mtp_kv, &state.text_cache, state.mtp_cache);
     configure_text_card(card, state.execution, state.sampling, state.current_state_slot,
-                        state.turn_checkpoint_state_slot, state.mtp_proposal_extent);
+                        state.turn_checkpoint_state_slot, state.mtp_proposal_extent,
+                        state.adapter);
     card.set_turn_checkpoint_hidden_output(state.turn_checkpoint_hidden);
     card.set_prefill_turn_checkpoint_frontier(
         turn_checkpoint_capture_frontier

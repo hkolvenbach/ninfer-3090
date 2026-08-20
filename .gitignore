@@ -36,6 +36,8 @@ node_modules/
 *.gguf
 out/
 models/
+# Anchored: a bare `lora/` would also swallow source directories such as tests/ops/lora/.
+/lora/
 vcpkg_installed/
 *.log
 

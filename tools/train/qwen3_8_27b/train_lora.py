@@ -32,16 +32,50 @@ TARGET_MODULES = ["q_proj", "k_proj", "v_proj", "o_proj", "down_proj"]
 LINEAR_ATTENTION_OUTPUT = "out_proj"
 
 
+def frozen_base_quantization(model) -> dict:
+    """Describe the quantization of the frozen base the adapter was fitted against.
+
+    The adapter is served on top of the `groupwise-int` artifact, not on top of this base, so the
+    two codecs differ.  Neither the PEFT config nor the model config records what bitsandbytes
+    actually applied, and without it the training-time base cannot be reconstructed later.
+    """
+    for _, module in model.named_modules():
+        weight = getattr(module, "weight", None)
+        state = getattr(weight, "quant_state", None)
+        if state is None:
+            continue
+        nested = getattr(state, "state2", None)
+        return {
+            "kind": type(weight).__name__,
+            "quant_type": getattr(state, "quant_type", None),
+            "blocksize": getattr(state, "blocksize", None),
+            "compute_dtype": str(getattr(state, "dtype", None)),
+            "double_quant": bool(getattr(state, "nested", False)),
+            "double_quant_blocksize": getattr(nested, "blocksize", None),
+        }
+    return {"kind": "unquantized"}
+
+
 def parse_arguments() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--base", required=True, type=Path, help="BF16 checkpoint directory")
     parser.add_argument("--out", required=True, type=Path, help="adapter output directory")
-    parser.add_argument("--dataset", default="", help="HF dataset id; empty uses --steps 0")
+    parser.add_argument("--dataset", default="", help="HF dataset id, or 'json' with --data-files; "
+                        "empty uses --steps 0")
+    parser.add_argument("--data-files", default="", help="local file for --dataset json")
     parser.add_argument("--dataset-split", default="train")
     parser.add_argument("--dataset-field", default="text")
     parser.add_argument("--prompt-column", default="", help="with --response-column, render a "
                         "two-turn chat into --dataset-field using the model chat template")
     parser.add_argument("--response-column", default="")
+    parser.add_argument("--completion-only", action="store_true",
+                        help="mask the prompt and take the loss on the response only")
+    # The rendered prompt must match the surface the engine serves. With thinking enabled the
+    # template leaves `<think>` open; the server's --no-thinking closes it immediately. An adapter
+    # trained against one context does not fire in the other.
+    parser.add_argument("--thinking", action="store_true",
+                        help="render prompts with the thinking block open (default: closed, "
+                             "matching ninfer-serve --no-thinking)")
     parser.add_argument("--rank", type=int, default=16, choices=(8, 16, 32, 64))
     parser.add_argument("--alpha", type=int, default=32)
     parser.add_argument("--max-seq-length", type=int, default=1024)
@@ -91,26 +125,55 @@ def main() -> int:
         from datasets import load_dataset
         from trl import SFTConfig, SFTTrainer
 
-        dataset = load_dataset(arguments.dataset, split=arguments.dataset_split)
+        if arguments.data_files:
+            dataset = load_dataset(arguments.dataset, data_files=arguments.data_files,
+                                   split=arguments.dataset_split)
+        else:
+            dataset = load_dataset(arguments.dataset, split=arguments.dataset_split)
+        text_field: str | None = arguments.dataset_field
         if arguments.prompt_column and arguments.response_column:
-            # The adapter must learn the same surface the engine serves, so the training text is
-            # the model's own chat template rather than a bare concatenation.
-            def render(batch: dict) -> dict:
-                rendered = []
-                for prompt, response in zip(batch[arguments.prompt_column],
-                                            batch[arguments.response_column]):
-                    rendered.append(tokenizer.apply_chat_template(
-                        [{"role": "user", "content": prompt},
-                         {"role": "assistant", "content": response}],
-                        tokenize=False))
-                return {arguments.dataset_field: rendered}
+            if arguments.completion_only:
+                # Emit TRL's prompt/completion schema so the loss is taken on the response only.
+                # Training on the concatenation instead lets a long prompt dominate the gradient:
+                # a ~30-token answer inside a ~600-token problem receives a few percent of the
+                # signal, which is far too little to teach a response-side behaviour.
+                #
+                # The columns are rendered strings rather than message lists on purpose. TRL's
+                # conversational branch would hand them to the multimodal processor's
+                # `apply_chat_template`, which expects typed content parts and fails on plain
+                # text. Rendering here also pins the training surface to the served one.
+                def split(batch: dict) -> dict:
+                    prompts, completions = [], []
+                    for prompt, response in zip(batch[arguments.prompt_column],
+                                                batch[arguments.response_column]):
+                        prompts.append(tokenizer.apply_chat_template(
+                            [{"role": "user", "content": prompt}],
+                            tokenize=False, add_generation_prompt=True,
+                            enable_thinking=arguments.thinking))
+                        completions.append(response)
+                    return {"prompt": prompts, "completion": completions}
 
-            dataset = dataset.map(render, batched=True, remove_columns=dataset.column_names)
+                dataset = dataset.map(split, batched=True, remove_columns=dataset.column_names)
+                text_field = None
+            else:
+                # The adapter must learn the same surface the engine serves, so the training text
+                # is the model's own chat template rather than a bare concatenation.
+                def render(batch: dict) -> dict:
+                    rendered = []
+                    for prompt, response in zip(batch[arguments.prompt_column],
+                                                batch[arguments.response_column]):
+                        rendered.append(tokenizer.apply_chat_template(
+                            [{"role": "user", "content": prompt},
+                             {"role": "assistant", "content": response}],
+                            tokenize=False, enable_thinking=arguments.thinking))
+                    return {arguments.dataset_field: rendered}
+
+                dataset = dataset.map(render, batched=True, remove_columns=dataset.column_names)
         trainer = SFTTrainer(
             model=model,
             train_dataset=dataset,
             args=SFTConfig(
-                dataset_text_field=arguments.dataset_field,
+                dataset_text_field=text_field,
                 max_length=arguments.max_seq_length,
                 per_device_train_batch_size=arguments.batch_size,
                 gradient_accumulation_steps=arguments.accumulate,
@@ -139,6 +202,12 @@ def main() -> int:
         "steps": arguments.steps,
         "max_seq_length": arguments.max_seq_length,
         "seed": arguments.seed,
+        "dataset": arguments.dataset,
+        "data_files": arguments.data_files,
+        "dataset_split": arguments.dataset_split,
+        "completion_only_loss": arguments.completion_only,
+        "thinking": arguments.thinking,
+        "frozen_base_quantization": frozen_base_quantization(model),
     }
     (arguments.out / "training_report.json").write_text(json.dumps(report, indent=2) + "\n")
     print(f"wrote adapter to {arguments.out}")

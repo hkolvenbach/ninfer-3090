@@ -27,6 +27,8 @@ def attention_mixer(model, layer, x, positions, start, tap, context) -> torch.Te
     h = rmsnorm(x, model.weight(layer_weights.input_norm))
     qk = linear(h, model.block_weight(attention_weights.query_key))
     gatev = linear(h, model.block_weight(attention_weights.gate_value))
+    if model.lora is not None:
+        model.lora.apply_attention_input(layer, h, qk, gatev)
     q = qk[:, :CFG.q_size].reshape(-1, CFG.q_heads, CFG.head_dim)
     k = qk[:, CFG.q_size:].reshape(-1, CFG.kv_heads, CFG.head_dim)
     gate = gatev[:, :CFG.q_size].reshape(-1, CFG.q_heads, CFG.head_dim)
@@ -41,10 +43,10 @@ def attention_mixer(model, layer, x, positions, start, tap, context) -> torch.Te
         for name, value in (("q", q), ("k", k), ("v", v), ("gate", gate)):
             model._tap(tap, f"layer_{layer:02d}/op/{name}", value, **context)
     attended = model._gqa(q, k, v, CFG.full_index(layer), start)
-    out = linear(
-        sigmoid_mul(gate, attended).reshape(-1, CFG.q_size),
-        model.weight(attention_weights.output),
-    )
+    mixed = sigmoid_mul(gate, attended).reshape(-1, CFG.q_size)
+    out = linear(mixed, model.weight(attention_weights.output))
+    if model.lora is not None:
+        out = model.lora.apply_attention_output(layer, mixed, out)
     return residual_add(x, out)
 
 
@@ -90,13 +92,11 @@ def gdn_mixer(model, layer, x, tap, context) -> torch.Tensor:
         unit_offset=False,
         z=z,
     )
-    return residual_add(
-        x,
-        linear(
-            out.reshape(-1, CFG.value_dim),
-            model.weight(gdn_weights.output),
-        ),
-    )
+    mixed = out.reshape(-1, CFG.value_dim)
+    projected = linear(mixed, model.weight(gdn_weights.output))
+    if model.lora is not None:
+        projected = model.lora.apply_gdn_output(layer, mixed, projected)
+    return residual_add(x, projected)
 
 
 def mlp(model, layer, x) -> torch.Tensor:
@@ -104,10 +104,11 @@ def mlp(model, layer, x) -> torch.Tensor:
     h = rmsnorm(x, model.weight(layer_weights.post_attention_norm))
     gate_up = linear(h, model.block_weight(layer_weights.mlp.gate_up))
     gate, up = gate_up.split(CFG.intermediate, dim=-1)
-    return residual_add(
-        x,
-        linear(silu_mul(gate, up), model.weight(layer_weights.mlp.down)),
-    )
+    activated = silu_mul(gate, up)
+    out = linear(activated, model.weight(layer_weights.mlp.down))
+    if model.lora is not None:
+        out = model.lora.apply_mlp_down(layer, activated, out)
+    return residual_add(x, out)
 
 
 def run(

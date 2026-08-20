@@ -97,6 +97,8 @@ def build_parser() -> argparse.ArgumentParser:
         "--stop-ids",
         help="comma/space-separated override; defaults to artifact generation config",
     )
+    parser.add_argument("--lora", help="PEFT adapter directory applied at the "
+                        "registered LoRA sites")
     parser.add_argument("--activation-dump")
     parser.add_argument("--dump-level", choices=("layer", "op"), default="layer")
     parser.add_argument(
@@ -302,6 +304,7 @@ def main(argv: Sequence[str] | None = None) -> None:
         mtp_draft_tokens=args.mtp_draft_tokens,
         draft_head=args.draft_head,
         compile_codec=compile_codec,
+        lora=args.lora,
     ) as model, torch.inference_mode():
         frontend = Frontend(model.binding)
         load_seconds = time.perf_counter() - load_started

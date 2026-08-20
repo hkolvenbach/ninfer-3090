@@ -55,6 +55,9 @@ struct PrefillContext {
     std::int32_t turn_checkpoint_state_slot                 = 0;
     std::uint32_t mtp_proposal_extent                       = 0;
     const qwen3_8::DFlashDecodeIngress* dflash_host_ingress = nullptr;
+    // A prefill chunk carries exactly one sequence, so its LoRA selection is a scalar rather than
+    // the per-row vector the batched decode paths bind. -1 selects the base weights.
+    std::int32_t adapter = -1;
 };
 
 struct OrdinaryBatchContext {
@@ -132,7 +135,7 @@ struct TargetVerifyFrameView {
 void configure_text_card(TextContext& card, const ExecutionCore& execution,
                          const ops::SamplingConfig* sampling, std::int32_t current_state_slot,
                          std::int32_t turn_checkpoint_state_slot,
-                         std::uint32_t mtp_proposal_extent);
+                         std::uint32_t mtp_proposal_extent, std::int32_t adapter);
 void target_verify_accept(ExecutionCore& execution, Tensor& continuation_hidden_store,
                           TextContext& card, TargetVerifyFrameView frame,
                           ops::GqaExecutionEnvelope envelope);

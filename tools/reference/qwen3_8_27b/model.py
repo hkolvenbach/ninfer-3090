@@ -15,6 +15,7 @@ from tools.reference.qwen3_8.common.tap import NullTap
 from . import mtp as mtp_schedule
 from .bindings import ArtifactBinding, WeightObject
 from .config import CFG
+from .lora import LoraAdapter
 from .ops import attention, linear, rmsnorm
 from .state import ModelState, StateSnapshot
 from .text import run as run_text
@@ -48,6 +49,7 @@ class RefModel:
         mtp_draft_tokens: int = 0,
         draft_head: bool = False,
         compile_codec: bool | None = None,
+        lora: str | Path | None = None,
     ):
         self.device = torch.device(device)
         if self.device.type == "cuda" and not torch.cuda.is_available():
@@ -64,6 +66,9 @@ class RefModel:
             raise ValueError("draft_head requires MTP")
 
         self.binding = ArtifactBinding.open(weights)
+        # Read from a PEFT directory, not a converted artifact, so this path stays
+        # independent of the converter it is used to check.
+        self.lora = None if lora is None else LoraAdapter(lora, device=self.device)
         self.memory_bytes = memory_bytes
         self.headroom_bytes = headroom_bytes
         self.kv_dtype = kv_dtype

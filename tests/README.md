@@ -120,6 +120,18 @@ NINFER_QWEN3_8_27B_WEIGHTS=$PWD/out/qwen3_8_27b.ninfer \
   ctest --test-dir build -R ninfer_qwen3_8_27b_prefix_real_test --output-on-failure
 ```
 
+The runtime LoRA test needs two more adapters over the same artifact. They must share one rank and
+one site inventory, so both come from the same converter path — a zero-step PEFT adapter for the
+zero arm, and a trained one for the arm that has to move the first greedy token. A synthetic
+`random` fixture does not work here: it is unstructured noise and does not move a confident argmax.
+
+```bash
+NINFER_QWEN3_8_27B_WEIGHTS=$PWD/out/qwen3_8_27b.ninfer \
+NINFER_QWEN3_8_27B_LORA_ZERO=$PWD/lora/peft_zero.lora.ninfer \
+NINFER_QWEN3_8_27B_LORA_TRAINED=$PWD/lora/math.lora.ninfer \
+  ctest --test-dir build -R ninfer_qwen3_8_27b_lora_real_test --output-on-failure
+```
+
 Run the peer 35B-A3B route independently:
 
 ```bash

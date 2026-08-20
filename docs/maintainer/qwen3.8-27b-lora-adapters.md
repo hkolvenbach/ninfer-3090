@@ -621,16 +621,39 @@ the feature as a whole, because per-column adapter routing is the one genuinely 
 |---|---|---|---|
 | 1 | Op unit test — tiers 1/2/3 against the FP32 oracle, bank built in memory, including `adapter_index < 0` | GPU only | `tests/ops/test_lora_delta_add.cpp` and `tests/ops/lora/`, following `tests/ops/op_check.h` and `op_tester.h` |
 | 2 | Converter — synthetic PEFT → `.ninfer`, object inventory, decoded values, rejection of excluded modules | nothing | `tests/targets/qwen3_8_27b/` |
-| 3 | Reference vs engine — per-layer activation dumps | **B3 fix** | `tools/reference/qwen3_8_27b/cli.py --lora --activation-dump --dump-level op` |
-| 4 | Serving — `/v1/models`, 404 on unknown, routing, mixed batch, prefix isolation | `models/qwen3_8_27b.ninfer` | `tests/test_serve_options.cpp`, `test_openai_schema.cpp`, live server |
-| 5 | Performance | GPU, quiet box | `bench/targets/qwen3_8_27b` at `B ∈ {1,8}` with 0/1/8 adapters |
+| 3 | Reference vs engine — a trained adapter, applied at the same sites, read from the PEFT directory so a converter fault cannot be inherited | BF16 checkpoint, a PEFT adapter | `tools/reference/qwen3_8_27b/lora.py`, `--lora` on `cli.py` |
+| 4 | Engine — a trained adapter moves the **first** greedy token; a zero adapter does not, and does not leak | `models/qwen3_8_27b.ninfer` + two co-registerable adapters | `tests/targets/qwen3_8_27b/test_engine_lora_real.cpp` |
+| 5 | Serving — `/v1/models`, 404 on unknown, routing, mixed batch, prefix isolation | `models/qwen3_8_27b.ninfer` | `tests/test_serve_options.cpp`, `test_openai_schema.cpp`, live server |
+| 6 | Performance | GPU, quiet box | `bench/targets/qwen3_8_27b` at `B ∈ {1,8}` with 0/1/8 adapters |
 
-Register new C++ tests through `ninfer_add_test(...)` in `tests/CMakeLists.txt:9-32`. Tests needing
-the real artifact read `NINFER_WEIGHTS` and skip without it.
+Register new C++ tests through `ninfer_add_test(...)` in `tests/CMakeLists.txt:9-32`. The
+real-artifact tests in `tests/targets/qwen3_8_27b/` read `NINFER_QWEN3_8_27B_WEIGHTS` and skip with
+exit 77 without it; layer 4 additionally needs `NINFER_QWEN3_8_27B_LORA_ZERO` and
+`NINFER_QWEN3_8_27B_LORA_TRAINED`.
 
-Layer 3 is the end-to-end numerical gate and is **blocked by B3** — the Python reference cannot
-open the shipped artifact until `tools/reference/qwen3_8_27b/bindings.py:276,314` is corrected from
-`Q6` to `W8`.
+Layer 4 exists because the coverage claim that used to stand here was false. It read: a zero adapter
+reproduces the base byte-identically while a dense adapter diverges, therefore "the correction is
+applied where it should be." It does not follow. A correction that is *suppressed* is
+indistinguishable from one that is *zero*, so the zero arm can never detect a missing application;
+and the dense arm only requires the delta to land somewhere, which the decode path satisfied on its
+own. A defect that suppressed the adapter through all of prefill passed every LoRA test in the tree.
+
+Two properties of layer 4 matter, and both were established by disabling the fix and re-running:
+
+- **One greedy token, not a completion.** The first token is the argmax of the logits the prefill
+  chunk produced, so it moves only if prefill itself ran adapted. Comparing a long completion does
+  not work: the decode steps diverge on their own and mask the defect.
+- **A trained adapter, not a synthetic one.** The `random` tier is unstructured noise; measured on
+  the real artifact it does not move a confident argmax at all, so it cannot serve as a behavioural
+  probe. Its numerics are already covered by layer 1. Only an adapter with a learned behaviour
+  gives the first token a direction to move in.
+
+Because all adapters in one bank share a rank and a site inventory, the zero arm must come from the
+same inventory as the trained arm — a 7-site synthetic beside a 6-site trained adapter is rejected
+at load. A zero-step PEFT adapter converted through the normal path satisfies this.
+
+The B3 defect that once blocked layer 3 is fixed: `tools/reference/qwen3_8_27b/bindings.py:276`
+and `:314` now read `W8`, matching `WeightsProfile::GroupwiseIntW8Endpoints`.
 
 ## 11. Training recipe
 
@@ -692,14 +715,16 @@ the adapter onto the downloaded `W16`, not onto `dequant(W4)` that training actu
 | **0d** | Prefix/lane/slot isolation, CLI and serving routes, `/v1/models` | **done**, all four surfaces |
 | **1** | Install `fla` and `causal_conv1d`; `get_peft_model()` with **zero training steps** → real PEFT zero adapter → must reproduce tier 0 exactly | **done** |
 | **2** | Real SFT; convert; serve | **done** |
+| **3** | Reference LoRA path (§10 layer 3); prefill-application defect found and fixed; engine matches the reference | **done** |
 
 Phase 0 evidence, on the real 18.2 GB `groupwise-int` artifact with three synthetic adapters
 resident:
 
 - a converted `.lora.ninfer` whose `B` is exactly zero is loaded, banked and executed, and its
   greedy output is **byte-identical** to the base — the zero-cost and correctness floor;
-- the same run with a dense random adapter **diverges**, so the correction is genuinely applied
-  through prefill, graph capture and decode;
+- the same run with a dense random adapter **diverges**, so the correction reaches execution —
+  note that this does *not* establish it reaches every phase, which is the inference that
+  concealed the prefill defect for two phases; see §10;
 - with three adapters registered, a request naming no adapter and a request naming the zero
   adapter both reproduce the base output exactly, while bank index 2 diverges — the banked stride
   addressing is correct;
@@ -744,9 +769,127 @@ with an explicit message. And `FastModel.from_pretrained` returns a `Qwen3VLProc
 tokenizer, so a positional `tokenizer(text)` call is interpreted as *images*; use `text=` or
 `processor.tokenizer`.
 
-The adapter is trained against a bitsandbytes NF4 frozen base but served on top of the
-`groupwise-int` artifact. That base-quantization mismatch is the main remaining quality risk and is
-not yet measured.
+### Base-quantization mismatch — measured, then refuted
+
+The behavioural non-transfer recorded below was real, reproducible, and **not** caused by the
+base-quantization mismatch. It was an engine defect: prefill never bound the selected adapter. The
+measurement and its refutation are both kept here, because the mismatch is still a genuine property
+of the training setup and the false attribution is the reason the defect survived a green test
+suite. **Skip to "What it actually was" for the conclusion.**
+
+An adapter is fitted with the frozen base held at bitsandbytes NF4 but served on top of the
+`groupwise-int` artifact. Recovered from the live loader, training holds the base at `nf4`,
+blocksize 64, **double-quantized scales** (nested blocksize 256), bf16 compute. The served base
+uses symmetric uniform codes against exactly-stored FP16 scales at the same group size, and is
+**Q5 at four of the six sites** — finer than NF4 — and Q4 at query and key. `q_proj` straddles
+both, its query half served from a Q4 matrix and its output-gate half from a Q5 one.
+`train_lora.py` now records this in `training_report.json`; neither the PEFT config nor the model
+config carries it.
+
+`tools/parity/qwen3_8_27b/lora_transfer.py` measured the 120-step math adapter over 60 held-out
+prompts at a 48-token greedy budget, with the prompt surface verified identical on both runners
+(75 prompt tokens each, matching `enable_thinking=False`):
+
+| Arm | Opens a reasoning block | Replies identical to its own base |
+|---|---:|---:|
+| `groupwise-int`, no adapter | 0% | — |
+| `groupwise-int` + adapter | **0%** | 40.0% |
+| NF4, no adapter | 0% | — |
+| NF4 + adapter | **100%** | 0.0% |
+
+The adapter was trained on chain-of-thought solutions, so emitting `<think>` is its single most
+salient learned behaviour. On the base it was fitted against it did so on every prompt. On the base
+it is served on it never did, and left 40% of replies byte-identical to no adapter at all. The
+effect did not transfer.
+
+That 40% figure is the tell, and it was misread at the time. A perturbation large enough to suppress
+the adapter's most salient behaviour on every prompt should not leave two replies in five *exactly*
+unchanged. Partial application explains both numbers at once; a base difference explains neither
+cleanly.
+
+Three confounds were eliminated before accepting this. The prompt is identical on both paths. The
+adapter is verifiably attached on both, with 128 `lora_A` modules and a maximum next-token logit
+change of 8.34 on the NF4 path. And NInfer neither hides reasoning in a separate response field —
+the message carries only `content` and `role` — nor suppresses the token, as no logit banning
+exists anywhere in `src/ops` or `src/targets`; thinking affects prompt construction only.
+
+Measured relative Frobenius error against the true BF16 weight, at four sites:
+
+| site | `e_g` served | `e_n` trained-on | `E = Q_g - Q_n` | `BA` |
+|---|---:|---:|---:|---:|
+| layer 3 attention/output | 0.0525 | 0.0937 | 0.1073 | 0.0079 |
+| layer 3 mlp/down | 0.0508 | 0.0923 | 0.1055 | 0.0069 |
+| layer 63 attention/output | 0.0573 | 0.0965 | 0.1119 | 0.0089 |
+| layer 63 mlp/down | 0.0546 | 0.0946 | 0.1091 | 0.0101 |
+
+The served base is about 1.8x **more** accurate than the base the adapter was fitted against —
+these are Q5 sites, and 5-bit uniform with exact FP16 scales beats 4-bit NF4 with double-quantized
+scales. The two errors are orthogonal: sqrt(0.0525^2 + 0.0937^2) = 0.1074 against a measured
+0.1073. The unmodeled perturbation is roughly 13x the adapter's own norm.
+
+A mechanism consistent with the norm table is that the adapter partly learned to compensate the
+specific quantization error of its own frozen base, and that emitting a reasoning block is a
+near-threshold first-token decision a base difference can flip. That was the working hypothesis, and
+it was wrong.
+
+#### What settled it
+
+Three confounds had been eliminated — prompt equality, adapter attachment on the NF4 path, and the
+absence of any reasoning-token suppression in `src/ops` or `src/targets`. A fourth had not: an error
+anywhere between the PEFT checkpoint and the applied delta produces the same observation. Two
+independent checks closed it, in the order that isolates the most code:
+
+1. **Converter** (`scale·B@A` from the PEFT directory against the artifact's `lora_a`/`lora_b`
+   product, every site of an attention layer and a GDN layer): all sites match at a relative error
+   of 0.0016–0.0022, which is BF16 rounding. The scale fold, the `B` orientation and the `q_proj`
+   de-interleave are all correct.
+2. **Layer 3 of §10** — a reference LoRA path (`tools/reference/qwen3_8_27b/lora.py`) that reads
+   the **PEFT directory directly**, so a converter fault cannot be inherited, applied at the same four
+   correction points on the same `groupwise-int` base. Result: `ref_base` opens 0/3 reasoning
+   blocks, matching NInfer's base, and `ref_adapter` opens **3/3**, matching the NF4 path
+   character-for-character.
+
+The adapter therefore transfers across the base-quantization difference perfectly well. The
+`groupwise-int` base reproduces the trained behaviour when the delta is actually applied. NInfer was
+not applying it.
+
+#### What it actually was
+
+`TextContext::set_adapter` — the setter for the scalar bank selector that prefill reads through
+`bind_uniform_adapter` — **had no caller anywhere in the tree**. `uniform_adapter_` therefore kept
+its initializer of `-1`, `bind_uniform_adapter` returned early leaving `active_adapters_` null, and
+every `lora_apply` call on the prefill path was suppressed. The batched decode paths were unaffected
+because they bind a per-row adapter vector through `set_active_adapters`, which was wired correctly.
+
+Every prompt was thus encoded entirely on base weights, and only the committed decode steps carried
+the delta. That accounts for the whole observation: the first token — the argmax of logits the
+prefill chunk produced — was always the base's token, so `<think>` was never emitted; and on
+prompts where the base's own continuation was stable the adapted decode steps changed nothing
+either, leaving 40% of replies byte-identical.
+
+The fix routes the sequence's adapter through `PrefillContext` into `configure_text_card`, the
+single configuration point shared by text prefill, multimodal prefill and the MTP bridge, alongside
+sampling and the linear-state slots. After it, the engine matches the reference exactly: base 0/3,
+adapter 3/3, with an opening character-identical to both the reference and the NF4 path, and 0%
+rather than 40% of replies byte-identical to base.
+
+#### Consequences
+
+- **The mismatch remedies are dropped.** Both routes costed here — retraining on a
+  `groupwise-int`-derived checkpoint (measured at a 12% residual reduction, already rejected) and
+  holding the artifact's codes and FP16 scales in the training loop (~20 GB peak, 2–4x slower per
+  step, dominated by the inverse conversion recipe) — existed only to remedy a non-transfer that
+  does not exist. Neither is scheduled.
+- **The norm table stands.** The served base really is about 1.8x more accurate than the base the
+  adapter was fitted against, and the two errors really are orthogonal. That difference is simply
+  not large enough to matter behaviourally, which is now a measured result rather than an estimate.
+- **The verification gap was the real defect.** §10's claim that a zero adapter reproducing the
+  base byte-identically "proves the correction is applied where it should be" was false: a suppressed
+  correction and a zero correction are indistinguishable by that test. Every LoRA test in the tree
+  passed throughout. See §10 for the gate that now covers it.
+
+One caveat on scope: this was one adapter, one task and one 48-token budget. It establishes that the
+behaviour transfers, not that downstream task quality is unaffected by the base difference.
 
 ## 13. Open decisions
 
