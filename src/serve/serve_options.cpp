@@ -4,6 +4,7 @@
 
 #include <cerrno>
 #include <cstdint>
+#include <filesystem>
 #include <cstdlib>
 #include <limits>
 #include <stdexcept>
@@ -114,6 +115,7 @@ std::string serve_usage_text(const char* argv0) {
            "[--kv-dtype bf16|int8|rk8v4|rk4v4|rk4v4-e8|rk2v4-e8] [--spec mtp|dflash --draft-tokens "
            "N] "
            "[--default-max-tokens N] "
+           "[--lora NAME=PATH]... "
            "[--vision] [--vision-max-tokens N] [--no-cuda-graph] [--no-prefix-reuse] "
            "[--prefix-checkpoint-policy stable-turn|rolling-tool] "
            "[--continuation-cache off|l1|l1-l2|l1-l2-l3] "
@@ -145,6 +147,7 @@ std::string serve_usage_text(const char* argv0) {
            "       --log-stats-interval-ms defaults to 5000; 0 disables periodic throughput logs\n"
            "       --vision enables media and loads the fixed Vision GPU allocations\n"
            "       --vision-max-tokens sets the Vision scratchpad token capacity (default 8192)\n"
+           "       --lora registers an adapter served as model id <model>-<NAME>\n"
            "       --kv-capacity auto leaves " +
            std::to_string(kDefaultKvCapacityHeadroomBytes / (1024ULL * 1024ULL)) +
            " MiB of sizing headroom\n"
@@ -280,6 +283,15 @@ ServeOptions parse_serve_options(int argc, char** argv) {
             }
             options.vision_max_tokens = static_cast<std::uint32_t>(val);
             options.enable_vision     = true;
+        } else if (arg == "--lora") {
+            const std::string_view spec(require_value("--lora"));
+            const std::size_t split = spec.find('=');
+            if (split == std::string_view::npos || split == 0 || split + 1 == spec.size()) {
+                throw std::invalid_argument("--lora expects NAME=PATH");
+            }
+            options.lora_adapters.push_back(
+                LoraAdapterSpec{.name = std::string(spec.substr(0, split)),
+                                .path = std::filesystem::path(spec.substr(split + 1))});
         } else if (arg == "--no-cuda-graph") {
             options.use_cuda_graph = false;
         } else if (arg == "--no-prefix-reuse") {

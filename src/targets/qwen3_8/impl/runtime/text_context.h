@@ -19,6 +19,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <functional>
+#include <initializer_list>
 #include <span>
 #include <vector>
 
@@ -72,8 +73,17 @@ inline constexpr ModelConfig kCfg{};
 inline constexpr float kAttnScale                     = kAttentionScale;
 inline constexpr std::uint32_t kPrefillChunkAlignment = 128;
 
+// One registered site paired with the destination it corrects.
+struct LoraDestination {
+    const qwen3_8::LoraSiteWeights* site = nullptr;
+    Tensor* destination                  = nullptr;
+};
+
 struct MlpW {
     const MlpWeights* payload = nullptr;
+    // Registered down-projection site. The delta acts on the SwiGLU activation, which the
+    // package post-mixer leaf owns, so this view is consumed inside that leaf.
+    const qwen3_8::LoraSiteWeights* lora_down = nullptr;
 };
 
 struct FullLayerW {
@@ -83,6 +93,7 @@ struct FullLayerW {
     const Tensor* q_norm                             = nullptr;
     const Tensor* k_norm                             = nullptr;
     const Tensor* post_attn_norm                     = nullptr;
+    const qwen3_8::LoraFullLayerWeights* lora        = nullptr;
     MlpW mlp;
 };
 
@@ -93,6 +104,7 @@ struct GdnLayerW {
     const Tensor* gdn_norm                 = nullptr;
     const Weight* out_proj                 = nullptr;
     const Tensor* post_attn_norm           = nullptr;
+    const qwen3_8::LoraGdnLayerWeights* lora = nullptr;
     MlpW mlp;
 };
 
@@ -181,6 +193,13 @@ public:
 
     void set_mtp_proposal_extent(std::uint32_t extent) noexcept { mtp_proposal_extent_ = extent; }
 
+    // LoRA bank selection for the calls that follow. `set_adapter` records a uniform choice for
+    // routes that carry one sequence (prefill and the single-sequence schedules); -1 keeps the
+    // base weights and suppresses every LoRA launch. `set_active_adapters` binds a device-resident
+    // per-sequence selector produced by a batched round's ingress.
+    void set_adapter(std::int32_t index) noexcept { uniform_adapter_ = index; }
+    void set_active_adapters(const Tensor* adapters) noexcept { active_adapters_ = adapters; }
+
     void set_linear_state_slots(std::int32_t current_slot, std::int32_t turn_checkpoint_slot);
     void set_gdn_state_action(GdnStateAction action, const GdnReplayRecords* replay_records);
 
@@ -238,6 +257,11 @@ private:
     }
 
     [[nodiscard]] const MtpW& mtp_weights() const;
+    void lora_apply(std::initializer_list<LoraDestination> sites, const Tensor& input,
+                    cudaStream_t stream);
+    // Materializes the uniform adapter choice into workspace-backed device storage and binds it
+    // for the current call. A no-op when no bank is resident or the base weights are selected.
+    void bind_uniform_adapter(cudaStream_t stream);
     void attn_mix(const FullLayerW& weights, Tensor& x, int index, Phase phase);
     void gdn_mix(const GdnLayerW& weights, Tensor& x, int index, Phase phase);
     void mlp_tail(const Tensor* post_norm, const MlpW& weights, Tensor& x, Phase phase);
@@ -297,6 +321,11 @@ private:
     const Tensor* active_cache_positions_                 = nullptr;
     const Tensor* active_rope_positions_                  = nullptr;
     const Tensor* active_kv_table_rows_                   = nullptr;
+    // Device-resident LoRA bank selector for the call in flight. One entry routes the whole
+    // call; B entries route per sequence. Null whenever the bank is unused.
+    const Tensor* active_adapters_                        = nullptr;
+    Tensor uniform_adapter_storage_;
+    std::int32_t uniform_adapter_                         = -1;
     const Tensor* active_linear_state_slots_              = nullptr;
     const Tensor* active_valid_columns_                   = nullptr;
     const Tensor* active_backend_kv_table_rows_           = nullptr;

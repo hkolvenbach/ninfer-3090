@@ -829,14 +829,28 @@ int test_tool_chunk_serialization() {
 
 int test_models_and_error() {
     int failures    = 0;
-    const Json list = Json::parse(make_models_list("qwen3.8-27b", 1, 65536, true));
+    const Json list = Json::parse(make_models_list("qwen3.8-27b", {}, 1, 65536, true));
     failures += check(list.at("object") == "list", "models list object");
+    failures += check(list.at("data").size() == 1, "models list holds only the base model");
     failures += check(list.at("data").at(0).at("id") == "qwen3.8-27b", "models list id");
     failures += check(list.at("data").at(0).at("object") == "model", "models list entry object");
     failures += check(list.at("data").at(0).at("owned_by") == "ninfer", "models list owner");
     failures += check(list.at("data").at(0).at("context_window") == 65536, "models list context");
     failures += check(list.at("data").at(0).at("modalities").at("vision") == true,
                       "models list vision modality");
+
+    // A registered adapter is served as an additional model id beside the base.
+    const Json with_adapters = Json::parse(make_models_list(
+        "qwen3.8-27b", {"qwen3.8-27b-qlora-math", "qwen3.8-27b-qlora-sql"}, 1, 65536, true));
+    failures += check(with_adapters.at("data").size() == 3, "adapter models list size");
+    failures += check(with_adapters.at("data").at(0).at("id") == "qwen3.8-27b",
+                      "adapter models list keeps the base first");
+    failures += check(with_adapters.at("data").at(1).at("id") == "qwen3.8-27b-qlora-math",
+                      "adapter models list first adapter id");
+    failures += check(with_adapters.at("data").at(2).at("id") == "qwen3.8-27b-qlora-sql",
+                      "adapter models list second adapter id");
+    failures += check(with_adapters.at("data").at(1).at("context_window") == 65536,
+                      "adapter models list context");
 
     const Json one = Json::parse(make_model_object("qwen3.8-27b", 1, 65536, false));
     failures += check(one.at("id") == "qwen3.8-27b" && one.at("object") == "model", "model object");

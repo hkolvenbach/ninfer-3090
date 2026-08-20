@@ -30,6 +30,10 @@ struct Options {
     std::uint32_t vision_max_tokens = 8192;
     bool enable_vision  = false;
     bool use_cuda_graph = true;
+    // Explicitly registered LoRA adapters, in bank order. There is no directory discovery.
+    std::vector<LoraAdapterSpec> lora_adapters;
+    // Adapter selected for this run; empty selects the base weights.
+    std::string adapter;
 
     bool raw_output      = false;
     bool print_token_ids = false;

@@ -330,6 +330,7 @@ auto dflash_decode_batch_body(DFlashBatchContext& state, std::int32_t batch_size
         Tensor text_rows        = frame.text_kv_table_rows.slice(0, 0, batch_size);
         Tensor dflash_rows      = frame.dflash_kv_table_rows.slice(0, 0, batch_size);
         Tensor lanes            = frame.lanes.slice(0, 0, batch_size);
+        Tensor adapters         = frame.adapters.slice(0, 0, batch_size);
         Tensor append_positions = frame.append_positions.slice(1, 0, batch_size);
         Tensor append_counts    = frame.append_counts.slice(0, 0, batch_size);
         Tensor drafts           = frame.draft_tokens.slice(1, 0, batch_size);
@@ -370,6 +371,7 @@ auto dflash_decode_batch_body(DFlashBatchContext& state, std::int32_t batch_size
                                  .valid_columns   = valid_columns,
                                  .kv_table_rows   = text_rows,
                                  .lanes           = lanes,
+                                 .adapters        = adapters,
                                  .target_hidden   = target_hidden,
                                  .target_logits   = target_logits,
                                  .target_tokens   = target_tokens,

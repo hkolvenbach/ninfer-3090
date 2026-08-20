@@ -61,6 +61,9 @@ struct RequestBasePlanImpl<NINFER_QWEN38_VARIANT> {
     std::optional<std::uint32_t> turn_rewrite_boundary;
     std::optional<std::uint32_t> user_turn_boundary;
     std::optional<std::uint32_t> stable_prefix_boundary;
+    // Requested LoRA bank index, or -1 for the base weights. Resident KV and GDN state are only
+    // reusable by the adapter that produced them.
+    std::int32_t adapter    = -1;
     bool allow_prefix_reuse = false;
 };
 
@@ -80,6 +83,7 @@ struct RequestPlanImpl<NINFER_QWEN38_VARIANT> {
     bool keep_user_turn_anchor = false;
     std::optional<std::uint32_t> stable_checkpoint_capture_frontier;
     ops::SamplingConfig sampling;
+    std::int32_t adapter                      = -1;
     std::uint32_t text_kv_page_entitlement    = 0;
     std::uint32_t backend_kv_page_entitlement = 0;
 };
@@ -163,6 +167,10 @@ struct SequenceState {
     Tensor tail_hidden;
     Tensor turn_checkpoint_hidden;
     std::uint32_t lane = 0;
+    // LoRA bank index that produced this continuation, or -1 for the base weights. KV and GDN
+    // recurrent state are only valid for the adapter that produced them, so this is part of the
+    // sequence identity rather than request state.
+    std::int32_t adapter = -1;
 
     std::uint32_t execution_frontier = 0;
     std::uint32_t ledger_frontier    = 0;
@@ -262,7 +270,8 @@ public:
                            const PreparedPromptData& prompt) const noexcept;
     [[nodiscard]] bool import_continuation_lane(std::uint32_t lane,
                                                 const cache::ContinuationImage& image,
-                                                const PreparedPromptData& prompt) noexcept;
+                                                const PreparedPromptData& prompt,
+                                                std::int32_t adapter) noexcept;
     [[nodiscard]] std::uint32_t retained_lane_depth(std::uint32_t lane) const noexcept;
     [[nodiscard]] std::string retained_lane_digest(std::uint32_t lane) const;
     [[nodiscard]] qwen3_8::RetainedSessionSnapshot

@@ -205,7 +205,8 @@ public:
                            const PreparedPrompt& prompt) const noexcept;
     [[nodiscard]] bool import_continuation_lane(std::uint32_t lane,
                                                 const cache::ContinuationImage& image,
-                                                const PreparedPrompt& prompt) noexcept;
+                                                const PreparedPrompt& prompt,
+                                                std::int32_t adapter) noexcept;
     [[nodiscard]] std::uint32_t retained_lane_depth(std::uint32_t lane) const noexcept;
     // Stable identifier (FNV-1a 64 hex) of the lane's resident token ledger; empty unless the
     // lane holds a retained session.

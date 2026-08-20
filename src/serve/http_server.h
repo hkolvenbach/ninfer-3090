@@ -13,8 +13,10 @@
 #include <chrono>
 #include <cstdint>
 #include <mutex>
+#include <optional>
 #include <string>
 #include <thread>
+#include <vector>
 
 namespace ninfer::serve {
 
@@ -30,6 +32,14 @@ public:
     void stop();
 
     [[nodiscard]] const std::string& public_model_id() const noexcept { return public_model_id_; }
+
+    // Resolves an API `model` string to the adapter it selects. Returns nullopt when the string
+    // names no served model; an empty string means the base weights.
+    [[nodiscard]] std::optional<std::string> resolve_model(const std::string& model) const;
+
+    // Same resolution for endpoints that must reject an unknown `model`, returning the selected
+    // adapter name and throwing the OpenAI-shaped 404 otherwise.
+    [[nodiscard]] std::string require_model(const std::string& model) const;
 
 private:
     void register_routes();
@@ -59,6 +69,9 @@ private:
     GenerationService* service_ = nullptr;
     ServeOptions options_;
     std::string public_model_id_;
+    // Served model id per registered adapter, in bank order: `<public model id>-<adapter name>`.
+    std::vector<std::string> adapter_model_ids_;
+    std::vector<std::string> adapter_names_;
     ResponseStore response_store_;
     ServeMetrics metrics_;
     JsonlRequestLog request_jsonl_;

@@ -273,7 +273,7 @@ def _tensor(name: str, shape: tuple[int, ...], format_name: str) -> _ExpectedTen
 
 
 def _text_contract() -> tuple[_ExpectedTensor, ...]:
-    tensors: list[_ExpectedTensor] = [_tensor("text/token_embedding", (248320, 5120), Q6)]
+    tensors: list[_ExpectedTensor] = [_tensor("text/token_embedding", (248320, 5120), W8)]
     for layer in range(64):
         prefix = f"text/layers/{layer}/"
         tensors.append(_tensor(prefix + "input_norm", (5120,), BF16))
@@ -311,7 +311,7 @@ def _text_contract() -> tuple[_ExpectedTensor, ...]:
     tensors.extend(
         (
             _tensor("text/final_norm", (5120,), BF16),
-            _tensor("text/output_head", (248320, 5120), Q6),
+            _tensor("text/output_head", (248320, 5120), W8),
         )
     )
     return tuple(tensors)

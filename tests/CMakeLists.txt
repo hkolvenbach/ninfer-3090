@@ -208,6 +208,7 @@ set(ninfer_op_tests
   silu_mul
   residual_add
   sigmoid_mul
+  lora_delta_add
   rmsnorm
   gated_rmsnorm
   l2norm

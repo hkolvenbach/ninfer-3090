@@ -95,6 +95,7 @@ auto mtp_decode_batch_body(MtpBatchContext& state, std::int32_t batch_size, std:
         Tensor text_rows         = frame.text_kv_table_rows.slice(0, 0, batch_size);
         Tensor mtp_rows          = frame.mtp_kv_table_rows.slice(0, 0, batch_size);
         Tensor lanes             = frame.lanes.slice(0, 0, batch_size);
+        Tensor adapters          = frame.adapters.slice(0, 0, batch_size);
         Tensor rope_deltas       = frame.rope_deltas.slice(0, 0, batch_size);
         Tensor verify_ids        = frame.verify_ids.slice(1, 0, batch_size);
         Tensor target_positions  = frame.target_positions.slice(1, 0, batch_size);
@@ -126,6 +127,7 @@ auto mtp_decode_batch_body(MtpBatchContext& state, std::int32_t batch_size, std:
                                  .valid_columns   = target_valid,
                                  .kv_table_rows   = text_rows,
                                  .lanes           = lanes,
+                                 .adapters        = adapters,
                                  .target_hidden   = target_hidden,
                                  .target_logits   = target_logits,
                                  .target_tokens   = target_tokens,

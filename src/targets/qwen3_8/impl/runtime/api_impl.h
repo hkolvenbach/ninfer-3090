@@ -264,9 +264,11 @@ Program<Variant>::preflight_continuation(const cache::ContinuationImage& image,
 template <>
 bool Program<Variant>::import_continuation_lane(std::uint32_t lane,
                                                 const cache::ContinuationImage& image,
-                                                const PreparedPrompt& prompt) noexcept {
+                                                const PreparedPrompt& prompt,
+                                                std::int32_t adapter) noexcept {
     try {
-        return impl_->import_continuation_lane(lane, image, PreparedPromptAccess::view(prompt));
+        return impl_->import_continuation_lane(lane, image, PreparedPromptAccess::view(prompt),
+                                               adapter);
     } catch (...) { return false; }
 }
 

@@ -41,6 +41,16 @@
 
 namespace ninfer::runtime {
 
+// Namespaces a continuation-cache alias by the adapter that produced it. Every alias is scoped,
+// including the base weights, so no unscoped key exists and two adapters can never collide. The
+// separator is ASCII unit-separator, which no session id or stable-prefix digest contains.
+inline std::string adapter_scoped_alias(std::int32_t adapter, std::string_view alias) {
+    std::string scope = adapter < 0 ? std::string("base") : "lora" + std::to_string(adapter);
+    scope += '\x1f';
+    scope += alias;
+    return scope;
+}
+
 template <class Instance>
 class ConcurrentExecutor {
     struct Request;
@@ -171,6 +181,14 @@ public:
             request_id = next_request_id_++;
         }
 
+        // A continuation produced under one adapter encodes that adapter's weights in its KV and
+        // GDN recurrent state, so every cache alias is namespaced by the selected adapter. This
+        // is a correctness requirement, not an optimization.
+        if (options.routing_hint) {
+            options.routing_hint = adapter_scoped_alias(options.execution.adapter,
+                                                        *options.routing_hint);
+        }
+
         std::shared_ptr<Request> request;
         try {
             CachedContinuation routed_continuation;
@@ -197,6 +215,10 @@ public:
                     }
                 }
                 stable_alias = instance_.program->stable_prefix_alias(prompt);
+                if (stable_alias) {
+                    stable_alias =
+                        adapter_scoped_alias(options.execution.adapter, *stable_alias);
+                }
                 stable_boundary = targets::qwen3_8::PreparedPromptAccess::view(prompt)
                                       .identity.stable_prefix_boundary;
                 if (stable_alias) {
@@ -1700,7 +1722,7 @@ private:
                     cache::continuation_image_bytes(*candidate.image);
                 const auto restore_started = Clock::now();
                 const bool restored = instance_.program->import_continuation_lane(
-                    lane, *candidate.image, request->prompt);
+                    lane, *candidate.image, request->prompt, request->options.execution.adapter);
                 const std::uint64_t restore_microseconds = static_cast<std::uint64_t>(
                     std::chrono::duration_cast<std::chrono::microseconds>(Clock::now() -
                                                                           restore_started)

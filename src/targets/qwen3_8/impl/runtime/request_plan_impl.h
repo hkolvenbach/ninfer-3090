@@ -97,6 +97,7 @@ ProgramImplCore::plan_request_base(const PreparedPromptData& prompt,
     base->summary.transient_alignment    = 1;
     base->summary.transient_bytes        = 0;
     base->sampling                       = translate_sampling(options.sampling);
+    base->adapter                        = options.adapter;
     base->allow_prefix_reuse             = options.allow_prefix_reuse;
     const std::uint32_t reserved_context_tokens =
         base->summary.prompt_tokens + (base->summary.effective_output_tokens == 0
@@ -212,8 +213,12 @@ RequestPlan ProgramImplCore::plan_request_for_lane(std::uint32_t lane,
     plan->sampling                    = base.sampling;
     plan->text_kv_page_entitlement    = base.text_kv_page_entitlement;
     plan->backend_kv_page_entitlement = base.backend_kv_page_entitlement;
+    plan->adapter                     = base.adapter;
 
-    if (base.allow_prefix_reuse && prompt.identity.reusable && sequence.retained) {
+    // A resident prefix produced under a different adapter is not reusable: its KV and GDN
+    // recurrent state encode that adapter's weights.
+    if (base.allow_prefix_reuse && prompt.identity.reusable && sequence.retained &&
+        sequence.adapter == base.adapter) {
         const bool dflash_append_ready =
             speculative_backend != SpeculativeBackend::DFlash ||
             sequence.dflash_context_frontier == sequence.execution_frontier;

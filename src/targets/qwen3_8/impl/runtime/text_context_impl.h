@@ -20,6 +20,7 @@
 #include "ninfer/ops/linear_add.h"
 #include "ninfer/ops/linear_pair.h"
 #include "ninfer/ops/linear_swiglu.h"
+#include "ninfer/ops/lora.h"
 #include "ninfer/ops/mtp_pack.h"
 #include "ninfer/ops/position.h"
 #include "ninfer/ops/residual_add.h"
@@ -43,6 +44,30 @@
 
 namespace ninfer::targets::qwen3_8::detail::NINFER_QWEN38_RUNTIME_NS::schedule {
 namespace {
+
+// `Variant` is a concrete type in this instantiation, so an `if constexpr` on one of its traits
+// would still require the discarded branch to name a member that exists. Routing the call through
+// a template parameter makes the branch dependent, so a package that registers no site table
+// never has to declare the leaf.
+template <class V, class Weights>
+[[nodiscard]] bool post_mixer_with_lora(const Tensor& hidden, const Weights& weights,
+                                        Tensor& residual, const qwen3_8::LoraApplication& lora,
+                                        qwen3_8::TextPhase phase, WorkspaceArena& workspace,
+                                        cudaStream_t stream) {
+    if constexpr (V::supports_lora) {
+        V::post_mixer_lora(hidden, weights, residual, lora, phase, workspace, stream);
+        return true;
+    } else {
+        (void)hidden;
+        (void)weights;
+        (void)residual;
+        (void)lora;
+        (void)phase;
+        (void)workspace;
+        (void)stream;
+        return false;
+    }
+}
 
 void copy_i32(const std::int32_t* source, Tensor& destination, cudaStream_t stream) {
     if (source == nullptr || destination.dtype != DType::I32 || !destination.is_contiguous() ||
@@ -292,9 +317,9 @@ void TextContext::bind() {
 
     for (int layer = 0; layer < kCfg.n_layers; ++layer) {
         if (ModelConfig::is_full(layer)) {
-            FullLayerW& out = full_[static_cast<std::size_t>(ModelConfig::full_idx(layer))];
-            const auto& source =
-                weights_.full_layers[static_cast<std::size_t>(ModelConfig::full_idx(layer))];
+            const std::size_t fidx = static_cast<std::size_t>(ModelConfig::full_idx(layer));
+            FullLayerW& out        = full_[fidx];
+            const auto& source     = weights_.full_layers[fidx];
             out.input_norm     = &source.input_norm;
             out.projection     = &source.projection;
             out.o_proj         = &source.output;
@@ -302,6 +327,11 @@ void TextContext::bind() {
             out.k_norm         = &source.key_norm;
             out.post_attn_norm = &source.post_attention_norm;
             out.mlp            = bind_mlp(source.post_mixer);
+            if (weights_.lora) {
+                const auto& bank = weights_.lora->full_layers[fidx];
+                out.lora         = &bank;
+                out.mlp.lora_down = bank.down.present() ? &bank.down : nullptr;
+            }
         } else {
             const std::size_t gidx = static_cast<std::size_t>(ModelConfig::gdn_idx(layer));
             GdnLayerW& out         = gdn_[gidx];
@@ -313,8 +343,56 @@ void TextContext::bind() {
             out.out_proj           = &source.output;
             out.post_attn_norm     = &source.post_attention_norm;
             out.mlp                = bind_mlp(source.post_mixer);
+            if (weights_.lora) {
+                const auto& bank = weights_.lora->gdn_layers[gidx];
+                out.lora         = &bank;
+                out.mlp.lora_down = bank.down.present() ? &bank.down : nullptr;
+            }
         }
     }
+}
+
+void TextContext::bind_uniform_adapter(cudaStream_t stream) {
+    active_adapters_ = nullptr;
+    if (!weights_.lora || uniform_adapter_ < 0) { return; }
+    if (uniform_adapter_ >= static_cast<std::int32_t>(weights_.lora->adapters)) {
+        throw std::invalid_argument("selected LoRA adapter index is outside the resident bank");
+    }
+    uniform_adapter_storage_ = work_.alloc(DType::I32, {1});
+    copy_i32(&uniform_adapter_, uniform_adapter_storage_, stream);
+    active_adapters_ = &uniform_adapter_storage_;
+}
+
+// Assembles a group from registered sites and runs it. A site whose bank plane is absent is
+// skipped, so an adapter that never trained a site costs nothing.
+void TextContext::lora_apply(std::initializer_list<LoraDestination> sites, const Tensor& input,
+                             cudaStream_t stream) {
+    if (active_adapters_ == nullptr || !weights_.lora) { return; }
+    ops::LoraGroup group;
+    group.rank          = weights_.lora->rank;
+    group.adapter_count = static_cast<std::int32_t>(weights_.lora->adapters);
+
+    std::array<Tensor*, ops::kMaximumLoraSites> destinations{};
+    std::int32_t count = 0;
+    for (const LoraDestination& entry : sites) {
+        if (entry.site == nullptr || !entry.site->present()) { continue; }
+        group.sites[count] = ops::LoraSite{
+            .a                = entry.site->a.data,
+            .b                = entry.site->b.data,
+            .n                = entry.destination->ne[0],
+            .k                = input.ne[0],
+            .a_adapter_stride = entry.site->a_adapter_stride,
+            .b_adapter_stride = entry.site->b_adapter_stride,
+        };
+        destinations[static_cast<std::size_t>(count)] = entry.destination;
+        ++count;
+    }
+    if (count == 0) { return; }
+    group.site_count = count;
+    ops::lora_delta_add(input, group, *active_adapters_,
+                        std::span<Tensor* const>(destinations.data(),
+                                                 static_cast<std::size_t>(count)),
+                        work_, stream);
 }
 
 const MtpW& TextContext::mtp_weights() const {
@@ -810,6 +888,13 @@ void TextContext::attn_mix(const FullLayerW& w, Tensor& x, int fidx, Phase ph) {
     Tensor v_flat    = v.view({kCfg.kv_size, T});
     Variant::attention_projection(h, *w.projection, q_flat, gate_flat, k_flat, v_flat, ph, work_,
                                   s);
+    if (w.lora != nullptr) {
+        lora_apply({{&w.lora->query, &q_flat},
+                    {&w.lora->gate, &gate_flat},
+                    {&w.lora->key, &k_flat},
+                    {&w.lora->value, &v_flat}},
+                   h, s);
+    }
 
     const auto results = workspace_recipe::text_attention_results<TextConfig>(work_, T);
     Tensor qn          = results.normalized_query.view({kCfg.head_dim, kCfg.n_q, T});
@@ -847,7 +932,9 @@ void TextContext::attn_mix(const FullLayerW& w, Tensor& x, int fidx, Phase ph) {
     }
     ops::sigmoid_mul(gate, a, s);
 
-    Variant::attention_output_projection(a.view({kCfg.q_size, T}), *w.o_proj, x, ph, work_, s);
+    Tensor attention_flat = a.view({kCfg.q_size, T});
+    Variant::attention_output_projection(attention_flat, *w.o_proj, x, ph, work_, s);
+    if (w.lora != nullptr) { lora_apply({{&w.lora->output, &x}}, attention_flat, s); }
 }
 
 void TextContext::gdn_mix(const GdnLayerW& w, Tensor& x, int gidx, Phase ph) {
@@ -952,7 +1039,9 @@ void TextContext::gdn_mix(const GdnLayerW& w, Tensor& x, int gidx, Phase ph) {
         {kCfg.gdn_v_dim, kCfg.gdn_v_heads, T});
     ops::gated_rmsnorm(o, *w.gdn_norm, z, kCfg.rms_eps, on, s);
 
-    Variant::gdn_output_projection(on.view({kCfg.value_dim, T}), *w.out_proj, x, ph, work_, s);
+    Tensor gdn_output_flat = on.view({kCfg.value_dim, T});
+    Variant::gdn_output_projection(gdn_output_flat, *w.out_proj, x, ph, work_, s);
+    if (w.lora != nullptr) { lora_apply({{&w.lora->output, &x}}, gdn_output_flat, s); }
 }
 
 void TextContext::mlp_tail(const Tensor* post_norm, const MlpW& m, Tensor& x, Phase ph) {
@@ -961,6 +1050,17 @@ void TextContext::mlp_tail(const Tensor* post_norm, const MlpW& m, Tensor& x, Ph
     Tensor h       = workspace_recipe::post_mixer_hidden<TextConfig>(work_, T);
     ops::rmsnorm(x, *post_norm, kCfg.rms_eps, true, h, s);
 
+    // The down-projection delta acts on the SwiGLU activation, which never leaves the package
+    // leaf, so the correction is applied inside that leaf rather than after it.
+    if (m.lora_down != nullptr && active_adapters_ != nullptr && weights_.lora) {
+        const qwen3_8::LoraApplication lora{
+            .site          = m.lora_down,
+            .adapter_index = active_adapters_,
+            .rank          = weights_.lora->rank,
+            .adapter_count = static_cast<std::int32_t>(weights_.lora->adapters),
+        };
+        if (post_mixer_with_lora<Variant>(h, *m.payload, x, lora, ph, work_, s)) { return; }
+    }
     Variant::post_mixer(h, *m.payload, x, ph, work_, s);
 }
 
@@ -1082,6 +1182,9 @@ TextContext::prefill_impl(std::span<const int> ids, const TextPrefill* text_pref
             len = checkpoint_rel - t0;
         }
         work_.reset();
+        // The chunk carries one sequence, so the whole call routes to one bank plane. The
+        // selector is re-materialized after every reset because the workspace is reused.
+        bind_uniform_adapter(ctx_.stream);
 
         VisionChunk vision_chunk;
         const std::uint32_t prompt_t0 = base + static_cast<std::uint32_t>(t0);

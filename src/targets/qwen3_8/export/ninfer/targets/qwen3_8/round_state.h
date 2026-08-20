@@ -34,6 +34,9 @@ struct OrdinaryDecodeIngress {
     std::array<std::int32_t, kMaximumConcurrency> rope_positions{};
     std::array<std::int32_t, kMaximumConcurrency> text_kv_table_rows{};
     std::array<std::int32_t, kMaximumConcurrency> lanes{};
+    // Per-batch-row LoRA bank index; -1 selects the base weights. Same per-column routing
+    // pattern as `lanes`, so a mixed-adapter batch still executes as one round.
+    std::array<std::int32_t, kMaximumConcurrency> adapters{};
     std::array<ops::SamplingConfig, kMaximumConcurrency> sampling{};
 };
 
@@ -55,6 +58,8 @@ struct MtpDecodeIngress {
     std::array<std::int32_t, kMaximumConcurrency> mtp_kv_table_rows{};
     std::array<std::int32_t, kMaximumConcurrency> lanes{};
     std::array<std::int32_t, kMaximumConcurrency> rope_deltas{};
+    // The MTP *target* pass is adapted; the draft head is not. See §6.7.
+    std::array<std::int32_t, kMaximumConcurrency> adapters{};
     std::array<ops::SamplingConfig, kMaximumConcurrency> sampling{};
 };
 
@@ -78,6 +83,7 @@ struct DFlashDecodeIngress {
     std::array<std::int32_t, kMaximumConcurrency> text_kv_table_rows{};
     std::array<std::int32_t, kMaximumConcurrency> dflash_kv_table_rows{};
     std::array<std::int32_t, kMaximumConcurrency> lanes{};
+    std::array<std::int32_t, kMaximumConcurrency> adapters{};
     std::array<ops::SamplingConfig, kMaximumConcurrency> sampling{};
 };
 
@@ -165,6 +171,7 @@ struct OrdinaryDecodeState {
     Tensor rope_positions;
     Tensor text_kv_table_rows;
     Tensor lanes;
+    Tensor adapters;
     const ops::SamplingConfig* sampling = nullptr;
     Tensor sampled_tokens;
     Tensor logits;
@@ -214,6 +221,7 @@ struct MtpDecodeState {
     Tensor mtp_kv_table_rows;
     Tensor lanes;
     Tensor rope_deltas;
+    Tensor adapters;
     const ops::SamplingConfig* sampling = nullptr;
     Tensor licensed_tokens;
     Tensor licensed_counts;
@@ -251,6 +259,7 @@ struct DFlashDecodeState {
     Tensor text_kv_table_rows;
     Tensor dflash_kv_table_rows;
     Tensor lanes;
+    Tensor adapters;
     const ops::SamplingConfig* sampling = nullptr;
     Tensor licensed_tokens;
     Tensor licensed_counts;

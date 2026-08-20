@@ -4,6 +4,7 @@
 
 #include "artifact/reader.h"
 #include "targets/qwen3_8_27b/impl/load/bindings.h"
+#include "targets/qwen3_8_27b/impl/load/lora_bindings.h"
 #include "targets/qwen3_8_27b/impl/variant.h"
 
 #include <stdexcept>
@@ -89,6 +90,23 @@ Package::construct_loaded_model(LoadPlan&& plan, artifact::MaterializedArtifact&
         plan.impl_->weights_profile, std::move(plan.impl_->plan.bindings), std::move(materialized));
     plan.impl_.reset();
     return std::unique_ptr<LoadedModel>(new LoadedModel(std::move(impl)));
+}
+
+std::vector<std::string> Package::attach_lora(LoadedModel& model, const EngineOptions& options,
+                                              DeviceContext& device) {
+    if (model.impl_ == nullptr) { throw std::invalid_argument("loaded model is empty"); }
+    if (options.lora_adapters.empty()) { return {}; }
+
+    detail::LoadedLoraBank bank = detail::load_lora_bank(options.lora_adapters, device);
+    detail::LoadedModelData& data = model.impl_->data;
+    data.runtime.lora             = std::move(bank.view);
+    data.lora_arena               = std::move(bank.arena);
+    data.lora_adapter_names       = std::move(bank.names);
+    // `lora_sizing_rank` already froze the workspace layout and must not be rewritten here; the
+    // bank's executed rank lives on the model view.
+    data.runtime.features.lora_adapters =
+        static_cast<std::uint32_t>(data.lora_adapter_names.size());
+    return data.lora_adapter_names;
 }
 
 Package::Frontend Package::make_frontend(const LoadedModel& model,

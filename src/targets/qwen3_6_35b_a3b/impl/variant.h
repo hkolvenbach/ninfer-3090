@@ -33,6 +33,9 @@ struct Variant {
     static constexpr std::uint32_t maximum_dflash_draft_tokens = kMaximumDFlashDraftTokens;
     static constexpr std::uint32_t maximum_context             = kNativeContext;
     static constexpr bool supports_dflash                      = DFlashConfig::supported;
+    // No LoRA site table is registered for this identity: its post-mixer is a sparse MoE whose
+    // down projection is per-expert, which the registered additive site contract does not cover.
+    static constexpr bool supports_lora                        = false;
     static constexpr std::int32_t draft_head_rows              = 131072;
 
     [[nodiscard]] static std::vector<GraphExecutionProfile>

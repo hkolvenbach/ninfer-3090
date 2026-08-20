@@ -11,6 +11,7 @@
 #include <cstdint>
 #include <optional>
 #include <string>
+#include <vector>
 
 namespace ninfer::serve {
 
@@ -75,8 +76,9 @@ std::string sse_done();
 // max_model_len to read. `modalities` mirrors the llama.cpp /props shape so
 // clients can tell a vision-enabled server from a text-only one behind the
 // same model id; a server without the field is read as text-only.
-std::string make_models_list(const std::string& model_id, std::int64_t created,
-                             std::uint32_t context_window, bool vision);
+std::string make_models_list(const std::string& model_id,
+                             const std::vector<std::string>& adapter_model_ids,
+                             std::int64_t created, std::uint32_t context_window, bool vision);
 std::string make_model_object(const std::string& model_id, std::int64_t created,
                               std::uint32_t context_window, bool vision);
 

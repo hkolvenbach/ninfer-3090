@@ -89,6 +89,7 @@ add_library(ninfer_ops STATIC
   ops/launcher/kv_cache_append_prefix.cu
   ops/launcher/l2norm.cu
   ops/launcher/layer_norm.cu
+  ops/launcher/lora_delta.cu
   ops/launcher/mtp_pack.cu
   ops/launcher/mtp_round.cu
   ops/launcher/speculative_round.cu
@@ -237,6 +238,7 @@ add_library(ninfer_ops STATIC
   ops/wrapper/linear_add.cpp
   ops/wrapper/linear_pair.cpp
   ops/wrapper/linear_swiglu.cpp
+  ops/wrapper/lora.cpp
   ops/wrapper/mtp_pack.cpp
   ops/wrapper/mtp_round.cpp
   ops/wrapper/speculative_round.cpp

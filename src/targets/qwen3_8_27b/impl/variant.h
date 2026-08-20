@@ -35,6 +35,9 @@ struct Variant {
     static constexpr std::uint32_t maximum_dflash_draft_tokens = kMaximumDFlashDraftTokens;
     static constexpr std::uint32_t maximum_context             = kNativeContext;
     static constexpr bool supports_dflash                      = DFlashConfig::supported;
+    // The registered LoRA site table is defined for this identity; see
+    // docs/maintainer/qwen3.8-27b-lora-adapters.md.
+    static constexpr bool supports_lora                        = true;
     static constexpr std::int32_t draft_head_rows              = 131072;
 
     static void attention_projection(const Tensor& hidden,
@@ -80,6 +83,12 @@ struct Variant {
     static void post_mixer(const Tensor& hidden, const PostMixerWeights& weights, Tensor& residual,
                            qwen3_8::TextPhase phase, WorkspaceArena& workspace,
                            cudaStream_t stream);
+    // Post-mixer with the registered down-projection correction folded between the SwiGLU and
+    // the fused down/residual add, because the activation the delta acts on is private here.
+    static void post_mixer_lora(const Tensor& hidden, const PostMixerWeights& weights,
+                                Tensor& residual, const qwen3_8::LoraApplication& lora,
+                                qwen3_8::TextPhase phase, WorkspaceArena& workspace,
+                                cudaStream_t stream);
     static void mtp_post_mixer(const Tensor& hidden, const MtpPostMixerWeights& weights,
                                Tensor& residual, WorkspaceArena& workspace, cudaStream_t stream);
     [[nodiscard]] static std::size_t
@@ -115,6 +124,10 @@ struct Variant {
     [[nodiscard]] static std::size_t
     post_mixer_workspace_capacity_bytes(WeightsProfile weights_profile, qwen3_8::TextPhase phase,
                                         std::int32_t first, std::int32_t last);
+    [[nodiscard]] static std::size_t
+    post_mixer_lora_workspace_capacity_bytes(WeightsProfile weights_profile,
+                                             qwen3_8::TextPhase phase, std::int32_t rank,
+                                             std::int32_t first, std::int32_t last);
     [[nodiscard]] static std::size_t mtp_post_mixer_workspace_capacity_bytes(std::int32_t first,
                                                                              std::int32_t last);
 

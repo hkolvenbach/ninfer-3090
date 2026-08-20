@@ -7,11 +7,13 @@
 #include "ninfer/ops/linear_add.h"
 #include "ninfer/ops/linear_pair.h"
 #include "ninfer/ops/linear_swiglu.h"
+#include "ninfer/ops/lora.h"
 #include "ninfer/ops/mtp_pack.h"
 #include "ninfer/ops/residual_add.h"
 #include "ninfer/ops/silu_mul.h"
 
 #include <algorithm>
+#include <array>
 #include <stdexcept>
 
 #define NINFER_QWEN38_VARIANT    ::ninfer::targets::qwen3_8_27b::detail::Variant
@@ -280,6 +282,64 @@ void Variant::post_mixer(const Tensor& hidden, const PostMixerWeights& weights, 
                        stream);
     ops::linear_add(activation, weights.down, residual, text_linear_add_policy(weights.down),
                     workspace, stream);
+}
+
+void Variant::post_mixer_lora(const Tensor& hidden, const PostMixerWeights& weights,
+                              Tensor& residual, const qwen3_8::LoraApplication& lora,
+                              qwen3_8::TextPhase phase, WorkspaceArena& workspace,
+                              cudaStream_t stream) {
+    if (!lora.active()) {
+        post_mixer(hidden, weights, residual, phase, workspace, stream);
+        return;
+    }
+    auto scope        = workspace.scope();
+    Tensor activation = workspace.alloc(DType::BF16, {TextConfig::intermediate, hidden.ne[1]});
+    ops::linear_swiglu(hidden, weights.gate_up, activation, text_swiglu_policy(weights.gate_up),
+                       workspace, stream);
+
+    // The delta must be accumulated into the residual, so it is applied to the down projection's
+    // output rather than folded into the fused linear_add. The fused op writes `down(activation)
+    // + residual` first, then the correction adds `B * (A * activation)` to the same tensor.
+    ops::linear_add(activation, weights.down, residual, text_linear_add_policy(weights.down),
+                    workspace, stream);
+
+    ops::LoraGroup group;
+    group.rank          = lora.rank;
+    group.adapter_count = lora.adapter_count;
+    group.site_count    = 1;
+    group.sites[0]      = ops::LoraSite{
+        .a                = lora.site->a.data,
+        .b                = lora.site->b.data,
+        .n                = residual.ne[0],
+        .k                = TextConfig::intermediate,
+        .a_adapter_stride = lora.site->a_adapter_stride,
+        .b_adapter_stride = lora.site->b_adapter_stride,
+    };
+    std::array<Tensor*, 1> destinations{&residual};
+    ops::lora_delta_add(activation, group, *lora.adapter_index, destinations, workspace, stream);
+}
+
+std::size_t Variant::post_mixer_lora_workspace_capacity_bytes(WeightsProfile weights_profile,
+                                                              qwen3_8::TextPhase phase,
+                                                              std::int32_t rank,
+                                                              std::int32_t first,
+                                                              std::int32_t last) {
+    validate_token_interval(first, last);
+    WorkspaceLayoutBuilder layout;
+    // The activation stays live across the correction, so its bytes are additive rather than
+    // shared with the projection scratch.
+    (void)layout.alloc(DType::BF16, {TextConfig::intermediate, last});
+    {
+        auto scope = layout.scope();
+        (void)layout.alloc_bytes(
+            post_mixer_workspace_capacity_bytes(weights_profile, phase, first, last));
+    }
+    {
+        auto scope = layout.scope();
+        (void)layout.alloc_bytes(
+            ops::lora_delta_add_workspace_capacity_bytes(rank, 1, first, last));
+    }
+    return layout.peak_bytes(1);
 }
 
 void Variant::mtp_post_mixer(const Tensor& hidden, const MtpPostMixerWeights& weights,

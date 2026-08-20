@@ -105,6 +105,17 @@ std::size_t parse_cache_reserve_mib(const char* text) {
     return static_cast<std::size_t>(value);
 }
 
+// `--lora NAME=PATH`. The name is what a request selects; the path is the adapter artifact.
+LoraAdapterSpec parse_lora_adapter(const char* text) {
+    const std::string_view spec(text);
+    const std::size_t split = spec.find('=');
+    if (split == std::string_view::npos || split == 0 || split + 1 == spec.size()) {
+        throw std::invalid_argument("--lora expects NAME=PATH");
+    }
+    return LoraAdapterSpec{.name = std::string(spec.substr(0, split)),
+                           .path = std::filesystem::path(spec.substr(split + 1))};
+}
+
 } // namespace
 
 std::string usage_text(const char* argv0) {
@@ -120,6 +131,7 @@ std::string usage_text(const char* argv0) {
            "       [--stop-token-id N]... [--stop <text>]... [--reasoning-stop <text>]...\n"
            "       [--raw-output] [--print-token-ids] [--no-thinking]\n"
            "       [--reasoning-effort low|medium|xhigh] [--vision] [--vision-max-tokens N]\n"
+           "       [--lora NAME=PATH]... [--adapter NAME]\n"
            "       [--no-cuda-graph] [--prefix-checkpoint-policy stable-turn|rolling-tool]\n"
            "       [--continuation-cache off|l1|l1-l2|l1-l2-l3] "
            "[--continuation-cache-policy adaptive]\n"
@@ -213,6 +225,13 @@ Options parse_options(int argc, char** argv) {
         } else if (arg == "--vision-max-tokens" || arg == "--vision-limit") {
             options.vision_max_tokens = parse_u32(value(arg), "vision-max-tokens", false);
             options.enable_vision     = true;
+        } else if (arg == "--lora") {
+            options.lora_adapters.push_back(parse_lora_adapter(value(arg)));
+        } else if (arg == "--adapter") {
+            options.adapter = value(arg);
+            if (options.adapter.empty()) {
+                throw std::invalid_argument("--adapter must name a registered adapter");
+            }
         } else if (arg == "--no-cuda-graph") {
             options.use_cuda_graph = false;
         } else if (arg == "--prefix-checkpoint-policy") {

@@ -232,6 +232,7 @@ ninfer::RequestOptions to_request_options(const GenerationRequest& request,
     options.execution.requested_output_tokens = static_cast<std::uint32_t>(request.max_tokens);
     options.execution.allow_prefix_reuse      = server.allow_prefix_reuse;
     options.execution.routing_hint            = request.prompt_cache_routing_hint;
+    if (!request.adapter.empty()) { options.execution.adapter = request.adapter; }
     options.execution.sampling             = resolve_sampling_overrides(request.sampling, server);
     options.output.raw                     = false;
     options.output.preserve_special_tokens = request.uses_tools() || request.has_tool_history();

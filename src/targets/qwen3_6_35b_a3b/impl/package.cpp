@@ -87,6 +87,19 @@ Package::construct_loaded_model(LoadPlan&& plan, artifact::MaterializedArtifact&
     return std::unique_ptr<LoadedModel>(new LoadedModel(std::move(impl)));
 }
 
+std::vector<std::string> Package::attach_lora(LoadedModel& model, const EngineOptions& options,
+                                              DeviceContext& device) {
+    (void)model;
+    (void)device;
+    if (!options.lora_adapters.empty()) {
+        throw std::invalid_argument("target '" + std::string(target_key) +
+                                    "' registers no LoRA site table, so it cannot load the " +
+                                    std::to_string(options.lora_adapters.size()) +
+                                    " registered adapter(s)");
+    }
+    return {};
+}
+
 Package::Frontend Package::make_frontend(const LoadedModel& model,
                                          PrefixCheckpointPolicy prefix_checkpoint_policy) {
     if (model.impl_ == nullptr) { throw std::invalid_argument("loaded model is empty"); }

@@ -10,6 +10,7 @@
 #include "ninfer/ops/gdn_input_proj.h"
 #include "ninfer/ops/linear_add.h"
 #include "ninfer/ops/linear_swiglu.h"
+#include "ninfer/ops/lora.h"
 #include "ninfer/ops/sampling.h"
 #include "ninfer/ops/speculative_round.h"
 #include "ninfer/ops/gqa_attention.h"
@@ -250,6 +251,13 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
         (void)layout.alloc_bytes(bytes);
     };
     const auto finish = [](const WorkspaceLayoutBuilder& layout) { return layout.peak_bytes(1); };
+    // Zero unless a bank is resident, which keeps the workspace identical to a build without
+    // adapter support.
+    const auto lora_scratch = [&](std::int32_t sites, std::int32_t first, std::int32_t last) {
+        if (!plan.features.lora()) { return std::size_t{0}; }
+        return ops::lora_delta_add_workspace_capacity_bytes(
+            static_cast<std::int32_t>(plan.features.lora_sizing_rank), sites, first, last);
+    };
 
     const auto text_common_root = [&](WorkspaceLayoutBuilder& layout, std::int32_t tokens) {
         (void)workspace_recipe::text_prefill_roots<TextConfig>(
@@ -263,12 +271,14 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
         (void)workspace_recipe::text_attention_projection<TextConfig>(layout, last);
         scratch(layout, Variant::attention_projection_workspace_capacity_bytes(plan.weights_profile,
                                                                                phase, first, last));
+        scratch(layout, lora_scratch(4, first, last));
         (void)workspace_recipe::text_attention_results<TextConfig>(layout, last);
         scratch(layout, ops::gqa_attention_workspace_capacity_bytes(
                             TextConfig::query_heads, plan.kv_dtype, envelope, batch_size, min_width,
                             max_width));
         scratch(layout, Variant::attention_output_projection_workspace_capacity_bytes(
                             plan.weights_profile, phase, first, last));
+        scratch(layout, lora_scratch(1, first, last));
     };
     const auto gdn_stage = [&](WorkspaceLayoutBuilder& layout, std::int32_t first,
                                std::int32_t last, qwen3_8::TextPhase phase, GdnWorkspacePath path,
@@ -298,11 +308,21 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
         (void)workspace_recipe::gdn_normalized_output<TextConfig>(layout, last);
         scratch(layout, Variant::gdn_output_projection_workspace_capacity_bytes(
                             plan.weights_profile, phase, first, last));
+        scratch(layout, lora_scratch(1, first, last));
     };
     const auto post_mixer_stage = [&](WorkspaceLayoutBuilder& layout, std::int32_t first,
                                       std::int32_t last, qwen3_8::TextPhase phase) {
         auto stage = layout.scope();
         (void)workspace_recipe::post_mixer_hidden<TextConfig>(layout, last);
+        if constexpr (Variant::supports_lora) {
+            if (plan.features.lora()) {
+                scratch(layout, Variant::post_mixer_lora_workspace_capacity_bytes(
+                                    plan.weights_profile, phase,
+                                    static_cast<std::int32_t>(plan.features.lora_sizing_rank), first,
+                                    last));
+                return;
+            }
+        }
         scratch(layout, Variant::post_mixer_workspace_capacity_bytes(plan.weights_profile, phase,
                                                                      first, last));
     };

@@ -505,15 +505,34 @@ void HttpServer::register_routes() {
     });
 }
 
+std::optional<std::string> HttpServer::resolve_model(const std::string& model) const {
+    if (model == public_model_id_) { return std::string(); }
+    for (std::size_t index = 0; index < adapter_model_ids_.size(); ++index) {
+        if (model == adapter_model_ids_[index]) { return adapter_names_[index]; }
+    }
+    return std::nullopt;
+}
+
+std::string HttpServer::require_model(const std::string& model) const {
+    if (const std::optional<std::string> selected = resolve_model(model)) { return *selected; }
+    ApiError error;
+    error.status  = 404;
+    error.type    = "invalid_request_error";
+    error.param   = "model";
+    error.code    = "model_not_found";
+    error.message = "model '" + model + "' not found";
+    throw ApiException(std::move(error));
+}
+
 void HttpServer::handle_models(const httplib::Request&, httplib::Response& res) const {
-    res.set_content(make_models_list(public_model_id_, unix_time_now(), options_.max_context,
-                                     options_.enable_vision),
+    res.set_content(make_models_list(public_model_id_, adapter_model_ids_, unix_time_now(),
+                                     options_.max_context, options_.enable_vision),
                     "application/json");
 }
 
 void HttpServer::handle_model(const httplib::Request& req, httplib::Response& res) const {
     const std::string id = req.matches.size() > 1 ? req.matches[1].str() : std::string();
-    if (id != public_model_id_) {
+    if (!resolve_model(id).has_value()) {
         ApiError error;
         error.status  = 404;
         error.type    = "invalid_request_error";
@@ -522,9 +541,9 @@ void HttpServer::handle_model(const httplib::Request& req, httplib::Response& re
         write_error(res, error);
         return;
     }
-    res.set_content(make_model_object(public_model_id_, unix_time_now(), options_.max_context,
-                                      options_.enable_vision),
-                    "application/json");
+    res.set_content(
+        make_model_object(id, unix_time_now(), options_.max_context, options_.enable_vision),
+        "application/json");
 }
 
 void HttpServer::handle_slot_action(const httplib::Request& req, httplib::Response& res) {
@@ -659,15 +678,8 @@ void HttpServer::handle_chat_completions(const httplib::Request& req, httplib::R
         RequestLimits limits;
         limits.default_max_tokens = options_.default_max_tokens;
         request                   = parse_chat_completion_request(body, limits);
-        if (request.model != public_model_id_) {
-            ApiError error;
-            error.status  = 404;
-            error.type    = "invalid_request_error";
-            error.code    = "model_not_found";
-            error.message = "model '" + request.model + "' not found";
-            throw ApiException(std::move(error));
-        }
-        prepared = service_->prepare(
+        request.adapter           = require_model(request.model);
+        prepared                  = service_->prepare(
             request, [&req] { return req.is_connection_alive && !req.is_connection_alive(); });
     } catch (const ApiException& e) {
         write_error(res, e.error());
@@ -851,9 +863,11 @@ void HttpServer::handle_messages(const httplib::Request& req, httplib::Response&
         RequestLimits limits;
         limits.default_max_tokens = options_.default_max_tokens;
         // The Anthropic endpoint accepts any `model` string (Claude Code sends real
-        // Claude model names) and echoes it back; it never 404s on model id.
-        request  = parse_messages_request(body, limits);
-        prepared = service_->prepare(
+        // Claude model names) and echoes it back; it never 404s on model id. A string that
+        // does name a served model still selects it, so adapters are reachable here too.
+        request         = parse_messages_request(body, limits);
+        request.adapter = resolve_model(request.model).value_or(std::string());
+        prepared        = service_->prepare(
             request, [&req] { return req.is_connection_alive && !req.is_connection_alive(); });
     } catch (const ApiException& e) {
         write_messages_error(res, e.error());
@@ -1028,6 +1042,12 @@ void HttpServer::attach(GenerationService& service) {
     }
     const ninfer::LoadSummary load = service.load_summary();
     public_model_id_               = resolve_public_model_id(options_, load.model_id);
+    adapter_names_                 = load.lora_adapter_names;
+    adapter_model_ids_.clear();
+    adapter_model_ids_.reserve(adapter_names_.size());
+    for (const std::string& name : adapter_names_) {
+        adapter_model_ids_.push_back(public_model_id_ + "-" + name);
+    }
     service_                       = &service;
     request_jsonl_.write_server_start(options_, service.sampling_defaults(), public_model_id_, load,
                                       service.memory_summary());

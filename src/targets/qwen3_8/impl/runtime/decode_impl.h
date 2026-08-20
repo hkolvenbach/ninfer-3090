@@ -31,10 +31,12 @@ auto ordinary_batch_body(OrdinaryBatchContext& state, std::int32_t batch_size,
         Tensor rope_positions  = ordinary.rope_positions.slice(0, 0, batch_size);
         Tensor kv_rows         = ordinary.text_kv_table_rows.slice(0, 0, batch_size);
         Tensor lanes           = ordinary.lanes.slice(0, 0, batch_size);
+        Tensor adapters        = ordinary.adapters.slice(0, 0, batch_size);
         Tensor hidden          = ordinary.hidden.slice(1, 0, batch_size);
         Tensor logits          = ordinary.logits.slice(1, 0, batch_size);
         Tensor sampled         = ordinary.sampled_tokens.slice(0, 0, batch_size);
 
+        card.set_active_adapters(&adapters);
         card.ordinary_decode_batch(tokens, cache_positions, rope_positions, kv_rows, lanes,
                                    envelope, hidden, logits);
         ops::scatter(hidden, lanes, state.continuation_hidden_store, state.execution.device.stream);

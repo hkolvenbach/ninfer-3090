@@ -102,6 +102,10 @@ ConstructedTarget construct_registered(const EngineOptions& options, DeviceConte
 
     auto model = Target::construct_loaded_model(std::move(load_plan), std::move(materialized));
     device.synchronize();
+    // The bank is committed before capacity is resolved, so the authoritative resolution below
+    // reads free memory that already excludes it.
+    std::vector<std::string> lora_adapter_names = Target::attach_lora(*model, options, device);
+    device.synchronize();
     runtime::KvCapacityResolution capacity_resolution =
         runtime::resolve_kv_capacity(options.kv_capacity, curve, current_free_device_bytes());
     auto sequence_plan = std::move(sequence_planner).finalize(capacity_resolution.main_page_groups);
@@ -128,6 +132,7 @@ ConstructedTarget construct_registered(const EngineOptions& options, DeviceConte
     summary.peak_staging_bytes   = stats.peak_staging_bytes;
     summary.tensor_count         = stats.tensor_count;
     summary.resource_count       = stats.resource_count;
+    summary.lora_adapter_names   = std::move(lora_adapter_names);
     return ConstructedTarget{.active            = ActiveTarget(std::move(instance)),
                              .load              = std::move(summary),
                              .sampling_defaults = sampling_defaults};

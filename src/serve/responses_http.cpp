@@ -87,17 +87,6 @@ ApiError response_not_found(const std::string& id) {
     return error;
 }
 
-void validate_model(const std::string& requested, const std::string& available) {
-    if (requested == available) { return; }
-    ApiError error;
-    error.status  = 404;
-    error.type    = "invalid_request_error";
-    error.param   = "model";
-    error.code    = "model_not_found";
-    error.message = "model '" + requested + "' not found";
-    throw ApiException(std::move(error));
-}
-
 Json parse_json_body(const httplib::Request& request) {
     try {
         return Json::parse(request.body);
@@ -204,8 +193,8 @@ void HttpServer::handle_responses(const httplib::Request& req, httplib::Response
         limits.default_max_tokens = options_.default_max_tokens;
         Json body                 = parse_json_body(req);
         resolve_response_item_references(body, response_store_);
-        request = parse_responses_request(body, limits);
-        validate_model(request.generation.model, public_model_id_);
+        request                   = parse_responses_request(body, limits);
+        request.generation.adapter = require_model(request.generation.model);
         if (request.previous_response_id) {
             const std::shared_ptr<const StoredResponse> previous =
                 response_store_.get(*request.previous_response_id);
@@ -369,7 +358,8 @@ void HttpServer::handle_response_input_tokens(const httplib::Request& req, httpl
         Json body                 = parse_json_body(req);
         resolve_response_item_references(body, response_store_);
         ResponsesRequest request = parse_response_input_tokens_request(body, limits);
-        validate_model(request.generation.model, public_model_id_);
+        // Token counting is adapter-independent, but an unknown `model` must still 404.
+        static_cast<void>(require_model(request.generation.model));
         const int tokens =
             service_->count_prompt_tokens(request.generation, [&req] { return disconnected(req); });
         res.set_content(make_response_input_tokens_body(tokens), "application/json");

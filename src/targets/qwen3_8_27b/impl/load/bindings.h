@@ -8,13 +8,17 @@
 
 #include "artifact/binder.h"
 #include "artifact/materializer.h"
+#include "core/arena.h"
 #include "core/tensor.h"
 
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <memory>
+#include <string>
 #include <utility>
 #include <variant>
+#include <vector>
 
 namespace ninfer::targets::qwen3_8_27b::detail {
 
@@ -185,6 +189,10 @@ public:
     artifact::MaterializedArtifact backing;
     qwen3_8::FrontendResources frontend;
     RuntimeModelView runtime;
+    // Owns the resident LoRA bank the model view points into. Empty unless adapters were
+    // registered at startup.
+    std::unique_ptr<DeviceArena> lora_arena;
+    std::vector<std::string> lora_adapter_names;
 };
 
 class LoadedModel::Impl {

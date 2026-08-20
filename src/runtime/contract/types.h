@@ -24,7 +24,10 @@ using ::ninfer::TokenId;
 struct ResolvedExecutionOptions {
     ResolvedSamplingParameters sampling;
     std::uint32_t requested_output_tokens = 0;
-    bool allow_prefix_reuse               = true;
+    // Resident LoRA bank index, or -1 for the base weights. Engine has already rejected an
+    // unregistered name, so this value is always admissible.
+    std::int32_t adapter    = -1;
+    bool allow_prefix_reuse = true;
 };
 
 struct ResolvedRequestOptions {

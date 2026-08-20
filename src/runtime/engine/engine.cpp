@@ -21,12 +21,34 @@
 namespace ninfer {
 namespace {
 
+// Resolves a requested adapter name against the startup-registered bank. An unregistered name is
+// a request error rather than a silent fall back to the base weights, because the two produce
+// different output and the caller asked for one of them specifically.
+std::int32_t resolve_adapter(const std::vector<std::string>& registered,
+                             const std::optional<std::string>& requested) {
+    if (!requested.has_value()) { return -1; }
+    for (std::size_t index = 0; index < registered.size(); ++index) {
+        if (registered[index] == *requested) { return static_cast<std::int32_t>(index); }
+    }
+    std::string known;
+    for (const std::string& name : registered) {
+        known += known.empty() ? "" : ", ";
+        known += name;
+    }
+    throw RequestError(RequestErrorKind::UnknownAdapter,
+                       "LoRA adapter '" + *requested + "' is not registered; " +
+                           (registered.empty() ? "this engine registered no adapters"
+                                               : "registered adapters are: " + known));
+}
+
 runtime::ResolvedRequestOptions resolve_request_options(const ModelSamplingDefaults& defaults,
-                                                        SamplingMode mode, RequestOptions options) {
+                                                        SamplingMode mode, RequestOptions options,
+                                                        const std::vector<std::string>& adapters) {
     runtime::ResolvedRequestOptions resolved;
     resolved.execution.sampling =
         runtime::resolve_sampling(defaults, mode, options.execution.sampling);
     resolved.execution.requested_output_tokens = options.execution.requested_output_tokens;
+    resolved.execution.adapter        = resolve_adapter(adapters, options.execution.adapter);
     resolved.execution.allow_prefix_reuse      = options.execution.allow_prefix_reuse;
     resolved.routing_hint                      = std::move(options.execution.routing_hint);
     resolved.stop                              = std::move(options.stop);
@@ -262,8 +284,9 @@ GenerationHandle Engine::submit(PreparedPrompt prompt, RequestOptions options,
         }
     } host_input_guard{&prompt, &host_input};
 
-    runtime::ResolvedRequestOptions resolved_options = resolve_request_options(
-        impl_->sampling_defaults, prompt.impl_->sampling_mode, std::move(options));
+    runtime::ResolvedRequestOptions resolved_options =
+        resolve_request_options(impl_->sampling_defaults, prompt.impl_->sampling_mode,
+                                std::move(options), impl_->load.lora_adapter_names);
     const ResolvedSamplingParameters resolved_sampling = resolved_options.execution.sampling;
 
     const PromptSummary prompt_summary = prompt.impl_->summary;
@@ -354,7 +377,11 @@ RuntimeStats Engine::runtime_stats() const {
 namespace {
 
 std::string slot_model_binding(const LoadSummary& load) {
-    return load.target + '\n' + load.model_id + '\n' + load.weights_id;
+    // The resident adapter set is part of the binding: a slot image carries KV and GDN state
+    // whose meaning depends on which adapters were registered and in what bank order.
+    std::string binding = load.target + '\n' + load.model_id + '\n' + load.weights_id;
+    for (const std::string& adapter : load.lora_adapter_names) { binding += '\n' + adapter; }
+    return binding;
 }
 
 } // namespace

@@ -887,15 +887,20 @@ std::string make_chat_chunk_usage(const std::string& id, const std::string& mode
 
 std::string sse_done() { return "data: [DONE]\n\n"; }
 
-std::string make_models_list(const std::string& model_id, std::int64_t created,
-                             std::uint32_t context_window, bool vision) {
-    const Json payload = {{"object", "list"},
-                          {"data", Json::array({Json{{"id", model_id},
-                                                     {"object", "model"},
-                                                     {"created", created},
-                                                     {"owned_by", "ninfer"},
-                                                     {"context_window", context_window},
-                                                     {"modalities", Json{{"vision", vision}}}}})}};
+std::string make_models_list(const std::string& model_id,
+                             const std::vector<std::string>& adapter_model_ids,
+                             std::int64_t created, std::uint32_t context_window, bool vision) {
+    const auto entry = [&](const std::string& id) {
+        return Json{{"id", id},
+                    {"object", "model"},
+                    {"created", created},
+                    {"owned_by", "ninfer"},
+                    {"context_window", context_window},
+                    {"modalities", Json{{"vision", vision}}}};
+    };
+    Json data = Json::array({entry(model_id)});
+    for (const std::string& id : adapter_model_ids) { data.push_back(entry(id)); }
+    const Json payload = {{"object", "list"}, {"data", std::move(data)}};
     return payload.dump();
 }
 

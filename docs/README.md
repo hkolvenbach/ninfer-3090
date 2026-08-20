@@ -46,6 +46,10 @@ Runtime and Op references:
 - [Op admission, contracts, ownership, qualification, and performance rules](maintainer/op-development.md)
 - [ReplaySSM GDN technical reference](maintainer/replayssm-gdn.md)
 - [Linear benchmark contract and registered suites](maintainer/linear-benchmark.md)
+- [Runtime LoRA adapters (Qwen3.8-27B)](maintainer/qwen3.8-27b-lora-adapters.md) is the current
+  authority for externally trained QLoRA adapters converted to `.ninfer`, banked alongside the base
+  artifact and selected per request by the served model name. Its contracts are pending migration
+  into the artifact, Op, architecture, and serving references.
 
 Artifact and model references:
 

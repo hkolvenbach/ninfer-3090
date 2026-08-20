@@ -262,6 +262,7 @@ int main(int argc, char** argv) {
         ninfer::RequestOptions request;
         request.execution.sampling                = cli.sampling;
         request.execution.requested_output_tokens = cli.max_new;
+        if (!cli.adapter.empty()) { request.execution.adapter = cli.adapter; }
         request.stop.token_ids                    = cli.stop_token_ids;
         request.stop.strings                      = cli.stop_strings;
         request.output.raw                        = cli.raw_output;
@@ -282,6 +283,7 @@ int main(int argc, char** argv) {
         engine_options.vision_max_tokens = cli.vision_max_tokens;
         engine_options.enable_vision  = cli.enable_vision;
         engine_options.use_cuda_graph = cli.use_cuda_graph;
+        engine_options.lora_adapters  = cli.lora_adapters;
         engine_options.load_progress  = load_progress.callback();
 
         const auto load_started = Clock::now();

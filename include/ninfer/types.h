@@ -104,6 +104,15 @@ struct ContinuationCacheOptions {
     std::uint32_t prefix_checkpoint_history = 4;
 };
 
+// Startup-registered LoRA adapter. Registration is explicit: an adapter exists only because it
+// was named on the command line or in EngineOptions. There is no directory discovery.
+inline constexpr std::size_t kMaximumLoraAdapters = 8;
+
+struct LoraAdapterSpec {
+    std::string name;
+    std::filesystem::path path;
+};
+
 struct EngineOptions {
     std::filesystem::path artifact_path;
     int device                         = 0;
@@ -120,6 +129,8 @@ struct EngineOptions {
     std::uint32_t vision_max_tokens = 8192;
     bool enable_vision  = false;
     bool use_cuda_graph = true;
+    // At most kMaximumLoraAdapters entries, each with a unique name.
+    std::vector<LoraAdapterSpec> lora_adapters;
     LoadProgress load_progress;
 };
 
@@ -193,6 +204,9 @@ struct ExecutionOptions {
     SamplingOverrides sampling;
     // Client-provided routing hint only; exact prepared-prefix identity must authorize reuse.
     std::optional<std::string> routing_hint;
+    // Registered adapter name; nullopt selects the base weights. An unregistered name is a
+    // request error, never a silent fallback to base.
+    std::optional<std::string> adapter;
     std::uint32_t requested_output_tokens = 0;
     bool allow_prefix_reuse               = true;
 };
@@ -318,6 +332,8 @@ enum class RequestErrorKind : std::uint8_t {
     Overloaded,
     QueueTimeout,
     Unavailable,
+    // The request named a LoRA adapter that was not registered at startup.
+    UnknownAdapter,
 };
 
 class RequestError final : public std::invalid_argument {
@@ -627,6 +643,8 @@ struct LoadSummary {
     std::uint64_t peak_staging_bytes   = 0;
     std::size_t tensor_count           = 0;
     std::size_t resource_count         = 0;
+    // Registered adapter names in bank-index order; empty when no adapter was registered.
+    std::vector<std::string> lora_adapter_names;
 };
 
 } // namespace ninfer

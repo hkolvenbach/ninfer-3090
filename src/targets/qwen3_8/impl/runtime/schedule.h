@@ -110,6 +110,9 @@ struct TargetVerifyFrameView {
     Tensor valid_columns;
     Tensor kv_table_rows;
     Tensor lanes;
+    // Per-sequence LoRA bank selector; one entry covers the whole [width, batch] tile column run
+    // of its sequence. Null data leaves the target pass on the base weights.
+    Tensor adapters;
     Tensor target_hidden;
     Tensor target_logits;
     Tensor target_tokens;

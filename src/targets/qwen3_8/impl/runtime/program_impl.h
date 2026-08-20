@@ -518,6 +518,9 @@ runtime::PrefillStepResult ProgramImplCore::start_prefill_lane(std::uint32_t lan
                                           request_plan.reuse_base))) {
         throw std::logic_error("planned resident prefix is no longer reusable");
     }
+    if (request_plan.reuse != ReusePath::FullReset && sequence.adapter != request_plan.adapter) {
+        throw std::logic_error("planned resident prefix belongs to a different LoRA adapter");
+    }
     if (request_plan.reuse == ReusePath::RestoreTurnCheckpoint &&
         (!sequence.turn_checkpoint.valid ||
          sequence.turn_checkpoint.frontier != request_plan.reuse_base)) {
@@ -556,6 +559,7 @@ runtime::PrefillStepResult ProgramImplCore::start_prefill_lane(std::uint32_t lan
                         capacity - prompt_tokens > 0 ? capacity - prompt_tokens - 1 : 0U})
             : 0U;
     request.lifecycle = Lifecycle::Empty;
+    sequence.adapter  = request_plan.adapter;
     sequence.retained = false;
     sequence.stable_continuation.reset();
     try {
@@ -1486,7 +1490,8 @@ ProgramImplCore::preflight_continuation(const cache::ContinuationImage& candidat
 
 bool ProgramImplCore::import_continuation_lane(std::uint32_t lane,
                                                  const cache::ContinuationImage& candidate,
-                                                 const PreparedPromptData& prompt) noexcept {
+                                                 const PreparedPromptData& prompt,
+                                                 std::int32_t adapter) noexcept {
     if (lane >= max_concurrency) { return false; }
     SequenceState& sequence = sequences[lane];
     RequestControl& request = requests[lane];
@@ -1684,6 +1689,7 @@ bool ProgramImplCore::import_continuation_lane(std::uint32_t lane,
         // anchor in place would let prefix_matches accept it against the newly restored ledger
         // and splice in another conversation's recurrent state.
         sequence.user_turn_anchor = {};
+        sequence.adapter          = adapter;
         sequence.retained         = true;
         request.lifecycle = Lifecycle::Complete;
         return true;
@@ -2013,6 +2019,7 @@ void ProgramImplCore::prepare_graphs() {
                 dflash_host_ingress->text_kv_table_rows[row]   = static_cast<std::int32_t>(row);
                 dflash_host_ingress->dflash_kv_table_rows[row] = static_cast<std::int32_t>(row);
                 dflash_host_ingress->lanes[row]                = static_cast<std::int32_t>(row);
+                dflash_host_ingress->adapters[row]             = -1;
                 dflash_host_ingress->sampling[row]             = {};
             }
         }
@@ -2041,6 +2048,7 @@ void ProgramImplCore::prepare_graphs() {
                 mtp_host_ingress->text_kv_table_rows[row] = static_cast<std::int32_t>(row);
                 mtp_host_ingress->mtp_kv_table_rows[row]  = static_cast<std::int32_t>(row);
                 mtp_host_ingress->lanes[row]              = static_cast<std::int32_t>(row);
+                mtp_host_ingress->adapters[row]           = -1;
                 mtp_host_ingress->rope_deltas[row]        = 0;
                 mtp_host_ingress->sampling[row]           = {};
             }
@@ -2056,6 +2064,7 @@ void ProgramImplCore::prepare_graphs() {
                     checked_i32(frontier, "graph representative ordinary RoPE position");
                 ordinary_host_ingress->text_kv_table_rows[row] = static_cast<std::int32_t>(row);
                 ordinary_host_ingress->lanes[row]              = static_cast<std::int32_t>(row);
+                ordinary_host_ingress->adapters[row]           = -1;
                 ordinary_host_ingress->sampling[row]           = {};
             }
         }
@@ -2648,6 +2657,7 @@ ProgramImplCore::decode_ordinary_batch(std::span<const std::uint32_t> lanes,
                 checked_i32(frontier, "ordinary batch RoPE position") + sequence.rope_delta;
             ordinary_host_ingress->text_kv_table_rows[row] = sequence.kv->text.bound_row();
             ordinary_host_ingress->lanes[row]    = static_cast<std::int32_t>(sequence.lane);
+            ordinary_host_ingress->adapters[row] = sequence.adapter;
             ordinary_host_ingress->sampling[row] = request.sampling_host;
             materialize_sequence_kv(sequence, frontier + 1, 0);
         }
@@ -2778,6 +2788,7 @@ ProgramImplCore::decode_mtp_batch(std::span<const std::uint32_t> lanes,
             mtp_host_ingress->text_kv_table_rows[row] = sequence.kv->text.bound_row();
             mtp_host_ingress->mtp_kv_table_rows[row]  = sequence.kv->backend->bound_row();
             mtp_host_ingress->lanes[row]              = static_cast<std::int32_t>(sequence.lane);
+            mtp_host_ingress->adapters[row]           = sequence.adapter;
             mtp_host_ingress->rope_deltas[row]        = sequence.rope_delta;
             mtp_host_ingress->sampling[row]           = request.sampling_host;
             materialize_sequence_kv(sequence, frontier + extent + 1,
@@ -2941,6 +2952,7 @@ ProgramImplCore::decode_dflash_batch(std::span<const std::uint32_t> lanes,
             dflash_host_ingress->text_kv_table_rows[row]   = sequence.kv->text.bound_row();
             dflash_host_ingress->dflash_kv_table_rows[row] = sequence.kv->backend->bound_row();
             dflash_host_ingress->lanes[row]    = static_cast<std::int32_t>(sequence.lane);
+            dflash_host_ingress->adapters[row] = sequence.adapter;
             dflash_host_ingress->sampling[row] = request.sampling_host;
             materialize_sequence_kv(sequence, frontier + extent + 1U, frontier);
         }
