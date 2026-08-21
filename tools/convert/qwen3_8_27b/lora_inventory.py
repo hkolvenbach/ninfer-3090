@@ -12,6 +12,14 @@ can accumulate into after the fused projection has run.  ``gate_proj``,
 their deltas would have to land before ``silu(g) * u`` and before the fused
 causal convolution respectively, which no post-hoc additive pass can express.
 
+The vocabulary endpoints are absent for a different reason.  ``lm_head`` would
+satisfy that rule - its logits destination is already a plain contiguous BF16
+matrix - but this table and its object names are layer-indexed and have no slot
+for a site outside the decoder stack.  ``embed_tokens`` has no matmul
+destination at all, because ``ops::embedding`` is a gather.  See
+``tools/train/qwen3_8_27b/train_lora.py`` for what each unregistered module
+would cost and buy.
+
 Every site is described in *stored* terms.  ``hf_heads`` and ``hf_head_rows``
 describe the source ``lora_B`` row space, and ``hf_row_begin``/``hf_row_end``
 select the rows this site owns inside one head:
@@ -213,16 +221,24 @@ for _spec in SITE_SPECS:
     SUPPORTED_HF_MODULES.setdefault(_leaf, ())
     SUPPORTED_HF_MODULES[_leaf] += (_spec.key,)
 
-# Rejected with an explicit message rather than silently dropped.
+# Rejected with an explicit message rather than silently dropped.  The four modules that
+# `train_lora.py --extra-modules` can train name what blocks them, so a training-side experiment
+# that reaches conversion gets a reason instead of a dead end.
+_SWIGLU_BLOCKER = (
+    "the delta must land before silu(gate) * up inside ops::linear_swiglu, which needs an "
+    "optional pre-activation addend in every schedule route"
+)
 REJECTED_HF_MODULES: dict[str, str] = {
-    "gate_proj": "the delta would have to land before silu(gate) * up inside ops::linear_swiglu",
-    "up_proj": "the delta would have to land before silu(gate) * up inside ops::linear_swiglu",
+    "gate_proj": _SWIGLU_BLOCKER,
+    "up_proj": _SWIGLU_BLOCKER,
     "in_proj_qkv": "the delta would have to land before the fused causal convolution and its SiLU",
     "in_proj_z": "the delta would have to land before the fused causal convolution and its SiLU",
     "in_proj_a": "fused into ops::gdn_norm_gating_proj",
     "in_proj_b": "fused into ops::gdn_norm_gating_proj",
-    "lm_head": "the output head is not a registered adapter site",
-    "embed_tokens": "the token embedding is not a registered adapter site",
+    "lm_head": "the logits destination already satisfies the lora_delta_add contract, but this "
+               "table and its object names are layer-indexed",
+    "embed_tokens": "ops::embedding is a gather, so this needs a new Op computing "
+                    "out[:, t] += B @ A[:, ids[t]]",
 }
 
 

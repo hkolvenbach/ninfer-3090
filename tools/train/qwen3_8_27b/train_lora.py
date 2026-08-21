@@ -1,19 +1,49 @@
-"""QLoRA training for the registered Qwen3.8-27B LoRA site table.
+"""QLoRA training for the Qwen3.8-27B LoRA module table.
 
-Trains an adapter that `tools/convert/qwen3_8_27b/convert_lora.py` can convert directly, targeting
-the complete registered site table: all seven sites, 42,205,184 parameters and 368 objects at
-``--rank 16``.  What is absent from that table is a structural limit rather than a shortcut.
-``gate_proj``/``up_proj`` and the Gated DeltaNet input projections are excluded because their
-deltas would have to land before ``silu(gate) * up`` and before the fused causal convolution,
-which no post-hoc additive pass can express.  See
-``docs/maintainer/qwen3.8-27b-lora-adapters.md`` section 3.
+By default this trains the complete registered site table: the six HF leaf modules in
+``TARGET_MODULES``, which `tools/convert/qwen3_8_27b/convert_lora.py` converts into seven sites,
+42,205,184 parameters and 368 objects at ``--rank 16``.
+
+``MODULE_NOTES`` documents every module this architecture exposes, registered or not: what each
+one computes, where a low-rank delta would have to land, what it costs, and what it is expected
+to buy.  Four modules are trainable through ``--extra-modules`` but are **not yet convertible**.
+They are documented and reachable so the training-side experiment can run before the engine work
+does; `convert_lora.py` rejects the resulting adapter by name.
+
+One property of such a run is worth knowing in advance.  Naming either vocabulary endpoint puts
+PEFT's ``save_embedding_layers`` into effect, because ``EMBEDDING_LAYER_NAMES`` is
+``["embed_tokens", "lm_head"]`` and either one triggers it, so the adapter additionally stores
+*both* full ``[248320, 5120]`` base matrices.  A measured ``--steps 0`` run with all four extra
+modules wrote 5,471,486,944 bytes: roughly 5.1 GB of base copy around 193 MB of low-rank planes.
+Registering these two sites therefore means skipping ``base_layer.weight`` keys at conversion,
+not only adding the planes.
+
+The module names do not map onto a dense transformer, so read the shape of the model first.  Of
+64 layers, 16 are full attention (3, 7, 11 ... 63) and 48 are Gated DeltaNet.  ``q_proj`` carries
+the query and the per-head output gate interleaved, 24 heads x (256 query rows + 256 gate rows),
+so it feeds two sites off one shared ``A``.  ``out_proj`` is ``linear_attn.out_proj``, GDN's
+analogue of ``o_proj``; PEFT matches on the leaf name and it does not collide with
+``self_attn.o_proj``.  Unsloth's published recipes target dense Llama/Mistral and have no
+equivalent of it, which is why their module list is not this one.
+
+Continued pretraining already works with the registered six.  CPT is raw text under full-token
+loss, which is ``--dataset-field text`` without ``--completion-only``; no part of the module set
+blocks it.  Two limits are real and are not removed by adding modules.  The rank ceiling is
+``ops::kMaximumLoraRank`` = 64, below what CPT usually wants.  And the vocabulary is fixed at
+248320 rows with the tokenizer SHA-256 pinned into the base artifact, so the canonical CPT case -
+teaching a new language by adding tokens - needs a new base artifact, not an adapter.  Weigh both
+against the published finding that LoRA loses the most ground to full finetuning in exactly this
+regime; it is strongest on style, format and instruction following, weakest on knowledge
+injection.
 
 Every adapter registered in one engine must share one rank and one site inventory, so an adapter
-trained against an earlier, narrower table cannot be served alongside one trained here.
+trained against a narrower table cannot be served alongside one trained here.
 
-``--steps 0`` performs no optimizer step and writes the freshly initialized adapter.  PEFT
-initializes ``lora_B`` to exactly zero, so that adapter is the exact tier-0 identity and is the
-seam test for Unsloth's on-disk key naming.
+``--steps 0`` performs no optimizer step and writes the freshly initialized adapter, which is the
+seam test for Unsloth's on-disk key naming.  It is an exact tier-0 identity, but the zero plane
+differs by site kind: PEFT zero-initializes ``lora_B`` for a Linear and ``lora_embedding_A`` for
+an Embedding, so an ``--extra-modules embed_tokens`` run is an identity through its ``A`` plane
+rather than its ``B``.
 """
 
 from __future__ import annotations
@@ -25,19 +55,176 @@ from unsloth import FastModel  # isort:skip
 import argparse
 import json
 import os
+from dataclasses import dataclass
 from pathlib import Path
 
 
-# The complete registered site table, expressed as the HuggingFace leaf modules that feed it.
-# `q_proj` feeds two sites: the converter de-interleaves query and output-gate rows.
-#
-# `out_proj` is `linear_attn.out_proj`, and it is what makes this table cover the whole model.
-# Only 16 of the 64 layers are full attention; the other 48 are Gated DeltaNet. Omitting it adapts
-# the token-mixing path in 16 layers and leaves the remaining 48 carrying `mlp.down_proj` alone,
-# so three quarters of the model would get a single adapted projection. PEFT matches on the leaf
-# name, and `linear_attn.out_proj` does not collide with `self_attn.o_proj`, so naming it here
-# targets exactly the 48 GDN layers and nothing else.
+# The complete registered site table, as the HuggingFace leaf modules that feed it. Together these
+# cover the attention block in all 16 full-attention layers, the GDN output projection in all 48
+# GDN layers, and the down projection in all 64. `MODULE_NOTES` below records what each one
+# computes and costs; changing this list changes which adapters can share one bank.
 TARGET_MODULES = ["q_proj", "k_proj", "v_proj", "o_proj", "down_proj", "out_proj"]
+
+
+@dataclass(frozen=True, slots=True)
+class ModuleNote:
+    """What one HF leaf module computes, and what adapting it costs and buys.
+
+    `parameters` is the rank-16 count across every layer the module occupies.  It scales exactly
+    with rank, because every plane is `rank x in_features` or `out_features x rank`; use
+    `parameters_at_rank` rather than the raw field when reporting a run.
+    """
+
+    role: str
+    destination: str
+    layers: int
+    parameters: int
+    registered: bool
+    gain: str
+    blocker: str = ""
+
+
+_REFERENCE_RANK = 16
+
+# hidden 5120, intermediate 17408, 64 layers (16 full attention + 48 GDN), vocabulary 248320.
+# Query and output gate are 24 heads x 256 rows each, so both `B` planes are [6144, r] over one
+# shared [r, 5120] `A`.  Counts below are `layers * (rank * in_features + out_features * rank)`.
+MODULE_NOTES: dict[str, ModuleNote] = {
+    "q_proj": ModuleNote(
+        role="Query and per-head output gate, interleaved. The query sets what a position looks "
+             "for; the gate scales that head's contribution on the way out.",
+        destination="q_flat and gate_flat, two plain BF16 destinations of ops::attn_input_proj",
+        layers=16,
+        parameters=4_456_448,       # 16 * (16*5120 + 2 * 6144*16)
+        registered=True,
+        gain="Feeds two registered sites off one shared A. Zeroing that A would corrupt the "
+             "unmasked twin, which is why site masking zeroes B only.",
+    ),
+    "k_proj": ModuleNote(
+        role="Keys - what each past token advertises to a query. Sets the retrieval matching "
+             "criterion.",
+        destination="k_flat",
+        layers=16,
+        parameters=1_572_864,       # 16 * (16*5120 + 1024*16)
+        registered=True,
+        gain="Smallest attention site. Matters for which tokens are found, not what is done "
+             "with them.",
+    ),
+    "v_proj": ModuleNote(
+        role="Values - the content actually retrieved and mixed across positions.",
+        destination="v_flat",
+        layers=16,
+        parameters=1_572_864,       # 16 * (16*5120 + 1024*16)
+        registered=True,
+        gain="Changes what retrieval returns rather than what it selects.",
+    ),
+    "o_proj": ModuleNote(
+        role="Projects mixed head outputs back to the residual stream: how retrieved content is "
+             "written back.",
+        destination="the residual x, through ops::linear_add",
+        layers=16,
+        parameters=2_883_584,       # 16 * (16*6144 + 5120*16)
+        registered=True,
+        gain="The attention block's write port. Reaches only the 16 full-attention layers.",
+    ),
+    "out_proj": ModuleNote(
+        role="linear_attn.out_proj - Gated DeltaNet's analogue of o_proj. Writes the recurrent "
+             "state readout back to the residual in the 48 GDN layers.",
+        destination="the residual x, through ops::linear_add",
+        layers=48,
+        parameters=8_650_752,       # 48 * (16*6144 + 5120*16)
+        registered=True,
+        gain="Absent from Unsloth's dense recipes. Two paired A/B runs at r=16 measured no "
+             "significant quality change from adding it; it is registered because the "
+             "token-mixing path should not be economized on in three quarters of the layers.",
+    ),
+    "down_proj": ModuleNote(
+        role="Reads the SwiGLU activation back to the residual: the value side of FFN key-value "
+             "memory - what the addressed channels emit.",
+        destination="the residual x, through ops::linear_add, applied inside the package "
+                    "post-mixer leaf because the activation never leaves it",
+        layers=64,
+        parameters=23_068_672,      # 64 * (16*17408 + 5120*16)
+        registered=True,
+        gain="55% of the registered table and the only site spanning all 64 layers. Measured to "
+             "carry per-item lexical behaviour, acquired in frequency order.",
+    ),
+    "gate_proj": ModuleNote(
+        role="Produces g in h = silu(g) * u. After SiLU it is a soft switch over 17408 channels: "
+             "the addressing (key) side of FFN key-value memory - which memories fire.",
+        destination="the pre-activation g inside ops::linear_swiglu. The gate and up weights are "
+                    "one packed [34816, 5120] tensor and the intermediate is not materialized on "
+                    "the decode or MmaSplitHalfPair routes, so no post-hoc additive pass reaches "
+                    "it; silu(g+dg)*(u+du) does not decompose into silu(g)*u + f(dg,du).",
+        layers=64,
+        parameters=23_068_672,      # 64 * (16*5120 + 17408*16)
+        registered=False,
+        gain="Highest of the four, on two grounds. Published placement studies concentrate LoRA "
+             "benefit in the MLP, and this target's own site ablation found the adapter's "
+             "learned behaviour concentrated in mlp/down - the value side - leaving no lever on "
+             "addressing. Both are inferences from dense transformers; no published placement "
+             "ablation exists for a GDN hybrid.",
+        blocker="needs an optional pre-activation addend in every linear_swiglu route",
+    ),
+    "up_proj": ModuleNote(
+        role="Produces u in h = silu(g) * u: the content the gated channels carry.",
+        destination="the pre-activation u inside ops::linear_swiglu, same packed tensor and same "
+                    "obstruction as gate_proj",
+        layers=64,
+        parameters=23_068_672,      # 64 * (16*5120 + 17408*16)
+        registered=False,
+        gain="Paired with gate_proj; the literature's MLP arm is both together with down_proj. "
+             "Adding both doubles the adapter, which is the main cost to weigh.",
+        blocker="needs an optional pre-activation addend in every linear_swiglu route",
+    ),
+    "lm_head": ModuleNote(
+        role="Final projection from the hidden state to logits over 248320 rows: what the model "
+             "is willing to say.",
+        destination="the logits tensor - already a plain contiguous BF16 [248320, T] that "
+                    "satisfies the ops::lora_delta_add destination contract",
+        layers=0,
+        parameters=4_055_040,       # 16*5120 + 248320*16
+        registered=False,
+        gain="Moderate and narrow. It reshapes the output distribution directly, which suits "
+             "register, refusal style and vocabulary preference, and it is cheap. It cannot "
+             "change what the model computes, only how that is read out. One hazard: the "
+             "speculative draft head is a row gather of lm_head, so a delta applied to one and "
+             "not the other desynchronizes proposals from the target and costs MTP acceptance.",
+        blocker="policy, not an Op limit - the site table and artifact object names are "
+                "layer-indexed and have no slot for a non-layer site",
+    ),
+    "embed_tokens": ModuleNote(
+        role="Token id to initial hidden state, a lookup over 248320 rows: what a token means on "
+             "entry.",
+        destination="none today - ops::embedding is a gather, not a matmul, so there is no "
+                    "[N, T] destination for B @ (A @ x). It needs a new Op computing "
+                    "out[:, t] += B @ A[:, ids[t]].",
+        layers=0,
+        parameters=4_055_040,       # 16*248320 + 5120*16
+        registered=False,
+        gain="Lowest of the four. Unsloth recommends it for continued pretraining, but that "
+             "recommendation is about learning new tokens for a new language, and this product "
+             "cannot add tokens: the vocabulary is fixed and the tokenizer is pinned into the "
+             "base artifact. What remains is re-weighting the meaning of existing tokens.",
+        blocker="needs a new Op and the same non-layer site slot as lm_head",
+    ),
+}
+
+OPTIONAL_MODULES: dict[str, ModuleNote] = {
+    name: note for name, note in MODULE_NOTES.items() if not note.registered
+}
+
+# `peft.utils.constants.EMBEDDING_LAYER_NAMES`. Naming either one sets `save_embedding_layers`,
+# which writes both full base matrices into the adapter alongside the low-rank planes.
+_PEFT_EMBEDDING_LAYER_NAMES = ("embed_tokens", "lm_head")
+
+REGISTERED_PARAMETERS = sum(note.parameters for note in MODULE_NOTES.values() if note.registered)
+
+
+def parameters_at_rank(parameters: int, rank: int) -> int:
+    """Exact parameter count at `rank`; every plane is `rank x in` or `out x rank`."""
+
+    return parameters * rank // _REFERENCE_RANK
 
 
 def frozen_base_quantization(model) -> dict:
@@ -88,6 +275,17 @@ def parse_arguments() -> argparse.Namespace:
     parser.add_argument("--thinking", action="store_true",
                         help="render prompts with the thinking block open (default: closed, "
                              "matching ninfer-serve --no-thinking)")
+    parser.add_argument(
+        "--extra-modules",
+        nargs="+",
+        default=(),
+        choices=sorted(OPTIONAL_MODULES),
+        metavar="MODULE",
+        help="also train modules that are not registered sites. They train here, but "
+             "convert_lora.py rejects the resulting adapter by name, so the run is a "
+             "training-side experiment only. See MODULE_NOTES for what each one costs and is "
+             f"expected to buy. One or more of: {', '.join(sorted(OPTIONAL_MODULES))}",
+    )
     parser.add_argument("--rank", type=int, default=16, choices=(8, 16, 32, 64))
     parser.add_argument("--alpha", type=int, default=32)
     parser.add_argument("--max-seq-length", type=int, default=1024)
@@ -104,7 +302,22 @@ def main() -> int:
     if not arguments.base.is_dir():
         raise SystemExit(f"base checkpoint directory does not exist: {arguments.base}")
 
-    targets = list(TARGET_MODULES)
+    extra_modules = sorted(set(arguments.extra_modules))
+    targets = list(TARGET_MODULES) + extra_modules
+    if extra_modules:
+        extra_parameters = sum(MODULE_NOTES[name].parameters for name in extra_modules)
+        print("training modules outside the registered site table; convert_lora.py will reject "
+              "this adapter:")
+        for name in extra_modules:
+            note = MODULE_NOTES[name]
+            print(f"  {name}: +{parameters_at_rank(note.parameters, arguments.rank):,} "
+                  f"parameters - {note.blocker}")
+        print(f"  {parameters_at_rank(REGISTERED_PARAMETERS, arguments.rank):,} registered -> "
+              f"{parameters_at_rank(REGISTERED_PARAMETERS + extra_parameters, arguments.rank):,} "
+              f"trainable at rank {arguments.rank}")
+        if any(name in _PEFT_EMBEDDING_LAYER_NAMES for name in extra_modules):
+            print("  a vocabulary endpoint is named, so PEFT will also write both full "
+                  "[248320, 5120] base matrices into the adapter - about 5.1 GB")
 
     # bfloat16 throughout: fp16 is rejected for this architecture by Unsloth's loader.
     model, tokenizer = FastModel.from_pretrained(
@@ -230,6 +443,7 @@ def main() -> int:
         "rank": arguments.rank,
         "alpha": arguments.alpha,
         "target_modules": targets,
+        "extra_modules": extra_modules,
         "steps": arguments.steps,
         "max_seq_length": arguments.max_seq_length,
         "seed": arguments.seed,

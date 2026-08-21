@@ -108,7 +108,8 @@ From `transformers/models/qwen3_5/modeling_qwen3_5.py`:
 
 NInfer's fused Ops make two HF module families **structurally impossible** to correct with a
 post-hoc additive delta. This is not an implementation shortcut; it is a property of where the
-nonlinearity sits.
+nonlinearity sits. The two vocabulary endpoints are also unregistered, but for different reasons;
+they are listed separately at the foot of the table so the two categories are not confused.
 
 | HF module | NInfer call site | v1 | Reason |
 |---|---|:--:|---|
@@ -120,10 +121,18 @@ nonlinearity sits.
 | `gate_proj`, `up_proj` | `ops::linear_swiglu` (`variant.cpp:278`) | **no** | the delta must land **before** `silu(g) * u`; `silu(g+dg)*(u+du)` is not decomposable into `silu(g)*u + f(dg,du)` |
 | `in_proj_qkv`, `in_proj_z` | `ops::gdn_input_proj_conv_snapshot` (`variant.cpp:213-232`) | **no** | the delta must land **before** the fused causal conv **and** its SiLU. The conv is linear, but a separate delta path would need its own 3-tap persistent state per lane; the SiLU then blocks recombination. |
 | `in_proj_a`, `in_proj_b` | `ops::gdn_norm_gating_proj` (`variant.cpp:265-272`) | **no** | `[48,5120]`, fused into the norm+gating leaf; negligible capacity |
+| `lm_head` | `ops::linear` into `logits` (`text_context_impl.h:642,747,805,1278`) | **no** | **not structural.** The destination is already a plain contiguous BF16 `[248320,T]` and satisfies the `lora_delta_add` contract. Excluded because this site table and its object names are layer-indexed, and because `text/draft_head` is a row gather of `lm_head` — an unmirrored delta desynchronizes MTP proposals from the target |
+| `embed_tokens` | `ops::embedding` (`text_context_impl.h:743,795,1256`) | **no** | a gather, not a matmul: no `[N,T]` destination exists for `B @ (A @ x)`. Needs a new Op computing `out[:,t] += B @ A[:,ids[t]]` |
 
 Supporting the excluded families requires an optional additive-input parameter threaded through the
 `linear_swiglu` and `gdn_input_proj*` epilogues across `q4`, `q5`, `w8`, and `nvfp4` — roughly six
 kernel families times four codecs. That is a separate project.
+
+The vocabulary endpoints are a different case: `lm_head` is a policy exclusion rather than a
+structural one, and `embed_tokens` needs a new Op rather than a modified epilogue.
+`tools/train/qwen3_8_27b/train_lora.py` carries the per-module role, cost and expected gain for all
+four unregistered modules, and its `--extra-modules` flag trains them for a training-side
+experiment; `convert_lora.py` still rejects the resulting adapter by name.
 
 **Registered v1 target-module set:**
 
