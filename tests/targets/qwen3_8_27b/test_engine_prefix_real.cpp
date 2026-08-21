@@ -1,7 +1,9 @@
 #include "ninfer/engine.h"
 
 #include <cstdint>
+#include <cstdio>
 #include <cstdlib>
+#include <filesystem>
 #include <iostream>
 #include <string>
 #include <utility>
@@ -45,19 +47,14 @@ ninfer::PromptInput chinese_chat(bool enable_thinking) {
     return input;
 }
 
-int exercise_registered_frontend(const ninfer::Engine& engine, bool qwen3_8) {
-    const std::uint32_t thinking_tokens = engine.count_tokens(chinese_chat(true));
-    const std::uint32_t no_thinking_tokens = engine.count_tokens(chinese_chat(false));
-    const std::uint32_t expected_thinking = qwen3_8 ? 58U : 16U;
-    const std::uint32_t expected_no_thinking = qwen3_8 ? 18U : 18U;
-    if (thinking_tokens != expected_thinking) {
-        std::cerr << "registered tokenizer/chat template changed the thinking prompt golden: "
-                  << thinking_tokens << '\n';
-        return 1;
-    }
-    if (no_thinking_tokens != expected_no_thinking) {
-        std::cerr << "registered tokenizer/chat template changed the no-thinking prompt golden: "
-                  << no_thinking_tokens << '\n';
+int exercise_registered_frontend(const ninfer::Engine& engine) {
+    const std::uint32_t thinking    = engine.count_tokens(chinese_chat(true));
+    const std::uint32_t no_thinking = engine.count_tokens(chinese_chat(false));
+    // The registered Qwen3.8 chat template injects a default system prompt in its thinking
+    // flavor, so the two goldens differ.
+    if (thinking != 58 || no_thinking != 18) {
+        std::cerr << "registered tokenizer/chat template changed the prompt goldens: thinking="
+                  << thinking << " no_thinking=" << no_thinking << '\n';
         return 1;
     }
     return 0;
@@ -356,6 +353,190 @@ int exercise_vision(ninfer::Engine& engine) {
     return 0;
 }
 
+// End-to-end turn checkpoint ring: a multi-turn chat leaves host checkpoints behind, and a
+// prompt that rewrites a mid-history turn restores from the deepest matching one instead of
+// re-prefilling from zero - with greedy output identical to a cold run of the same prompt.
+int exercise_turn_checkpoint_ring(const char* artifact) {
+    ninfer::EngineOptions ring_options = engine_options(artifact);
+    ring_options.enable_vision         = false;
+    ring_options.turn_checkpoint_ring  = 4;
+    ninfer::Engine engine(ring_options);
+
+    auto text_message = [](std::string role, std::string text) {
+        ninfer::ChatMessage message;
+        message.role = std::move(role);
+        message.parts.push_back(ninfer::MessagePart{
+            .kind = ninfer::MessagePartKind::Text, .text = std::move(text), .media = {}});
+        return message;
+    };
+    auto chat = [&](std::vector<ninfer::ChatMessage> messages) {
+        ninfer::PromptInput input;
+        input.messages                = std::move(messages);
+        input.options.enable_thinking = false;
+        return input;
+    };
+    auto options = [](bool reuse) {
+        ninfer::RequestOptions result;
+        result.execution.requested_output_tokens = 8;
+        result.execution.sampling.temperature    = 0.0F;
+        result.execution.allow_prefix_reuse      = reuse;
+        result.stop.include_model_defaults       = false;
+        return result;
+    };
+
+    const ninfer::ChatMessage turn1 = text_message("user", "Count from one to five.");
+    const ninfer::GenerationResult first =
+        engine.generate(engine.prepare(chat({turn1})), options(true));
+    if (first.generated_token_ids.size() != 8) {
+        std::cerr << "ring turn 1 did not generate eight tokens\n";
+        return 1;
+    }
+
+    const ninfer::ChatMessage assistant1 = text_message("assistant", first.content);
+    const ninfer::ChatMessage turn2      = text_message("user", "Now say the alphabet.");
+    const ninfer::GenerationResult second =
+        engine.generate(engine.prepare(chat({turn1, assistant1, turn2})), options(true));
+    if (second.reused_prompt_tokens == 0) {
+        std::cerr << "ring turn 2 did not reuse the turn 1 prefix\n";
+        return 1;
+    }
+
+    const ninfer::ChatMessage assistant2 = text_message("assistant", second.content);
+    const ninfer::ChatMessage turn3 = text_message("user", "Thank you. What comes after Tuesday?");
+    const ninfer::GenerationResult third = engine.generate(
+        engine.prepare(chat({turn1, assistant1, turn2, assistant2, turn3})), options(true));
+    if (third.reused_prompt_tokens == 0) {
+        std::cerr << "ring turn 3 did not reuse the turn 2 prefix\n";
+        return 1;
+    }
+
+    const std::vector<ninfer::SlotState> states = engine.slot_states();
+    if (states.empty() || !states[0].retained || states[0].checkpoints.empty()) {
+        std::cerr << "retained slot reports no turn checkpoints after three turns\n";
+        return 1;
+    }
+
+    // Rewriting turn 2 diverges before the resident checkpoint; only a ring entry at the turn
+    // 1 boundary can be reused, and execution must land it back in the device slot.
+    const ninfer::ChatMessage rewritten2 = text_message("user", "Instead, name three colors.");
+    const ninfer::PromptInput rewrite    = chat({turn1, assistant1, rewritten2});
+    const ninfer::GenerationResult restored =
+        engine.generate(engine.prepare(rewrite), options(true));
+    if (restored.prefix_reuse_path != ninfer::PrefixReusePath::RestoreTurnCheckpoint ||
+        restored.reused_prompt_tokens == 0 ||
+        restored.reused_prompt_tokens >= restored.prompt.prompt_tokens) {
+        std::cerr << "mid-history rewrite did not restore from the checkpoint ring: reused="
+                  << restored.reused_prompt_tokens << " of " << restored.prompt.prompt_tokens
+                  << '\n';
+        return 1;
+    }
+
+    const ninfer::GenerationResult cold = engine.generate(engine.prepare(rewrite), options(false));
+    if (cold.generated_token_ids != restored.generated_token_ids) {
+        std::cerr << "ring checkpoint restore changed greedy output relative to full prefill\n";
+        return 1;
+    }
+
+    // Rebuild the ring on the rewritten branch, then rewrite turn 1: nothing can match below
+    // the first boundary, so the ring must not manufacture reuse.
+    const ninfer::GenerationResult rebuilt =
+        engine.generate(engine.prepare(rewrite), options(true));
+    if (rebuilt.reused_prompt_tokens == 0) {
+        std::cerr << "rewritten branch did not become the resident session\n";
+        return 1;
+    }
+    const ninfer::ChatMessage rewritten1 = text_message("user", "Name a prime number.");
+    const ninfer::GenerationResult reset =
+        engine.generate(engine.prepare(chat({rewritten1})), options(true));
+    if (reset.reused_prompt_tokens != 0 ||
+        reset.prefix_reuse_path != ninfer::PrefixReusePath::FullReset) {
+        std::cerr << "fully diverged prompt incorrectly reused ring state: reused="
+                  << reset.reused_prompt_tokens << '\n';
+        return 1;
+    }
+    return 0;
+}
+
+// End-to-end auto-save-on-eviction: a session bound to a slot file (by an explicit save) is
+// spilled back to that file when a fresh session's FullReset admission destroys it, so the
+// file ends up holding the session's latest frontier, not the explicitly saved one.
+int exercise_auto_save_evicted(const char* artifact) {
+    ninfer::EngineOptions options = engine_options(artifact);
+    options.enable_vision         = false;
+    options.turn_checkpoint_ring  = 4;
+    options.auto_save_evicted     = true;
+    ninfer::Engine engine(options);
+
+    const std::string slot_file =
+        (std::filesystem::temp_directory_path() / "ninfer-auto-save-test.bin").string();
+    struct FileGuard {
+        std::string path;
+        ~FileGuard() { (void)std::remove(path.c_str()); }
+    } guard{slot_file};
+
+    auto text_message = [](std::string role, std::string text) {
+        ninfer::ChatMessage message;
+        message.role = std::move(role);
+        message.parts.push_back(ninfer::MessagePart{
+            .kind = ninfer::MessagePartKind::Text, .text = std::move(text), .media = {}});
+        return message;
+    };
+    auto chat = [&](std::vector<ninfer::ChatMessage> messages) {
+        ninfer::PromptInput input;
+        input.messages                = std::move(messages);
+        input.options.enable_thinking = false;
+        return input;
+    };
+    ninfer::RequestOptions request;
+    request.execution.requested_output_tokens = 8;
+    request.execution.sampling.temperature    = 0.0F;
+    request.execution.allow_prefix_reuse      = true;
+    request.stop.include_model_defaults       = false;
+
+    const ninfer::ChatMessage turn1 = text_message("user", "Name two planets. Be brief.");
+    const ninfer::GenerationResult first = engine.generate(engine.prepare(chat({turn1})), request);
+    const ninfer::SlotSaveResult saved   = engine.save_slot(0, slot_file, first.session_digest);
+    if (saved.tokens == 0) {
+        std::cerr << "explicit save before eviction moved no tokens\n";
+        return 1;
+    }
+
+    // Deepen the session past the explicit save, then evict it with an unrelated session.
+    const ninfer::ChatMessage assistant1 = text_message("assistant", first.content);
+    const ninfer::ChatMessage turn2      = text_message("user", "Now two metals. Be brief.");
+    const ninfer::GenerationResult second =
+        engine.generate(engine.prepare(chat({turn1, assistant1, turn2})), request);
+    if (second.reused_prompt_tokens == 0) {
+        std::cerr << "auto-save fixture turn 2 did not continue the resident session\n";
+        return 1;
+    }
+    const ninfer::GenerationResult evictor = engine.generate(
+        engine.prepare(chat({text_message("user", "Name two colors. Be brief.")})), request);
+    if (evictor.reused_prompt_tokens != 0) {
+        std::cerr << "auto-save evictor unexpectedly reused the previous session\n";
+        return 1;
+    }
+
+    // The restore drains the writer queue, so it must observe the spilled (deeper) state.
+    const ninfer::SlotRestoreResult restored = engine.restore_slot(0, slot_file);
+    if (restored.tokens <= saved.tokens || restored.session_digest != second.session_digest) {
+        std::cerr << "auto-save did not spill the evicted session: restored " << restored.tokens
+                  << " tokens (explicit save " << saved.tokens << "), digest "
+                  << restored.session_digest << " vs " << second.session_digest << '\n';
+        return 1;
+    }
+    const ninfer::ChatMessage assistant2 = text_message("assistant", second.content);
+    const ninfer::ChatMessage turn3      = text_message("user", "Now two birds. Be brief.");
+    const ninfer::GenerationResult resumed =
+        engine.generate(engine.prepare(chat({turn1, assistant1, turn2, assistant2, turn3})),
+                        request);
+    if (resumed.reused_prompt_tokens == 0) {
+        std::cerr << "restored auto-saved session did not reuse its prefix\n";
+        return 1;
+    }
+    return 0;
+}
+
 int verify_loaded_product(const ninfer::Engine& engine) {
     const ninfer::LoadSummary load = engine.load_summary();
     if (load.target != "qwen3_8_27b" ||
@@ -381,17 +562,23 @@ int verify_loaded_product(const ninfer::Engine& engine) {
 } // namespace
 
 int exercise_artifact(const char* artifact) {
-    ninfer::Engine engine(engine_options(artifact));
-    if (const int result = verify_loaded_product(engine); result != 0) { return result; }
-    if (const int result =
-            exercise_registered_frontend(engine, engine.load_summary().target == "qwen3_8_27b");
-        result != 0) {
+    {
+        ninfer::Engine engine(engine_options(artifact));
+        if (const int result = verify_loaded_product(engine); result != 0) { return result; }
+        if (const int result = exercise_registered_frontend(engine); result != 0) {
+            return result;
+        }
+        if (const int result = exercise_full_prefill_chunk(engine); result != 0) {
+            return result;
+        }
+        if (const int result = exercise_prefix(engine); result != 0) { return result; }
+        if (const int result = exercise_vision(engine); result != 0) { return result; }
+    }
+    // Own Engine (and scope) per exercise: both features are startup options.
+    if (const int result = exercise_turn_checkpoint_ring(artifact); result != 0) {
         return result;
     }
-    if (const int result = exercise_full_prefill_chunk(engine); result != 0) { return result; }
-    if (const int result = exercise_prefix(engine); result != 0) { return result; }
-    if (const int result = exercise_vision(engine); result != 0) { return result; }
-    return 0;
+    return exercise_auto_save_evicted(artifact);
 }
 
 int main() {

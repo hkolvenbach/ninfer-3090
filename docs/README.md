@@ -11,6 +11,7 @@ run the CLI or HTTP server.
 | [CLI](cli.md) | text, chat-history, image/video input, output streams, sampling, MTP, and common runtime options |
 | [HTTP serving](serving.md) | OpenAI Responses/Chat Completions, Anthropic Messages, state, streaming, token counting, authentication, and tool calls |
 | [Tiered continuation cache](continuation-cache.md) | implemented L1/L2/L3 semantics, OpenCode session routing, stable-prefix sharing, persistence, sizing, metrics, and current limitations |
+| [Turn checkpoint ring](turn-checkpoint-ring.md) | `--turn-checkpoints` sizing, mid-history reuse, slot listing, snapshot persistence, and eviction |
 | [Performance](performance.md) | RTX 5090 single-request and concurrent-decode results, MTP/DFlash measurements, and reproduction commands |
 | [CLI examples](../examples/cli/) | committed text, multimodal, thinking, long-decode, and long-context inputs |
 
@@ -67,6 +68,8 @@ Artifact and model references:
 
 Work record:
 
+- [Cross-fork port ledger](maintainer/port-ledger.md) records which sibling-fork and upstream
+  changes have been taken into this branch, and which were declined.
 - [Prefill throughput plan (sm_89 / Qwen3.8-27B `groupwise-int`)](maintainer/prefill-throughput-plan.md)
   holds the roofline analysis, per-kernel budgets, INT8 route design, tuning sweeps, and the
   measured reasons the GQA head-packing and SwiGLU-fusion levers were closed. Its stable

@@ -198,6 +198,12 @@ decode batched at roughly 1.5x aggregate throughput, each lane keeping its own
 resident prefix. Prefill still serializes across lanes, so a deep cold prefill
 delays the other lane's first token.
 
+Add `--turn-checkpoints 32` when clients edit conversation history (agent memory
+updates, message rewrites, regenerated turns): the server then re-prefills from
+the nearest retained turn boundary instead of from zero. The ring costs host
+memory only, about 4.6 GiB per slot at 32 entries. See
+[docs/turn-checkpoint-ring.md](docs/turn-checkpoint-ring.md).
+
 Extra requests beyond the slots wait in the admission queue, and the queue deadline
 defaults to 30 seconds. A deep prefill can hold a slot longer than that, so
 parallel agent clients would fail with `request_queue_timeout`. The
@@ -446,6 +452,22 @@ The default build registers only Qwen3.8-27B. Enable the optional Qwen3.6-35B-A3
   admission picks the lane whose occupation costs least to replace - an empty lane before any
   retained session, then the shallowest - so a burst request no longer evicts a deep resident
   session while a free lane exists.
+- **Turn checkpoint ring.** `--turn-checkpoints N` (off by default) keeps up to N past turn
+  checkpoints per slot in host memory. A prompt that rewrites the middle of its history -
+  an edited message, an updated agent memory block, a regenerated earlier turn - restores at
+  the deepest checkpoint below the edit instead of re-prefilling from zero. The ring and the
+  user-turn anchor are independent rewind points: ring entries land wherever the checkpoint
+  policy placed a checkpoint, always after the last user message's content, while the anchor
+  sits at that message's opener. The planner takes whichever is deepest and still matches.
+  One checkpoint holds the GDN linear-attention state (about 147 MiB of host memory on
+  Qwen3.8-27B); the attention KV needs no copy. Slot snapshots carry the ring across restarts.
+  The recommended value is 32. Details in
+  [docs/turn-checkpoint-ring.md](docs/turn-checkpoint-ring.md).
+- **Auto-save on eviction.** `--auto-save-evicted` (off by default, requires
+  `--slot-save-path`) spills an involuntarily evicted session - checkpoint ring included -
+  back to the slot file it was last saved to or restored from, before the eviction destroys
+  it. Rotating more sessions than slots then loses nothing: the next restore recovers the
+  session at its latest frontier. Explicit `erase` never auto-saves.
 
 ### Serving surface
 

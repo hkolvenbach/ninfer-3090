@@ -48,7 +48,9 @@ int main() {
     int failures = 0;
 
     ServeMetrics metrics;
-    const auto empty = parse(metrics.render(1));
+    // The four llamacpp counters flow straight from the Engine's live totals.
+    ninfer::RuntimeStats live;
+    const auto empty = parse(metrics.render(1, live));
     failures += check(empty.at("llamacpp:prompt_tokens_total") == 0.0, "starts at zero");
     const auto never = metrics.last_completed();
     failures += check(never.prompt_tokens == 0 && never.cached_tokens == 0,
@@ -61,7 +63,7 @@ int main() {
     // older one processes and the newer one is deferred.
     metrics.begin_request(7, 500);
     metrics.begin_request(8, 900);
-    const auto busy = parse(metrics.render(1));
+    const auto busy = parse(metrics.render(1, live));
     failures += check(busy.at("llamacpp:requests_processing") == 1.0, "one processing");
     failures += check(busy.at("llamacpp:requests_deferred") == 1.0, "one deferred");
     const auto active = metrics.active_snapshot();
@@ -70,7 +72,7 @@ int main() {
     metrics.end_request(7);
     metrics.end_request(7); // idempotent
     metrics.end_request(8);
-    const auto drained = parse(metrics.render(1));
+    const auto drained = parse(metrics.render(1, live));
     failures += check(drained.at("llamacpp:requests_processing") == 0.0, "drained processing");
     failures += check(drained.at("llamacpp:requests_deferred") == 0.0, "drained deferred");
 
@@ -87,6 +89,10 @@ int main() {
                       "last completed after warm request");
 
     ninfer::RuntimeStats runtime;
+    runtime.computed_prefill_tokens            = 1300;
+    runtime.prefill_seconds_total              = 0.6;
+    runtime.committed_decode_tokens            = 300;
+    runtime.decode_seconds_total               = 6.0;
     runtime.continuation_lookup_hits           = 7;
     runtime.continuation_lookup_misses         = 3;
     runtime.continuation_preflight_rejections  = 2;
@@ -133,11 +139,13 @@ int main() {
                           rendered.find("# TYPE ninfer:l1_resident_entries gauge") !=
                               std::string::npos,
                       "Prometheus counter and gauge types rendered");
-    failures += check(values.at("llamacpp:prompt_tokens_total") == 1300.0, "computed prefill sum");
-    failures += check(values.at("llamacpp:prompt_seconds_total") == 0.6, "prefill seconds sum");
-    failures += check(values.at("llamacpp:tokens_predicted_total") == 300.0, "decode tokens sum");
-    failures +=
-        check(values.at("llamacpp:tokens_predicted_seconds_total") == 6.0, "decode seconds sum");
+    // The four llamacpp counters come from the Engine's live per-unit totals, not from the
+    // completion-based sums this class accumulates for the ninfer: series.
+    failures += check(values.at("llamacpp:prompt_tokens_total") == 1300.0, "live prefill tokens");
+    failures += check(values.at("llamacpp:prompt_seconds_total") == 0.6, "live prefill seconds");
+    failures += check(values.at("llamacpp:tokens_predicted_total") == 300.0, "live decode tokens");
+    failures += check(values.at("llamacpp:tokens_predicted_seconds_total") == 6.0,
+                      "live decode seconds");
     failures += check(values.at("ninfer:requests_total") == 2.0, "request count");
     failures += check(values.at("ninfer:prefix_cache_hit_tokens_total") == 900.0, "cache hits");
     failures += check(values.at("ninfer:draft_tokens_total") == 450.0, "draft tokens");
@@ -183,8 +191,6 @@ int main() {
 
     // A cache hit reported larger than the prompt must clamp, not underflow.
     metrics.record(outcome(10, 50, 1, 0.0, 0.1, 0, 0));
-    const auto clamped = parse(metrics.render(1));
-    failures += check(clamped.at("llamacpp:prompt_tokens_total") == 1300.0, "underflow clamped");
     const auto residue = metrics.last_completed();
     failures += check(residue.prompt_tokens == 10 && residue.cached_tokens == 10,
                       "last completed cache clamped to prompt");

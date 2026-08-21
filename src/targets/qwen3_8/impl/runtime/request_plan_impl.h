@@ -234,16 +234,49 @@ RequestPlan ProgramImplCore::plan_request_for_lane(std::uint32_t lane,
                                                    sequence.turn_checkpoint.frontier)) {
             plan->reuse      = ReusePath::RestoreTurnCheckpoint;
             plan->reuse_base = sequence.turn_checkpoint.frontier;
-        } else if (speculative_backend != SpeculativeBackend::DFlash &&
-                   sequence.user_turn_anchor.valid && sequence.user_turn_anchor.frontier != 0 &&
-                   sequence.user_turn_anchor.frontier < prompt.token_ids.size() &&
-                   qwen3_8::detail::prefix_matches(prompt, sequence.ledger,
-                                                   sequence.prefix_identity,
-                                                   sequence.user_turn_anchor.frontier)) {
+        } else {
             // Both device anchors sit after the last user message's content, so a client that
-            // rewrites that message's tail invalidates them while this one still holds.
-            plan->reuse      = ReusePath::RestoreUserTurnAnchor;
-            plan->reuse_base = sequence.user_turn_anchor.frontier;
+            // rewrites that message's tail invalidates them. Two host-resident rewind points
+            // survive that edit, and they are not redundant: the user-turn anchor is pinned at
+            // the opener of the last user query, while ring entries sit at frontiers the device
+            // checkpoint policy visited earlier in the session. Take the deepest candidate that
+            // still prefix-matches.
+            const auto matches = [&](std::uint32_t frontier) {
+                return frontier != 0 && frontier < prompt.token_ids.size() &&
+                       qwen3_8::detail::prefix_matches(prompt, sequence.ledger,
+                                                       sequence.prefix_identity, frontier);
+            };
+            // DFlash keeps a single turn checkpoint with no second rewind point. Its ring
+            // capacity is already forced to zero at plan time, so only the anchor needs an
+            // explicit exclusion here.
+            std::uint32_t anchor = speculative_backend != SpeculativeBackend::DFlash &&
+                                           sequence.user_turn_anchor.valid
+                                       ? sequence.user_turn_anchor.frontier
+                                       : 0;
+            // The ring is ascending by frontier, so a reverse walk with the anchor spliced in
+            // at its own depth visits every candidate deepest-first.
+            for (auto entry = sequence.checkpoint_ring.rbegin();
+                 entry != sequence.checkpoint_ring.rend(); ++entry) {
+                if (anchor > entry->frontier) {
+                    if (matches(anchor)) {
+                        plan->reuse      = ReusePath::RestoreUserTurnAnchor;
+                        plan->reuse_base = anchor;
+                        break;
+                    }
+                    anchor = 0;
+                }
+                if (matches(entry->frontier)) {
+                    // Execution re-lands the matched entry in the device checkpoint slot, so
+                    // the ordinary RestoreTurnCheckpoint path proceeds unchanged.
+                    plan->reuse      = ReusePath::RestoreTurnCheckpoint;
+                    plan->reuse_base = entry->frontier;
+                    break;
+                }
+            }
+            if (plan->reuse == ReusePath::FullReset && matches(anchor)) {
+                plan->reuse      = ReusePath::RestoreUserTurnAnchor;
+                plan->reuse_base = anchor;
+            }
         }
     }
 

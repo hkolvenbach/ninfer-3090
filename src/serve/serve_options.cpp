@@ -109,8 +109,9 @@ std::string serve_usage_text(const char* argv0) {
            " <model.ninfer> [--host H] [--port N] [--api-key KEY] "
            "[--model-id ID] [--max-context N] [--kv-capacity N|auto] [--max-concurrency N] "
            "[--max-pending-requests N] [--pending-timeout-ms N] "
-           "[--prefill-chunk N] [--log-stats-interval-ms N] [--device N] "
+           "[--prefill-chunk N] [--turn-checkpoints N] [--log-stats-interval-ms N] [--device N] "
            "[--max-request-mib N] [--request-log-jsonl FILE] [--slot-save-path DIR] "
+           "[--auto-save-evicted] "
            "[--response-store-max-records N] [--response-store-max-mib N] "
            "[--kv-dtype bf16|int8|rk8v4|rk4v4|rk4v4-e8|rk2v4-e8] [--spec mtp|dflash --draft-tokens "
            "N] "
@@ -141,6 +142,12 @@ std::string serve_usage_text(const char* argv0) {
            "       --slot-save-path enables llama.cpp-style session persistence: POST "
            "/slots/{id}?action=save|restore|erase with {\"filename\": NAME} moves one idle "
            "slot's resident session to or from DIR (disabled when omitted)\n"
+           "       --turn-checkpoints retains N host turn checkpoints per slot so a prompt "
+           "that diverges mid-history re-prefills from the nearest checkpoint instead of from "
+           "zero (0 disables; each entry holds the full GDN state image in host memory)\n"
+           "       --auto-save-evicted spills an involuntarily evicted session back to the "
+           "slot file it was last saved to or restored from, before the eviction destroys it "
+           "(requires --slot-save-path; explicit erase never auto-saves)\n"
            "       --model-id overrides the artifact identity.model_id reported by the server\n"
            "       Responses state is process-local and bounded to 1024 records / 256 MiB by "
            "default\n"
@@ -226,6 +233,11 @@ ServeOptions parse_serve_options(int argc, char** argv) {
         } else if (arg == "--prefill-chunk") {
             options.prefill_chunk = static_cast<std::uint32_t>(
                 parse_nonnegative_int(require_value("--prefill-chunk"), "prefill-chunk"));
+        } else if (arg == "--turn-checkpoints") {
+            options.turn_checkpoint_ring = static_cast<std::uint32_t>(
+                parse_nonnegative_int(require_value("--turn-checkpoints"), "turn-checkpoints"));
+        } else if (arg == "--auto-save-evicted") {
+            options.auto_save_evicted = true;
         } else if (arg == "--log-stats-interval-ms") {
             options.log_stats_interval_ms = static_cast<std::uint32_t>(parse_nonnegative_int(
                 require_value("--log-stats-interval-ms"), "log-stats-interval-ms"));
@@ -396,6 +408,9 @@ ServeOptions parse_serve_options(int argc, char** argv) {
     if (options.continuation_cache.tiers == ContinuationCacheTiers::L1L2L3 &&
         options.continuation_cache.directory.empty()) {
         throw std::invalid_argument("--continuation-cache-dir is required for l1-l2-l3");
+    }
+    if (options.auto_save_evicted && options.slot_save_path.empty()) {
+        throw std::invalid_argument("--auto-save-evicted requires --slot-save-path");
     }
     if (options.port <= 0 || options.port > 65535) {
         throw std::invalid_argument("--port must be in [1,65535]");

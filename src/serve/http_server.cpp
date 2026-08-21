@@ -426,7 +426,9 @@ void HttpServer::register_routes() {
         res.set_content(nlohmann::json{{"status", "ok"}}.dump(), "application/json");
     });
     server_.Get("/metrics", [this](const httplib::Request&, httplib::Response& res) {
-        res.set_content(metrics_.render(options_.max_concurrency, service_->runtime_stats()),
+        res.set_content(metrics_.render(options_.max_concurrency,
+                                        service_ != nullptr ? service_->runtime_stats()
+                                                            : ninfer::RuntimeStats{}),
                         "text/plain; version=0.0.4");
     });
     // llama.cpp-shaped slot detail, read from the Engine's real lane table: a busy lane
@@ -443,10 +445,16 @@ void HttpServer::register_routes() {
         for (std::uint32_t i = 0; i < options_.max_concurrency; ++i) {
             const ninfer::SlotState state =
                 i < states.size() ? states[i] : ninfer::SlotState{};
+            nlohmann::json checkpoints = nlohmann::json::array();
+            for (const ninfer::SlotCheckpoint& checkpoint : state.checkpoints) {
+                checkpoints.push_back({{"frontier", checkpoint.frontier},
+                                       {"session_digest", checkpoint.session_digest}});
+            }
             slots.push_back({{"id", i},
                              {"is_processing", state.processing},
                              {"retained", state.retained},
                              {"session_digest", state.session_digest},
+                             {"checkpoints", std::move(checkpoints)},
                              {"n_ctx", options_.max_context},
                              {"n_prompt_tokens", state.prompt_tokens},
                              {"n_prompt_tokens_cache", state.cached_tokens},
