@@ -44,6 +44,18 @@ seam test for Unsloth's on-disk key naming.  It is an exact tier-0 identity, but
 differs by site kind: PEFT zero-initializes ``lora_B`` for a Linear and ``lora_embedding_A`` for
 an Embedding, so an ``--extra-modules embed_tokens`` run is an identity through its ``A`` plane
 rather than its ``B``.
+
+Check the GDN fast path before a long run.  ``fla`` and ``causal_conv1d`` can both import cleanly
+while 48 of the 64 layers still run their PyTorch fallback, and the only symptom is one line at
+startup: "The fast path is not available because one of the required library is not installed".
+Training is a full-sequence forward and backward rather than a decode loop, so it pays more for
+that fallback than generation does::
+
+    python3 -c "import unsloth, transformers.models.qwen3_5.modeling_qwen3_5 as m; \\
+        print(m.is_fast_path_available)"
+
+Importing unsloth first is required -- the veto is Unsloth's import-time patch, not transformers'.
+`docs/maintainer/qwen3.8-27b-lora-adapters.md` section 2.3 has the diagnosis and the repair.
 """
 
 from __future__ import annotations

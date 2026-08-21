@@ -100,9 +100,44 @@ From `transformers/models/qwen3_5/modeling_qwen3_5.py`:
 | # | Item | Status |
 |---|---|---|
 | B1 | BF16 Qwen3.8-27B checkpoint | **absent.** No `.safetensors` > 100 MB anywhere under `/home/ubuntu`; `~/.cache/huggingface/hub` holds only orphaned lock dirs for the AWQ and GGUF derivatives, which are unusable (`SOURCE_DTYPE = "BF16"` is a hard abort, `tools/convert/qwen3_8/common/recipe.py:22,319-321`). ~54 GB download. 145 GB free. **Required only for training (Phase 1+).** |
-| B2 | `flash-linear-attention` (`fla`) and `causal_conv1d` | **absent.** `is_fast_path_available` (`modeling_qwen3_5.py:205`) is false, so GDN falls back to `torch_chunk_gated_delta_rule` / `torch_causal_conv1d_update` — materially slower and more VRAM-hungry. Install before training. |
+| B2 | `flash-linear-attention` (`fla`) and `causal_conv1d` | **present** (`fla-core` 0.5.2, `causal_conv1d` 1.7.0), but installing them is not sufficient — see the trap below. `is_fast_path_available` (`modeling_qwen3_5.py:205`) is `all()` over **four** symbols, so a broken `causal_conv1d` also disables the working `fla` GDN kernels and drops the recurrence onto `torch_chunk_gated_delta_rule` / `torch_causal_conv1d_update`. |
 | B3 | `tools/reference/qwen3_8_27b/bindings.py:276,314` declares `text/token_embedding` and `text/output_head` as `Q6G64_F16S` | **defect.** The shipped artifact stores both as `W8G32_F16S` (verified against `models/qwen3_8_27b.ninfer`, 1,350,860,800 bytes each). The Python reference therefore cannot open the shipped artifact and raises `BindingError`. Stale leak from `base_inventory.py:48,91`. **Blocks the numerical oracle. Two-line fix, must land first.** |
 | B4 | GPU | RTX 4090, 24 GB, `sm_89`, driver 610.57.04. Sufficient for the engine work; tight but workable for 27B QLoRA text-only at `seq ≤ 1024`. |
+
+**B2 is installed-versus-enabled, and the difference is silent.** Both packages can import cleanly
+while the fast path stays off, announcing itself only as `The fast path is not available because
+one of the required library is not installed`. Unsloth widens the failure: at import,
+`patch_causal_conv1d_cuda_probe` (`unsloth_zoo/temporary_patches/misc.py:946`) runs a tiny
+`causal_conv1d_fn` forward and nullifies both entry points on *any* exception, printing
+`causal_conv1d CUDA kernels not compatible with this GPU`. That message is written for "no kernel
+image is available" on unsupported architectures, but it also fires on a wheel that merely
+disagrees with the installed libtorch — which then takes `fla` down with it via the `all()` gate.
+
+An ABI mismatch is the likely cause and is easy to misread: it fails on **every** dtype, `float32`
+included, with `Expected input_type == at::ScalarType::Float || ... to be true, but got false`,
+which reads like an unsupported-dtype error. A correctly built extension cannot reject all three of
+its own supported dtypes. Ada is *not* the problem — released wheels carry no `sm_89` cubin, but
+`sm_80` runs on 8.9 under CUDA minor-version forward compatibility, confirmed on this card.
+
+Verify after importing unsloth, since the veto is Unsloth's import-time patch and not transformers':
+
+```bash
+python3 -c "import unsloth, transformers.models.qwen3_5.modeling_qwen3_5 as m; print(m.is_fast_path_available)"
+```
+
+Repair by compiling against the torch actually installed in that environment. `--no-cache-dir` is
+load-bearing: without it pip silently reinstalls the same mismatched wheel from its cache, reporting
+`Using cached ...whl` and never invoking `nvcc`.
+
+```bash
+CAUSAL_CONV1D_FORCE_BUILD=TRUE MAX_JOBS=$(nproc) python3 -m pip install \
+    --no-build-isolation --no-deps --force-reinstall --no-cache-dir \
+    --no-binary causal_conv1d "causal_conv1d==1.7.0"
+```
+
+Measured on this target at batch 32, fallback → fast path: steady-state decode 143.2 → 154.7 tok/s,
+and the prefill-bearing warmup pass 56.6 → 94.3 tok/s, at an unchanged 19.79 GiB peak. Training is
+a full-sequence forward/backward rather than a decode loop, so it sits nearer the second figure.
 
 ## 3. Scope decision — supported LoRA target modules
 
@@ -794,8 +829,15 @@ and `:314` now read `W8`, matching `WeightsProfile::GroupwiseIntW8Endpoints`.
 
 ## 11. Training recipe
 
-Prerequisites: B1 (BF16 checkpoint) and B2 (`fla`, `causal_conv1d`). Without B2 the GDN torch
-fallback will very likely exceed 24 GB even at `seq = 1024`.
+Prerequisites: B1 (BF16 checkpoint) and B2 (`fla`, `causal_conv1d`) — and for B2, confirm the fast
+path is actually *enabled*, not merely installed (section 2.3).
+
+An earlier revision predicted the GDN torch fallback would "very likely exceed 24 GB even at
+`seq = 1024`". Measurement refutes that: the entire 200-step GRPO run of section 11.1 executed on
+the fallback at `max_seq_length = 1024` and peaked at 20.07 GiB, and rollout generation at 32
+concurrent sequences peaked at 19.79 GiB on both paths. The fallback's cost is throughput, not
+capacity, and the fast path does not lower the peak — so B2 is a speed prerequisite, and
+`max_seq_length` remains the memory control.
 
 ```python
 import unsloth                                   # must precede transformers
@@ -812,7 +854,7 @@ model, tok = FastModel.from_pretrained(
 model = FastModel.get_peft_model(
     model,
     r = 16, lora_alpha = 32, lora_dropout = 0.0, bias = "none",
-    target_modules = ["q_proj", "k_proj", "v_proj", "o_proj", "down_proj"],   # section 3
+    target_modules = ["q_proj", "k_proj", "v_proj", "o_proj", "down_proj", "out_proj"],  # section 3
     use_gradient_checkpointing = "unsloth",
     use_rslora = False, loftq_config = None, random_state = 3407,
 )
@@ -841,6 +883,80 @@ not fit.
 For completeness: merging is also numerically undesirable here. For every model type outside
 `_DEQUANT_MERGE_BASE_MODEL_TYPES = frozenset({"falcon_h1"})` (`saving_utils.py:193`), Unsloth folds
 the adapter onto the downloaded `W16`, not onto `dequant(W4)` that training actually saw.
+
+### 11.1 Reinforcement learning — `tools/train/qwen3_8_27b/train_grpo.py`
+
+GRPO against a programmatic verifier, producing an adapter that converts and banks exactly like an
+SFT one: same six modules, same seven sites, 42,205,184 parameters and 368 objects at `r=16`.
+
+Rollouts run through the training model (`fast_inference=False`). That is Unsloth's documented
+route for this architecture, and it is also the only correct one available. vLLM does register
+`Qwen3_5ForCausalLM` with `SupportsLoRA`, but no vLLM that knows `qwen3_5` is co-installable with
+Unsloth: `unsloth 2026.8.19` pins `torch<2.12` and `transformers<=5.5.0`, and resolving against
+those caps yields vLLM 0.11.0 (with `transformers==5.5.0`) or 0.23.0 (unpinned, `transformers`
+4.57.6), both of which predate the architecture. Generating from the training model is not a
+concession: the behaviour policy *is* the target policy, so the importance ratio is exact, and the
+adapter is applied at the same seven sites during generation and during the gradient step. A
+separate engine could not be, which is also why NInfer cannot serve rollouts — its `groupwise-int`
+weights differ from the trained NF4 base by `E = 0.1073` against an adapter norm of `‖BA‖ = 0.0079`
+(section "Base-quantization mismatch"), a discrepancy roughly thirteen times the signal.
+
+Two implementation facts are load-bearing on this target.
+
+`text_only=True` collapses the model onto `Qwen3_5TextConfig`, which carries no `architectures`.
+`unsloth/models/vision.py:548` iterates that field unconditionally on the generate path, so every
+rollout raises `TypeError: 'NoneType' object is not iterable`. SFT never reaches it because SFT
+never generates. `clear_generation_max_length` addresses a second one: Qwen3.8 carries
+`max_length = 262144` on its runtime generation config, and `transformers/generation/utils.py:2339`
+therefore reports a `max_new_tokens`/`max_length` clash on every single generate() call.
+
+**Task selection is the decisive design step, and accuracy is the wrong statistic.** GRPO's
+advantage is a within-group z-score, so a problem whose `--group` samples all score alike
+contributes exactly zero gradient. What predicts trainability is the fraction of groups that are
+*not* unanimous. Measured on this base at `--group 4`, thinking-off, 16 problems per row:
+
+| task | mean reward | fully solved | informative groups |
+|---|---:|---:|---:|
+| `mini_sudoku` 4–6 empty | 0.626 | 0.516 | 0.750 |
+| **`mini_sudoku` 6–8 empty** | **0.266** | 0.125 | **0.938** |
+| `mini_sudoku` 8–10 empty | 0.191 | 0.109 | 0.938 |
+| `maze` d3–5 g5–6 | 0.203 | 0.203 | 0.438 |
+| `maze` d5–10 g5–10 | 0.062 | 0.062 | 0.125 |
+| `n_queens` remove 1–2 / 2–4 / 4–7 | 0.000 | 0.000 | 0.000 |
+
+`n_queens` scores exactly zero at every difficulty tried, including removing only one or two
+queens. It is unlearnable here in the strict sense — no sampled completion is ever correct, so
+there is nothing to reinforce — and it is also the task most likely to be chosen by inspection.
+`--calibrate` reports both columns before a run commits hours to a task.
+
+Measured run: `mini_sudoku` at 6–8 empty cells, `r=16`, `G=4`, 200 steps, `--beta 0`
+(no reference pass), `--generation-batch 16`, 512 problems, lr 5e-6. Peak **20.07 GiB of 23.54**,
+about 8.2 s/step, 56 minutes wall. Sampled training reward rose from 0.486 to 0.740 (first and
+last ten logged groups).
+
+Held out to a seed the run never saw, 64 problems, greedy, both arms on the same NF4 base with the
+adapter toggled rather than reloaded:
+
+| arm | mean | solved | mean completion tokens |
+|---|---:|---:|---:|
+| base | 0.6029 | 28/64 (0.438) | 61.1 |
+| adapter | 0.8624 | 35/64 (0.547) | 30.9 |
+
+Adapter better on 22 problems, worse on 1, tied on 41; sign test on the 23 discordant pairs gives
+two-sided `p = 5.7e-06`.
+
+Read that gain carefully. A large part of it is format compliance rather than solving ability:
+mean completion halves, and served through NInfer the *base* scores 0.044 against the adapter's
+0.645 mainly because the base narrates a step-by-step derivation and is cut off by the token
+budget before it emits a grid, while the adapter emits the bare grid. The verifier rewards a
+correctly formatted answer, so RLVR optimized the whole observable behaviour, not the arithmetic
+alone. The matched-format comparison above — where the base does answer concisely — is the
+defensible capability claim, and it is the smaller of the two numbers.
+
+`mask_truncated_completions` is off by default for the same reason. A correct grid terminates in
+about 32 tokens, so a completion that runs to the cap has failed the task's own format
+instruction and its zero reward is real signal; masking it measured 50–75% of samples discarded,
+which collapses the effective group size.
 
 ## 12. Phasing
 
