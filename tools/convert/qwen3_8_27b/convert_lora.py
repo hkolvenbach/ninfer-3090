@@ -18,6 +18,13 @@ Three transforms happen here and nowhere else:
 
 An adapter that targets a module NInfer cannot correct after the fact is
 rejected by name, never silently dropped.
+
+``--zero-sites`` writes a registered site's ``B`` plane as zeros while keeping
+its full inventory.  ``delta = B @ A`` is then exactly zero, so the site is
+inert rather than absent, and the artifact keeps the object count and slab size
+of its unmasked peers -- which is what lets a whole ablation series load into
+one adapter bank.  ``A`` is left as trained: the fused query/gate parent shares
+one ``A`` plane, so zeroing ``A`` would corrupt the unmasked twin.
 """
 
 from __future__ import annotations
@@ -287,12 +294,26 @@ def build_site_tensors(
     return a.to(torch.bfloat16).contiguous(), b.to(torch.bfloat16).contiguous()
 
 
-def convert(adapter_dir: Path, out_path: Path) -> dict[str, object]:
+def convert(
+    adapter_dir: Path, out_path: Path, zero_sites: frozenset[str] = frozenset()
+) -> dict[str, object]:
     started = time.perf_counter()
     config = load_adapter_config(adapter_dir)
     state = load_adapter_tensors(adapter_dir)
     entries = parse_adapter_state(state)
     site_keys = resolve_sites(entries, config)
+
+    if zero_sites:
+        try:
+            inventory.require_sites(zero_sites)
+        except ValueError as error:
+            _reject(str(error))
+        absent = sorted(zero_sites - site_keys)
+        if absent:
+            _reject(
+                f"--zero-sites names {absent}, which this adapter does not target; a masked "
+                "site must be present in the source adapter for the inventory to be preserved"
+            )
 
     specs = inventory.build_tensor_specs(config.rank, site_keys)
     container_specs = tuple(
@@ -308,6 +329,8 @@ def convert(adapter_dir: Path, out_path: Path) -> dict[str, object]:
             if site.key not in site_keys or layer not in site.layers():
                 continue
             a, b = build_site_tensors(entries, layer, site, config)
+            if site.key in zero_sites:
+                b = torch.zeros_like(b)
             a_name = inventory.a_object_name(layer, site)
             if a_name not in emitted:
                 writer.write(a_name, encode_direct(a, "BF16"))
@@ -316,6 +339,9 @@ def convert(adapter_dir: Path, out_path: Path) -> dict[str, object]:
     writer.finish()  # raises unless every planned payload was written
 
     statistics = family_conversion.object_statistics(writer.objects)
+    # Storage is deliberately unchanged by masking, so `parameters` stays the inventory count and
+    # `effective_parameters` reports how much of it can still move an activation.
+    live_sites = site_keys - zero_sites
     report: dict[str, object] = {
         "identity": {"model_id": identity.model_id, "weights_id": identity.weights_id},
         "target_key": TARGET_KEY,
@@ -331,7 +357,11 @@ def convert(adapter_dir: Path, out_path: Path) -> dict[str, object]:
             "folded_scale": config.scale,
             "target_modules": list(config.target_modules),
             "sites": sorted(site_keys),
+            "zeroed_sites": sorted(zero_sites),
             "parameters": inventory.parameter_count(config.rank, site_keys),
+            "effective_parameters": (
+                inventory.parameter_count(config.rank, live_sites) if live_sites else 0
+            ),
         },
         "converter": {
             "revision": family_conversion.converter_revision(Path(__file__).resolve().parents[3]),
@@ -350,14 +380,25 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--adapter", required=True, type=Path, help="PEFT adapter directory")
     parser.add_argument("--out", required=True, type=Path, help="output .lora.ninfer path")
+    parser.add_argument(
+        "--zero-sites",
+        nargs="+",
+        default=(),
+        metavar="SITE",
+        help="registered sites to write as an all-zero B plane. The site keeps its full "
+             "inventory, so the result stays loadable in one bank alongside its unmasked peers.",
+    )
     args = parser.parse_args()
 
-    report = convert(args.adapter, args.out)
+    report = convert(args.adapter, args.out, frozenset(args.zero_sites))
     adapter = report["adapter"]
     objects = report["objects"]
     print(f"wrote {report['artifact']['path']}")
     print(f"  rank {adapter['rank']}  alpha {adapter['lora_alpha']}  scale {adapter['folded_scale']}")
     print(f"  sites {', '.join(adapter['sites'])}")
+    if adapter["zeroed_sites"]:
+        print(f"  zeroed {', '.join(adapter['zeroed_sites'])}  "
+              f"({adapter['effective_parameters']} of {adapter['parameters']} parameters live)")
     print(f"  {objects['count']} objects, {adapter['parameters']} parameters, "
           f"{report['artifact']['bytes']} bytes")
 
