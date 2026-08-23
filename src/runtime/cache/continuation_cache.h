@@ -54,6 +54,12 @@ struct CacheConfig {
     std::size_t l2_byte_budget                                 = 256U * 1024U * 1024U;
     std::size_t l3_byte_budget                                 = 8ULL * 1024ULL * 1024ULL * 1024ULL;
     std::size_t filesystem_reserve_bytes                       = 0;
+    // Chunks restart at every segment boundary, so a segment whose length is not a multiple of
+    // this size rewrites a partial tail chunk per turn. Cutting the chunk to 512 KiB to shrink
+    // that residue was measured on the 27B swarm and rejected: L3 fell only from 476 to 438 MB
+    // per entry, because the residue is small next to the GDN state and the turn's genuine KV
+    // delta, while persistence rose from 6.9 to 17.9 seconds per operation on the per-file fsync
+    // and directory sync that each additional chunk costs.
     std::size_t chunk_bytes                                    = 4U * 1024U * 1024U;
     std::size_t session_history_depth                          = 8;
     std::chrono::seconds l2_idle_ttl                           = std::chrono::hours(2);
@@ -111,10 +117,39 @@ struct PersistedState {
                                    std::chrono::system_clock::time_point queued_at,
                                    std::chrono::system_clock::time_point now);
 
+// Why a session publication did not advance the alias. A publication that is not stored is a
+// capacity outcome; one that is stored but did not advance lost a CAS race.
+enum class SessionPublishOutcome : std::uint8_t {
+    Advanced,
+    RejectedTooLarge,   // the image alone exceeds the L2 budget
+    EvictedOnAdmission, // admitted, then evicted by its own admission pass
+    HeadMoved,          // stored, but the alias head changed since the caller read it
+    GenerationMoved,    // stored, but the alias generation changed (a rollback intervened)
+    // A write-once stable-prefix alias was already owned by a different image. Two lanes that
+    // computed the same stable prefix do not produce the same image: the FP32 GDN recurrence
+    // accumulates over each lane's own prefill chunk boundaries, so the content ids differ even
+    // though the prefix text is identical. The loser's state is still admitted and usable; it
+    // simply does not own the alias, so this is a lost race and not a failure.
+    AliasAlreadyOwned,
+};
+
+[[nodiscard]] constexpr const char* session_publish_outcome_name(SessionPublishOutcome outcome) {
+    switch (outcome) {
+    case SessionPublishOutcome::Advanced: return "advanced";
+    case SessionPublishOutcome::RejectedTooLarge: return "rejected_too_large";
+    case SessionPublishOutcome::EvictedOnAdmission: return "evicted_on_admission";
+    case SessionPublishOutcome::HeadMoved: return "head_moved";
+    case SessionPublishOutcome::GenerationMoved: return "generation_moved";
+    case SessionPublishOutcome::AliasAlreadyOwned: return "alias_already_owned";
+    }
+    return "advanced";
+}
+
 struct SessionPublishResult {
     ContentId id;
     bool stored         = false;
     bool alias_advanced = false;
+    SessionPublishOutcome outcome = SessionPublishOutcome::Advanced;
 };
 
 struct SessionCandidateDescriptor {
@@ -196,7 +231,8 @@ public:
     [[nodiscard]] CacheLookupResult resolve_candidate(const SessionCandidateDescriptor& candidate);
     // Reserved aliases are immutable selectors for content-addressed shared prefixes. Publishing
     // an existing alias is a no-op, and unlike sessions it never creates history.
-    [[nodiscard]] bool publish_immutable_alias(std::string_view alias, const ContentId& id);
+    [[nodiscard]] SessionPublishResult publish_immutable_alias(std::string_view alias,
+                                                               const ContentId& id);
     // Coalesces the latest admitted state per session/stable alias and promotes it asynchronously.
     [[nodiscard]] bool queue_persistence(std::string_view alias, const ContentId& id,
                                          std::uint64_t frontier_tokens, bool immutable = false);

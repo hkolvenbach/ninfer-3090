@@ -547,3 +547,30 @@ tuned small-`T` BF16 routes were faster:
 Break-even is near 770 tokens and the worst case is about 15 ms on a 229-token prompt. A token-count
 threshold would recover it, but it would also make a token's projection output depend on the width
 of the call that produced it, which widens rather than narrows how far prefix reuse can drift.
+
+### Concurrent agent serving: closed-loop clients bound TTFT
+
+The swarm workload for this target is a closed loop: a fixed number of agents each wait for their
+response before sending the next request. Queue depth is therefore not a free variable. By Little's
+Law the steady state satisfies `N_agents ≈ throughput × response_time`, so response time is pinned
+to `N_agents / throughput` and any capacity that is freed is immediately consumed by the same
+agents. Measured with ten agents against four lanes:
+
+| Change | Execution-thread effect | Throughput | TTFT p50 |
+|---|---|---|---|
+| baseline | admission 23.5% of thread | 12.3 req/min | ~24.8 s |
+| restore decode moved off the execution thread | admission 9.9% of thread | 13.4 req/min | ~25.3 s |
+
+Restore cost per request fell from 0.31 s to 0.11 s and the execution thread went from roughly 77%
+to 90% GPU-bound, yet TTFT did not move: 84–88% of it is queueing, and the queue refilled. Two
+consequences for measurement. A serving change must be reported at the level it actually acts on —
+execution-thread share and throughput here, not TTFT — because a closed-loop client will absorb a
+throughput gain and report an unchanged latency. And a TTFT target under this workload can only be
+met by raising throughput or lane count; removing CPU work from the execution thread stops paying
+once the thread is GPU-bound, which on this target it now is.
+
+Attribution must also be taken at the level being claimed. `restore_microseconds` covers the whole
+import call, and `preflight_microseconds` is logged separately; comparing the two is what localizes
+a restore regression. A cost model for the transfer alone is not a substitute: on this card
+37 KB pinned copies already reach 8.87 GB/s against 13.16 GB/s for 8 MB copies, so device transfer
+was never the dominant term in a restore, and host-side decoding was.

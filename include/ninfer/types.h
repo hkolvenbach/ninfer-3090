@@ -132,6 +132,13 @@ struct EngineOptions {
     std::uint32_t max_pending_requests = 16;
     std::uint32_t pending_timeout_ms   = 30000;
     std::uint32_t prefill_chunk        = 1024;
+    // While a prompt is still being consumed, the execution thread alternates prefill chunks with
+    // decode rounds. A chunk costs several rounds, so a one-for-one alternation gives the thread
+    // almost entirely to the prefilling lane. This is the share of thread time granted to decode
+    // relative to prefill while a prefill is in flight: 0 keeps one round per chunk, 1.0 splits
+    // the thread evenly. Raising it speeds up already-generating requests at the cost of the
+    // latency of the request being prefilled.
+    double prefill_decode_balance      = 0.0;
     // Retained host-side turn checkpoints per lane (0 disables the ring). Each entry snapshots
     // the linear-attention state at a past turn boundary so a prompt that diverges mid-history
     // re-prefills from the nearest checkpoint instead of from zero. Host memory cost per entry
@@ -409,6 +416,17 @@ struct GenerationTimings {
     double prepare_seconds     = 0.0;
     double first_token_seconds = 0.0;
     double vision_seconds      = 0.0;
+    // Wall time the request spent in the bounded FIFO between submission and the admission that
+    // gave it a lane. Under concurrent load this, not prefill, dominates TTFT, so it is a
+    // first-class timing rather than a cache diagnostic.
+    double queue_seconds       = 0.0;
+    // Wall time spent importing a continuation image into the admitted lane. Charged to the
+    // request that consumed it; an L1 hit needs no import and reports zero.
+    double restore_seconds     = 0.0;
+    // Synchronous continuation export performed on the completion path while the lane is still
+    // held. It is charged to the request that triggered it because it delays that request's
+    // result and, being inside the shared decode round, every other lane's next round too.
+    double publish_seconds     = 0.0;
     double prefill_seconds     = 0.0;
     double decode_seconds      = 0.0;
     double total_seconds       = 0.0;
@@ -439,13 +457,38 @@ enum class ContinuationAliasKind : std::uint8_t { None, Session, StablePrefix };
 enum class ContinuationMissReason : std::uint8_t {
     None,
     Disabled,
+    // No alias could be derived for the request at all: neither a client routing hint nor a
+    // reusable stable prefix. Genuinely uncacheable, distinct from NotAttempted.
     NoAlias,
+    // An alias existed but no candidate was ever evaluated - the lookup found nothing under it,
+    // or restoration never ran. Separating this from NoAlias is what makes a cold-start miss
+    // distinguishable from a cache that simply had no entry yet.
+    NotAttempted,
     EntryUnavailableOrCorrupt,
     NotDeeper,
     PreflightRejected,
     RollbackConflict,
     NoLane,
     RestoreFailed,
+};
+
+// Why an import of an otherwise viable continuation image into a lane did not complete. The
+// engine cannot choose a better candidate without knowing this, and a swallowed cause is what
+// made a KV-exhaustion restore failure look identical to a corrupt image.
+enum class ContinuationRestoreFailure : std::uint8_t {
+    None,
+    // The shared paged-KV pool could not satisfy the restored lane's page reservation.
+    KvReservationExhausted,
+    // The independent re-verification inside the import disagreed with the preflight depth.
+    VerifyDepthMismatch,
+    // The image's segment inventory did not match what this backend configuration requires.
+    SegmentInventoryMismatch,
+    // Frontier, ledger, backend, or geometry metadata was inconsistent with the image payload.
+    MetadataMismatch,
+    // A segment failed to decode, or a host-to-device transfer raised.
+    DecodeFailed,
+    // The lane was not in a state that can accept an import.
+    LaneUnavailable,
 };
 
 [[nodiscard]] constexpr std::string_view continuation_source_name(ContinuationSource value) {
@@ -474,6 +517,7 @@ enum class ContinuationMissReason : std::uint8_t {
     case ContinuationMissReason::None: return "none";
     case ContinuationMissReason::Disabled: return "disabled";
     case ContinuationMissReason::NoAlias: return "no_alias";
+    case ContinuationMissReason::NotAttempted: return "not_attempted";
     case ContinuationMissReason::EntryUnavailableOrCorrupt:
         return "entry_unavailable_or_corrupt";
     case ContinuationMissReason::NotDeeper: return "not_deeper";
@@ -485,10 +529,27 @@ enum class ContinuationMissReason : std::uint8_t {
     return "none";
 }
 
+[[nodiscard]] constexpr std::string_view continuation_restore_failure_name(
+    ContinuationRestoreFailure value) {
+    switch (value) {
+    case ContinuationRestoreFailure::None: return "none";
+    case ContinuationRestoreFailure::KvReservationExhausted: return "kv_reservation_exhausted";
+    case ContinuationRestoreFailure::VerifyDepthMismatch: return "verify_depth_mismatch";
+    case ContinuationRestoreFailure::SegmentInventoryMismatch:
+        return "segment_inventory_mismatch";
+    case ContinuationRestoreFailure::MetadataMismatch: return "metadata_mismatch";
+    case ContinuationRestoreFailure::DecodeFailed: return "decode_failed";
+    case ContinuationRestoreFailure::LaneUnavailable: return "lane_unavailable";
+    }
+    return "none";
+}
+
 struct ContinuationDiagnostics {
     ContinuationSource source                 = ContinuationSource::None;
     ContinuationAliasKind alias_kind         = ContinuationAliasKind::None;
-    ContinuationMissReason final_miss_reason = ContinuationMissReason::NoAlias;
+    ContinuationMissReason final_miss_reason = ContinuationMissReason::NotAttempted;
+    // Set only when final_miss_reason is RestoreFailed; names the import step that refused.
+    ContinuationRestoreFailure restore_failure = ContinuationRestoreFailure::None;
     std::uint64_t lookup_microseconds         = 0;
     std::uint64_t preflight_microseconds      = 0;
     std::uint64_t restore_microseconds        = 0;
@@ -569,12 +630,23 @@ struct RuntimeStats {
     std::uint64_t continuation_lookup_hits           = 0;
     std::uint64_t continuation_lookup_misses         = 0;
     std::uint64_t continuation_preflight_rejections  = 0;
+    // Continuation decodes served by the preparation thread, versus decoded inline by the
+    // executor because no prepared payload matched the image it chose.
+    std::uint64_t continuation_preparation_hits   = 0;
+    std::uint64_t continuation_preparation_decoded = 0;
+    std::uint64_t continuation_preparation_inline = 0;
     // Aggregate useful restores. These equal the corresponding L1 + L2 + L3 tier totals.
     std::uint64_t continuation_restore_successes     = 0;
     std::uint64_t continuation_restore_failures      = 0;
     std::uint64_t continuation_publication_successes = 0;
     std::uint64_t continuation_publication_failures  = 0;
     std::uint64_t continuation_publication_superseded = 0;
+    // Publications dropped at enqueue because a newer snapshot for the same session replaced them.
+    std::uint64_t continuation_publication_coalesced = 0;
+    // Attribution for continuation_publication_failures; these three sum to it.
+    std::uint64_t continuation_publication_failed_capacity    = 0;
+    std::uint64_t continuation_publication_failed_evicted     = 0;
+    std::uint64_t continuation_publication_failed_alias_moved = 0;
     std::uint64_t continuation_restored_tokens       = 0;
     std::uint64_t continuation_restored_bytes        = 0;
     std::uint64_t continuation_l1_restore_successes   = 0;
@@ -590,12 +662,20 @@ struct RuntimeStats {
     std::uint64_t continuation_stable_prefix_restores = 0;
     std::uint64_t continuation_miss_disabled          = 0;
     std::uint64_t continuation_miss_no_alias          = 0;
+    std::uint64_t continuation_miss_not_attempted     = 0;
     std::uint64_t continuation_miss_entry_unavailable_or_corrupt = 0;
     std::uint64_t continuation_miss_not_deeper        = 0;
     std::uint64_t continuation_miss_preflight_rejected = 0;
     std::uint64_t continuation_miss_rollback_conflict = 0;
     std::uint64_t continuation_miss_no_lane           = 0;
     std::uint64_t continuation_miss_restore_failed    = 0;
+    // Restore-failure attribution. These sum to continuation_restore_failures.
+    std::uint64_t continuation_restore_failed_kv_reservation = 0;
+    std::uint64_t continuation_restore_failed_verify_depth   = 0;
+    std::uint64_t continuation_restore_failed_inventory      = 0;
+    std::uint64_t continuation_restore_failed_metadata       = 0;
+    std::uint64_t continuation_restore_failed_decode         = 0;
+    std::uint64_t continuation_restore_failed_lane           = 0;
     std::uint64_t continuation_l2_lookup_microseconds = 0;
     std::uint64_t continuation_l2_lookup_operations   = 0;
     std::uint64_t continuation_l3_lookup_microseconds = 0;
@@ -620,8 +700,43 @@ struct RuntimeStats {
     std::uint32_t continuation_l3_entries            = 0;
     std::uint64_t l1_evictions                        = 0;
     std::uint64_t l1_demotions                        = 0;
+    // On-demand KV growth. A request reserves a bounded decode window at admission and acquires
+    // the rest of its output as it generates: `attempts` counts round boundaries that asked,
+    // `forced_spills` counts retained sessions demoted to make room, and `curtailed` counts
+    // requests that ended early at `length` because neither rung found pages.
+    std::uint64_t kv_growth_attempts                  = 0;
+    std::uint64_t kv_growth_forced_spills             = 0;
+    std::uint64_t kv_growth_curtailed                 = 0;
     std::uint64_t l1_resident_bytes                   = 0;
     std::uint32_t l1_resident_entries                 = 0;
+    // Requests refused before they could be logged: the bounded FIFO was full (429) or the
+    // admission deadline expired while they waited (503). A rejected request produces no
+    // request-log record, so without these counters it is invisible.
+    std::uint64_t admission_rejected_overloaded      = 0;
+    std::uint64_t admission_rejected_queue_timeout   = 0;
+    // Cumulative wall time requests spent between submission and admission, and the number of
+    // admissions that contributed. Their ratio is the mean queue delay, the quantity that
+    // dominates TTFT once the cache is working.
+    double queue_seconds_total                       = 0.0;
+    std::uint64_t admitted_requests                  = 0;
+    // How the single execution thread spent its wall clock. Every unit below runs behind one
+    // mutex, so a second spent in any one of them is a second in which every other resident lane
+    // makes no progress. Decode rounds are short and prefill chunks are long, so their ratio is
+    // what decides whether a decoding request is starved by someone else's prompt.
+    double worker_decode_seconds                     = 0.0;
+    double worker_prefill_seconds                    = 0.0;
+    double worker_admission_seconds                  = 0.0;
+    // Decomposition of worker_admission_seconds. `calls` counts scheduler iterations that entered
+    // the admission attempt, most of which admit nothing, so the per-call cost of the three phases
+    // is what determines how much of the execution thread admission consumes.
+    std::uint64_t worker_admission_calls             = 0;
+    double worker_admission_plan_seconds             = 0.0;
+    double worker_admission_restore_seconds          = 0.0;
+    double worker_admission_commit_seconds           = 0.0;
+    double worker_publish_seconds                    = 0.0;
+    double worker_upkeep_seconds                     = 0.0;
+    std::uint64_t worker_decode_rounds               = 0;
+    std::uint64_t worker_prefill_steps               = 0;
     std::uint32_t running_requests                   = 0;
     std::uint32_t prefilling_requests                = 0;
     std::uint32_t decode_ready_requests              = 0;

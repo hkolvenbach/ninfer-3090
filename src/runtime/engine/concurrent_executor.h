@@ -36,6 +36,7 @@
 #include <string_view>
 #include <thread>
 #include <unordered_map>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -69,6 +70,7 @@ public:
           pending_timeout_(std::chrono::milliseconds(options.pending_timeout_ms)),
           auto_save_evicted_(options.auto_save_evicted),
           admission_capacity_(instance.program->admission_capacity()),
+          prefill_decode_balance_(options.prefill_decode_balance),
           continuation_cache_(make_continuation_cache(options.continuation_cache)),
           l1_policy_active_(options.continuation_cache.tiers != ContinuationCacheTiers::Off),
           l1_byte_budget_(mib_to_bytes(options.continuation_cache.l1_capacity_mib,
@@ -88,10 +90,17 @@ public:
         }
         if (continuation_cache_) {
             publication_worker_ = std::thread([this] { publication_loop(); });
+            try {
+                preparation_worker_ = std::thread([this] { preparation_loop(); });
+            } catch (...) {
+                stop_publication_worker();
+                throw;
+            }
         }
         try {
             worker_ = std::thread([this] { worker_loop(); });
         } catch (...) {
+            stop_preparation_worker();
             stop_publication_worker();
             throw;
         }
@@ -104,6 +113,9 @@ public:
         }
         queue_cv_.notify_all();
         if (worker_.joinable()) { worker_.join(); }
+        // Preparation is speculative and holds no cache state, so it is abandoned before the
+        // publication worker drains the work that must survive shutdown.
+        stop_preparation_worker();
         stop_publication_worker();
     }
 
@@ -164,6 +176,9 @@ public:
             pending_deadline = submitted + pending_timeout_;
         }
         if (submitted >= pending_deadline) {
+            // A refused request never reaches the request log, so ingress rejection is only
+            // visible if it is counted here.
+            continuation_stats_.rejected_queue_timeout.fetch_add(1, std::memory_order_relaxed);
             throw RequestError(RequestErrorKind::QueueTimeout,
                                "inference request expired before submission");
         }
@@ -176,6 +191,7 @@ public:
                                    "inference engine is unavailable");
             }
             if (outstanding_ >= max_outstanding_) {
+                continuation_stats_.rejected_overloaded.fetch_add(1, std::memory_order_relaxed);
                 throw RequestError(RequestErrorKind::Overloaded, "inference request queue is full");
             }
             ++outstanding_;
@@ -223,13 +239,18 @@ public:
                 stable_boundary = targets::qwen3_8::PreparedPromptAccess::view(prompt)
                                       .identity.stable_prefix_boundary;
                 if (stable_alias) {
+                    // Descriptors only. Materialising here would put a full L3 image read plus
+                    // verification on the caller's thread, ahead of the queue, for a prefix that
+                    // may not even beat what a lane already holds.
                     stable_continuation = lookup_continuation(
-                        *stable_alias, ContinuationAliasKind::StablePrefix, false);
+                        *stable_alias, ContinuationAliasKind::StablePrefix, false, true);
                 }
             }
             auto output = instance_.loaded->frontend.make_output_session(prompt, options.stop,
                                                                           options.output);
             if (Clock::now() >= pending_deadline) {
+                continuation_stats_.rejected_queue_timeout.fetch_add(1,
+                                                                      std::memory_order_relaxed);
                 throw RequestError(RequestErrorKind::QueueTimeout,
                                    "inference request expired before submission");
             }
@@ -286,6 +307,12 @@ public:
             continuation_stats_.lookup_misses.load(std::memory_order_relaxed);
         snapshot.continuation_preflight_rejections =
             continuation_stats_.preflight_rejections.load(std::memory_order_relaxed);
+        snapshot.continuation_preparation_hits =
+            continuation_preparation_hits_.load(std::memory_order_relaxed);
+        snapshot.continuation_preparation_decoded =
+            continuation_preparation_decoded_.load(std::memory_order_relaxed);
+        snapshot.continuation_preparation_inline =
+            continuation_preparation_inline_.load(std::memory_order_relaxed);
         reconcile_continuation_aggregate_totals(snapshot);
         snapshot.continuation_restore_failures =
             continuation_stats_.restore_failures.load(std::memory_order_relaxed);
@@ -293,6 +320,14 @@ public:
             continuation_stats_.publication_successes.load(std::memory_order_relaxed);
         snapshot.continuation_publication_failures =
             continuation_stats_.publication_failures.load(std::memory_order_relaxed);
+        snapshot.continuation_publication_coalesced =
+            continuation_stats_.publication_coalesced.load(std::memory_order_relaxed);
+        snapshot.continuation_publication_failed_capacity =
+            continuation_stats_.publication_failed_capacity.load(std::memory_order_relaxed);
+        snapshot.continuation_publication_failed_evicted =
+            continuation_stats_.publication_failed_evicted.load(std::memory_order_relaxed);
+        snapshot.continuation_publication_failed_alias_moved =
+            continuation_stats_.publication_failed_alias_moved.load(std::memory_order_relaxed);
         snapshot.continuation_publication_superseded =
             continuation_stats_.publication_superseded.load(std::memory_order_relaxed);
         snapshot.continuation_l2_lookup_microseconds =
@@ -303,6 +338,22 @@ public:
             continuation_stats_.l3_lookup_microseconds.load(std::memory_order_relaxed);
         snapshot.continuation_l3_lookup_operations =
             continuation_stats_.l3_lookup_operations.load(std::memory_order_relaxed);
+        snapshot.continuation_restore_failed_kv_reservation =
+            continuation_stats_.restore_failed_kv_reservation.load(std::memory_order_relaxed);
+        snapshot.continuation_restore_failed_verify_depth =
+            continuation_stats_.restore_failed_verify_depth.load(std::memory_order_relaxed);
+        snapshot.continuation_restore_failed_inventory =
+            continuation_stats_.restore_failed_inventory.load(std::memory_order_relaxed);
+        snapshot.continuation_restore_failed_metadata =
+            continuation_stats_.restore_failed_metadata.load(std::memory_order_relaxed);
+        snapshot.continuation_restore_failed_decode =
+            continuation_stats_.restore_failed_decode.load(std::memory_order_relaxed);
+        snapshot.continuation_restore_failed_lane =
+            continuation_stats_.restore_failed_lane.load(std::memory_order_relaxed);
+        snapshot.admission_rejected_overloaded =
+            continuation_stats_.rejected_overloaded.load(std::memory_order_relaxed);
+        snapshot.admission_rejected_queue_timeout =
+            continuation_stats_.rejected_queue_timeout.load(std::memory_order_relaxed);
         if (continuation_cache_) {
             const cache::CacheStats cache = continuation_cache_->stats();
             snapshot.continuation_persistence_queued = cache.persistence_queued;
@@ -532,18 +583,87 @@ private:
         std::atomic<std::uint64_t> lookup_hits{0};
         std::atomic<std::uint64_t> lookup_misses{0};
         std::atomic<std::uint64_t> preflight_rejections{0};
-        std::atomic<std::uint64_t> restore_successes{0};
         std::atomic<std::uint64_t> restore_failures{0};
         std::atomic<std::uint64_t> publication_successes{0};
         std::atomic<std::uint64_t> publication_failures{0};
         std::atomic<std::uint64_t> publication_superseded{0};
-        std::atomic<std::uint64_t> restored_tokens{0};
-        std::atomic<std::uint64_t> restored_bytes{0};
+        // Older queued publications for a session that a newer snapshot replaced before they ran.
+        std::atomic<std::uint64_t> publication_coalesced{0};
+        // Attribution for publication_failures: these three sum to it.
+        std::atomic<std::uint64_t> publication_failed_capacity{0};
+        std::atomic<std::uint64_t> publication_failed_evicted{0};
+        std::atomic<std::uint64_t> publication_failed_alias_moved{0};
         std::atomic<std::uint64_t> l2_lookup_microseconds{0};
         std::atomic<std::uint64_t> l2_lookup_operations{0};
         std::atomic<std::uint64_t> l3_lookup_microseconds{0};
         std::atomic<std::uint64_t> l3_lookup_operations{0};
+        // Restore-failure attribution; these sum to restore_failures.
+        std::atomic<std::uint64_t> restore_failed_kv_reservation{0};
+        std::atomic<std::uint64_t> restore_failed_verify_depth{0};
+        std::atomic<std::uint64_t> restore_failed_inventory{0};
+        std::atomic<std::uint64_t> restore_failed_metadata{0};
+        std::atomic<std::uint64_t> restore_failed_decode{0};
+        std::atomic<std::uint64_t> restore_failed_lane{0};
+        // Requests refused at ingress, which never reach the request log.
+        std::atomic<std::uint64_t> rejected_overloaded{0};
+        std::atomic<std::uint64_t> rejected_queue_timeout{0};
     };
+
+    void record_restore_failure(ContinuationRestoreFailure failure) noexcept {
+        auto* counter = [&]() -> std::atomic<std::uint64_t>* {
+            switch (failure) {
+            case ContinuationRestoreFailure::KvReservationExhausted:
+                return &continuation_stats_.restore_failed_kv_reservation;
+            case ContinuationRestoreFailure::VerifyDepthMismatch:
+                return &continuation_stats_.restore_failed_verify_depth;
+            case ContinuationRestoreFailure::SegmentInventoryMismatch:
+                return &continuation_stats_.restore_failed_inventory;
+            case ContinuationRestoreFailure::MetadataMismatch:
+                return &continuation_stats_.restore_failed_metadata;
+            case ContinuationRestoreFailure::DecodeFailed:
+                return &continuation_stats_.restore_failed_decode;
+            case ContinuationRestoreFailure::LaneUnavailable:
+                return &continuation_stats_.restore_failed_lane;
+            case ContinuationRestoreFailure::None: return nullptr;
+            }
+            return nullptr;
+        }();
+        if (counter != nullptr) { counter->fetch_add(1, std::memory_order_relaxed); }
+    }
+
+    // Charges a lazily resolved candidate's I/O to the request and to the tier that served it.
+    void account_candidate_lookup(const std::shared_ptr<Request>& request,
+                                   const cache::CacheLookupResult& lookup) noexcept {
+        request->continuation.lookup_microseconds += lookup.io_microseconds;
+        const CacheLookupAccountingTier tier = cache_lookup_accounting_tier(lookup.source);
+        if (tier == CacheLookupAccountingTier::L3) {
+            continuation_stats_.l3_lookup_microseconds.fetch_add(lookup.io_microseconds,
+                                                                  std::memory_order_relaxed);
+            continuation_stats_.l3_lookup_operations.fetch_add(1, std::memory_order_relaxed);
+        } else if (tier == CacheLookupAccountingTier::L2) {
+            continuation_stats_.l2_lookup_microseconds.fetch_add(lookup.io_microseconds,
+                                                                  std::memory_order_relaxed);
+            continuation_stats_.l2_lookup_operations.fetch_add(1, std::memory_order_relaxed);
+        }
+    }
+
+    // Pages a restore of this image needs. The request's planned entitlement already covers the
+    // whole prompt plus its output budget, so it dominates the image's own frontier; taking the
+    // maximum only guards a plan that is somehow shallower than the candidate it selected.
+    [[nodiscard]] runtime::KvPageFootprint
+    continuation_image_kv_footprint(const cache::ContinuationImage& image,
+                                     const std::shared_ptr<Request>& request) const noexcept {
+        constexpr std::uint64_t kPageTokens = 64;
+        const std::uint32_t frontier_pages =
+            image.frontier_tokens == 0
+                ? 0U
+                : static_cast<std::uint32_t>((image.frontier_tokens + kPageTokens - 1) /
+                                             kPageTokens);
+        if (!request->base_plan) { return {.text_pages = frontier_pages, .backend_pages = 0}; }
+        const AdmissionResources& planned = request->base_plan->summary().admission;
+        return {.text_pages    = std::max(frontier_pages, planned.main_kv_pages),
+                .backend_pages = planned.backend_kv_pages};
+    }
 
     CachedContinuation lookup_continuation(const std::string& session,
                                              ContinuationAliasKind alias_kind,
@@ -659,6 +779,32 @@ private:
                 return {};
             }
             const std::uint64_t sequence = ++publication_issued_;
+            // A session publishes a complete self-contained snapshot, so an older queued
+            // publication for the same session is already dead: its CAS expects a head the newer
+            // one is about to replace. Executing it costs a full multi-hundred-megabyte admission
+            // and then records a failure. Fold it into the newer one instead, which inherits the
+            // head the dropped publication was chaining from so the alias still advances.
+            if (!immutable) {
+                for (auto queued = publications_.begin(); queued != publications_.end();) {
+                    if (queued->session != session || queued->immutable) {
+                        ++queued;
+                        continue;
+                    }
+                    expected_head       = queued->expected_head;
+                    expected_generation = queued->expected_generation;
+                    image.parent_id     = expected_head;
+                    queued->ticket->store(PublicationStatus::Superseded,
+                                          std::memory_order_release);
+                    if (queued->stable_flight) {
+                        std::lock_guard flight_lock(stable_flight_mutex_);
+                        (void)stable_flights_.release(queued->stable_flight->first,
+                                                      queued->stable_flight->second);
+                    }
+                    continuation_stats_.publication_coalesced.fetch_add(
+                        1, std::memory_order_relaxed);
+                    queued = publications_.erase(queued);
+                }
+            }
             publications_.push_back(Publication{.image         = std::move(image),
                                                  .session       = session,
                                                  .expected_head = std::move(expected_head),
@@ -692,6 +838,8 @@ private:
                 publications_.pop_front();
             }
             PublicationStatus status = PublicationStatus::Failed;
+            cache::SessionPublishOutcome publication_outcome =
+                cache::SessionPublishOutcome::RejectedTooLarge;
             try {
                 const cache::StoreOptions options{
                     .recompute_cost = static_cast<double>(item.image.frontier_tokens),
@@ -702,10 +850,17 @@ private:
                     const auto frontier_tokens = item.image.frontier_tokens;
                     const cache::ContentId id =
                         continuation_cache_->admit(std::move(item.image), options);
-                    if (continuation_cache_->publish_immutable_alias(item.session, id)) {
+                    const auto result =
+                        continuation_cache_->publish_immutable_alias(item.session, id);
+                    publication_outcome = result.outcome;
+                    if (result.alias_advanced) {
                         status = PublicationStatus::Success;
                         (void)continuation_cache_->queue_persistence(
                             item.session, id, frontier_tokens, true);
+                    } else if (result.outcome == cache::SessionPublishOutcome::AliasAlreadyOwned) {
+                        // Another lane already owns this write-once stable prefix. The image is
+                        // admitted and reusable; only the alias was contested.
+                        status = PublicationStatus::Superseded;
                     }
                 } else {
                     const auto frontier_tokens = item.image.frontier_tokens;
@@ -719,6 +874,7 @@ private:
                     status = result.alias_advanced ? PublicationStatus::Success
                                                    : (result.stored ? PublicationStatus::Superseded
                                                                     : PublicationStatus::Failed);
+                    publication_outcome = result.outcome;
                 }
             } catch (...) {}
             if (status == PublicationStatus::Success) {
@@ -728,6 +884,22 @@ private:
                                                                       std::memory_order_relaxed);
             } else {
                 continuation_stats_.publication_failures.fetch_add(1, std::memory_order_relaxed);
+                switch (publication_outcome) {
+                case cache::SessionPublishOutcome::EvictedOnAdmission:
+                    continuation_stats_.publication_failed_evicted.fetch_add(
+                        1, std::memory_order_relaxed);
+                    break;
+                case cache::SessionPublishOutcome::HeadMoved:
+                case cache::SessionPublishOutcome::GenerationMoved:
+                    continuation_stats_.publication_failed_alias_moved.fetch_add(
+                        1, std::memory_order_relaxed);
+                    break;
+                case cache::SessionPublishOutcome::RejectedTooLarge:
+                case cache::SessionPublishOutcome::Advanced:
+                    continuation_stats_.publication_failed_capacity.fetch_add(
+                        1, std::memory_order_relaxed);
+                    break;
+                }
             }
             item.ticket->store(status, std::memory_order_release);
             {
@@ -745,6 +917,114 @@ private:
                 queue_cv_.notify_all();
             }
         }
+    }
+
+    // Decode ahead for the requests nearest admission. Runs on the executor thread but outside
+    // execution_mutex_, alongside refresh_stable_flights(), so it also runs during a prefill.
+    void refresh_restore_preparation() noexcept {
+        if (!continuation_cache_) { return; }
+        try {
+            const std::vector<std::shared_ptr<Request>> queued = pending_snapshot();
+
+            std::lock_guard lock(preparation_mutex_);
+            // Payloads are large, so an unclaimed one is dropped rather than held indefinitely.
+            const auto now = Clock::now();
+            // A session publishes a fresh image every turn, so an unclaimed payload is stale
+            // quickly; holding one only starves the next preparation against kPreparedLimit.
+            std::erase_if(prepared_, [&](const auto& entry) {
+                return now - entry.second.prepared_at > std::chrono::seconds(10);
+            });
+
+            std::size_t considered = 0;
+            for (const auto& request : queued) {
+                if (considered >= kPreparationDepth) { break; }
+                ++considered;
+                if (request->cancelled.load(std::memory_order_relaxed)) { continue; }
+                if (!request->options.routing_hint) { continue; }
+                const std::string& session = *request->options.routing_hint;
+                if (preparation_in_flight_.contains(session)) { continue; }
+                if (prepared_.size() + preparation_queue_.size() >= kPreparedLimit) { break; }
+                preparation_in_flight_.insert(session);
+                preparation_queue_.push_back(PreparationJob{session});
+            }
+            if (!preparation_queue_.empty()) { preparation_cv_.notify_one(); }
+        } catch (...) {
+            // Preparation is an optimisation; a failure here must not disturb admission.
+        }
+    }
+
+    void preparation_loop() noexcept {
+        for (;;) {
+            PreparationJob job;
+            {
+                std::unique_lock lock(preparation_mutex_);
+                preparation_cv_.wait(lock, [this] {
+                    return preparation_stopping_ || !preparation_queue_.empty();
+                });
+                if (preparation_stopping_) { return; }
+                job = std::move(preparation_queue_.front());
+                preparation_queue_.pop_front();
+            }
+            std::shared_ptr<targets::qwen3_8::DecodedContinuation> payload;
+            cache::ContentId prepared_id;
+            try {
+                // Newest first, which is the head admission reconciles to.
+                auto snapshot = continuation_cache_->session_candidates(job.session);
+                for (const auto& descriptor : snapshot.newest_to_oldest) {
+                    if (descriptor.status != cache::CacheLookupStatus::Hit) { continue; }
+                    {
+                        std::lock_guard lock(preparation_mutex_);
+                        if (prepared_.contains(descriptor.id.hex)) { break; }
+                    }
+                    if (auto image = continuation_cache_->resolve_candidate(descriptor).image) {
+                        payload     = instance_.program->decode_continuation(*image);
+                        prepared_id = descriptor.id;
+                    }
+                    break;
+                }
+            } catch (...) {
+                // A malformed image fails identically when the executor decodes it inline.
+                payload.reset();
+            }
+            {
+                std::lock_guard lock(preparation_mutex_);
+                preparation_in_flight_.erase(job.session);
+                if (payload) {
+                    continuation_preparation_decoded_.fetch_add(1, std::memory_order_relaxed);
+                }
+                if (payload && !preparation_stopping_) {
+                    prepared_[prepared_id.hex] =
+                        PreparedContinuationEntry{std::move(payload), Clock::now()};
+                }
+            }
+            queue_cv_.notify_all();
+        }
+    }
+
+    // Claim the payload decoded for exactly this image. A payload is valid solely for the content
+    // it was decoded from, so content identity is the whole matching rule.
+    [[nodiscard]] std::shared_ptr<targets::qwen3_8::DecodedContinuation>
+    take_prepared_continuation(const std::optional<cache::ContentId>& chosen) noexcept {
+        if (!chosen || !chosen->valid()) { return nullptr; }
+        std::lock_guard lock(preparation_mutex_);
+        const auto entry = prepared_.find(chosen->hex);
+        if (entry == prepared_.end()) { return nullptr; }
+        auto payload = std::move(entry->second.payload);
+        prepared_.erase(entry);
+        continuation_preparation_hits_.fetch_add(1, std::memory_order_relaxed);
+        return payload;
+    }
+
+    void stop_preparation_worker() noexcept {
+        {
+            std::lock_guard lock(preparation_mutex_);
+            preparation_stopping_ = true;
+            preparation_queue_.clear();
+        }
+        preparation_cv_.notify_all();
+        if (preparation_worker_.joinable()) { preparation_worker_.join(); }
+        std::lock_guard lock(preparation_mutex_);
+        prepared_.clear();
     }
 
     void stop_publication_worker() noexcept {
@@ -919,6 +1199,7 @@ private:
                                               : (stable_alias ? ContinuationAliasKind::StablePrefix
                                                               : ContinuationAliasKind::None);
                 if (!options.routing_hint && !stable_alias) {
+                    // Nothing about this prompt can ever be cached under any alias.
                     continuation.final_miss_reason = ContinuationMissReason::NoAlias;
                 } else if (routed_continuation.status ==
                                cache::CacheLookupStatus::UnavailableOrCorrupt ||
@@ -926,7 +1207,9 @@ private:
                     continuation.final_miss_reason =
                         ContinuationMissReason::EntryUnavailableOrCorrupt;
                 } else {
-                    continuation.final_miss_reason = ContinuationMissReason::NoAlias;
+                    // An alias exists. Until restoration actually evaluates a candidate this is
+                    // an absence of evidence, not evidence that nothing was cacheable.
+                    continuation.final_miss_reason = ContinuationMissReason::NotAttempted;
                 }
             }
         }
@@ -940,6 +1223,9 @@ private:
         ResolvedRequestOptions options;
         Clock::time_point deadline;
         Clock::time_point submitted;
+        // Set exactly once, when admission gives this request a lane.
+        std::optional<Clock::time_point> admitted;
+        double publish_seconds = 0.0;
         std::optional<Clock::time_point> first_token;
         std::optional<GenerationBudget> budget;
         std::optional<BeginSummary> begin;
@@ -1077,7 +1363,8 @@ private:
     }
 
     [[nodiscard]] bool stable_flight_needed(const Request& request) const noexcept {
-        return request.stable_alias && !request.stable_continuation.image;
+        return request.stable_alias && !request.stable_continuation.image &&
+               request.stable_continuation.candidates.empty();
     }
 
     void initialize_stable_flight(const std::shared_ptr<Request>& request) {
@@ -1121,9 +1408,9 @@ private:
 
             request->stable_flight_builder = true;
             CachedContinuation candidate = lookup_continuation(
-                *request->stable_alias, ContinuationAliasKind::StablePrefix, false);
+                *request->stable_alias, ContinuationAliasKind::StablePrefix, false, true);
             request->continuation.lookup_microseconds += candidate.lookup_microseconds;
-            if (!candidate.image) { continue; }
+            if (candidate.candidates.empty()) { continue; }
 
             request->stable_continuation            = std::move(candidate);
             request->continuation_restore_attempted = false;
@@ -1163,15 +1450,25 @@ private:
         result.reasoning               = std::move(request->reasoning);
         result.reasoning_tokens        = request->output.reasoning_tokens();
         result.finish_reason           = reason;
-        result.timings.prepare_seconds = request->prepare_seconds;
+        // Time between the engine accepting the request and the admission that gave it a lane.
+        // Under concurrent load this, not prefill, is what TTFT is mostly made of, so it is
+        // reported even when the request never reached a lane. It is applied after the lane's
+        // timings are copied in, because that copy replaces the whole struct.
+        const double queue_seconds =
+            request->admitted ? std::chrono::duration<double>(*request->admitted -
+                                                              request->submitted)
+                                    .count()
+                              : std::chrono::duration<double>(Clock::now() - request->submitted)
+                                    .count();
         if (request->begin) {
             result.reused_prompt_tokens = request->begin->reused_prompt_tokens;
             result.prefix_reuse_path    = request->begin->prefix_reuse_path;
         }
         if (request->lane) {
             result.timings = instance_.program->generation_timings_lane(*request->lane);
-            result.timings.prepare_seconds = request->prepare_seconds;
             result.speculative = instance_.program->speculative_stats_lane(*request->lane);
+            result.timings.restore_seconds =
+                static_cast<double>(request->continuation.restore_microseconds) / 1e6;
             result.slot        = static_cast<std::int32_t>(*request->lane);
             // Empty unless the lane retained the finished session (aborts and cancels clear it).
             result.session_digest = instance_.program->retained_lane_digest(*request->lane);
@@ -1220,6 +1517,9 @@ private:
             case ContinuationMissReason::NoAlias:
                 ++cumulative_stats_.continuation_miss_no_alias;
                 break;
+            case ContinuationMissReason::NotAttempted:
+                ++cumulative_stats_.continuation_miss_not_attempted;
+                break;
             case ContinuationMissReason::EntryUnavailableOrCorrupt:
                 ++cumulative_stats_.continuation_miss_entry_unavailable_or_corrupt;
                 break;
@@ -1261,6 +1561,9 @@ private:
                 request->prepare_seconds +
                 std::chrono::duration<double>(*request->first_token - request->submitted).count();
         }
+        result.timings.prepare_seconds = request->prepare_seconds;
+        result.timings.queue_seconds   = queue_seconds;
+        result.timings.publish_seconds = request->publish_seconds;
         result.timings.total_seconds =
             request->prepare_seconds +
             std::chrono::duration<double>(Clock::now() - request->submitted).count();
@@ -1306,6 +1609,7 @@ private:
                                             .expected_head = request->routed_continuation.id,
                                             .expected_generation =
                                                 request->routed_continuation.generation};
+        const auto export_started = Clock::now();
         try {
             auto image                        = instance_.program->export_continuation_lane(lane);
             image.parent_id                   = lane_sessions_[lane]->expected_head;
@@ -1317,6 +1621,10 @@ private:
         } catch (...) {
             // A continuation is an optimization; generation has already completed successfully.
         }
+        const double export_seconds =
+            std::chrono::duration<double>(Clock::now() - export_started).count();
+        request->publish_seconds += export_seconds;
+        cumulative_stats_.worker_publish_seconds += export_seconds;
     }
 
     // Every involuntary loss of a retained session funnels through here: L1 retention pressure,
@@ -1363,27 +1671,53 @@ private:
         }
     }
 
+    [[nodiscard]] std::array<L1RetentionEntry, kMaximumConcurrency>
+    retention_entries(Clock::time_point now) noexcept {
+        std::array<L1RetentionEntry, kMaximumConcurrency> entries{};
+        for (std::uint32_t lane = 0; lane < max_concurrency_; ++lane) {
+            const bool resident = instance_.program->has_retained_lane(lane);
+            if (resident && !retained_last_used_[lane]) { retained_last_used_[lane] = now; }
+            if (!resident && slots_[lane] == nullptr) { retained_last_used_[lane].reset(); }
+            entries[lane] = L1RetentionEntry{
+                .lane           = lane,
+                .resident_bytes = resident
+                                      ? instance_.program->retained_lane_resident_bytes(lane)
+                                      : 0,
+                .last_used      = retained_last_used_[lane].value_or(now),
+                .resident       = resident,
+                .active         = slots_[lane] != nullptr,
+            };
+        }
+        return entries;
+    }
+
+    // Demote the least recently used retained lane that no request occupies, so its pages return
+    // to the shared pool. Unlike the L1 sweep this ignores the byte budget and the idle TTL: the
+    // caller has already established that a running lane cannot proceed without those pages.
+    // The session is not lost - evict_retained_lane publishes it to L2/L3 on the way out.
+    [[nodiscard]] bool spill_lru_retained_lane(std::uint32_t exclude_lane) noexcept {
+        try {
+            const Clock::time_point now = Clock::now();
+            auto entries                = retention_entries(now);
+            for (std::uint32_t lane = 0; lane < max_concurrency_; ++lane) {
+                if (lane == exclude_lane) { entries[lane].resident = false; }
+            }
+            const auto victim = select_l1_retention_victim(
+                std::span<const L1RetentionEntry>(entries.data(), max_concurrency_), 0,
+                Clock::duration::zero(), now);
+            if (!victim) { return false; }
+            evict_retained_lane(*victim);
+            return true;
+        } catch (...) { return false; }
+    }
+
     [[nodiscard]] bool enforce_l1_retention() noexcept {
         if (!l1_policy_active_) { return false; }
         bool changed = false;
         try {
             for (;;) {
                 const Clock::time_point now = Clock::now();
-                std::array<L1RetentionEntry, kMaximumConcurrency> entries{};
-                for (std::uint32_t lane = 0; lane < max_concurrency_; ++lane) {
-                    const bool resident = instance_.program->has_retained_lane(lane);
-                    if (resident && !retained_last_used_[lane]) { retained_last_used_[lane] = now; }
-                    if (!resident && slots_[lane] == nullptr) { retained_last_used_[lane].reset(); }
-                    entries[lane] = L1RetentionEntry{
-                        .lane = lane,
-                        .resident_bytes = resident
-                                              ? instance_.program->retained_lane_resident_bytes(lane)
-                                              : 0,
-                        .last_used = retained_last_used_[lane].value_or(now),
-                        .resident = resident,
-                        .active = slots_[lane] != nullptr,
-                    };
-                }
+                const auto entries          = retention_entries(now);
                 const auto victim = select_l1_retention_victim(
                     std::span<const L1RetentionEntry>(entries.data(), max_concurrency_),
                     l1_byte_budget_, l1_idle_ttl_, now);
@@ -1514,19 +1848,64 @@ private:
         return have_pending;
     }
 
-    [[nodiscard]] RoundMembership build_round_membership() const {
+    // A lane is admitted holding a bounded decode window, so the pages for a long generation are
+    // acquired here, one step at a time, as the lane actually reaches them. Three rungs, cheapest
+    // first: take free pages; reclaim pages from a retained session no request is using; and
+    // failing both, end this request at its current length rather than fail it mid-stream.
+    [[nodiscard]] RoundMembership build_round_membership() {
         RoundMembership membership;
+        std::array<std::shared_ptr<Request>, kMaximumConcurrency> curtailed{};
+        std::size_t curtailed_size = 0;
         for (std::uint32_t lane = 0; lane < max_concurrency_; ++lane) {
             const auto& request = slots_[lane];
             if (request == nullptr || !request->decode_ready) { continue; }
             if (!request->budget) {
                 throw std::logic_error("decode-ready request has no generation budget");
             }
+            if (!grow_decode_headroom(lane)) {
+                // Copied before the slot is released: curtail_request resets slots_[lane].
+                std::shared_ptr<Request> ending = request;
+                curtail_request(ending, lane);
+                curtailed[curtailed_size++] = std::move(ending);
+                continue;
+            }
             membership.lanes[membership.size]   = lane;
             membership.budgets[membership.size] = request->budget->round_budget();
             ++membership.size;
         }
+        if (curtailed_size != 0) {
+            // The lane table already reflects every curtailed completion before its client is
+            // woken, matching the ordering a terminal decode round establishes.
+            publish_runtime_stats();
+            for (std::size_t i = 0; i < curtailed_size; ++i) {
+                complete_success(curtailed[i], FinishReason::ContextCapacity);
+            }
+        }
         return membership;
+    }
+
+    // Acquire the pages this lane needs for one more round. Three rungs, cheapest first: take
+    // free pages; reclaim pages from a retained session that no request is using; and failing
+    // both, report that the lane cannot continue.
+    [[nodiscard]] bool grow_decode_headroom(std::uint32_t lane) {
+        ++cumulative_stats_.kv_growth_attempts;
+        while (!instance_.program->try_grow_decode_headroom(lane)) {
+            if (!spill_lru_retained_lane(lane)) { return false; }
+            ++cumulative_stats_.kv_growth_forced_spills;
+        }
+        return true;
+    }
+
+    // End a request at its current length because the pool cannot hold another round. The request
+    // finishes successfully with `length`, and its session is retained and published, so the next
+    // turn of the same conversation still restores instead of prefilling from scratch.
+    void curtail_request(const std::shared_ptr<Request>& request, std::uint32_t lane) {
+        ++cumulative_stats_.kv_growth_curtailed;
+        (void)request->output.preview_terminal(FinishReason::ContextCapacity);
+        instance_.program->retire_lane(lane);
+        append_output(request, request->output.commit_preview());
+        publish_retained_completion(request, lane, FinishReason::ContextCapacity);
+        remove_completed_slot(lane);
     }
 
     [[nodiscard]] ActiveAdmissionSet active_admission_set() const {
@@ -1608,6 +1987,22 @@ private:
         } else {
             request->decode_ready = true;
         }
+    }
+
+    void timed_decode_round(const RoundMembership& membership) {
+        const auto started = Clock::now();
+        run_decode_round(membership);
+        cumulative_stats_.worker_decode_seconds +=
+            std::chrono::duration<double>(Clock::now() - started).count();
+        ++cumulative_stats_.worker_decode_rounds;
+    }
+
+    void timed_prefill_step() {
+        const auto started = Clock::now();
+        run_prefill_step();
+        cumulative_stats_.worker_prefill_seconds +=
+            std::chrono::duration<double>(Clock::now() - started).count();
+        ++cumulative_stats_.worker_prefill_steps;
     }
 
     void run_prefill_step() {
@@ -1692,7 +2087,10 @@ private:
             }
             if (!target_lane) {
                 // Lane pressure is transient. Leave the candidate and preflight state untouched so
-                // restoration is retried when admission next observes an idle lane.
+                // restoration is retried when admission next observes an idle lane. It is still
+                // recorded, because a request that never got a lane is not the same miss as one
+                // whose alias held nothing.
+                observe_continuation_miss(request->continuation, ContinuationMissReason::NoLane);
                 return;
             }
 
@@ -1718,7 +2116,8 @@ private:
 
             if (!request->routed_continuation.image &&
                 request->routed_continuation.candidates.empty() &&
-                !request->stable_continuation.image) {
+                !request->stable_continuation.image &&
+                request->stable_continuation.candidates.empty()) {
                 request->continuation_restore_attempted = true;
                 return;
             }
@@ -1742,8 +2141,12 @@ private:
                 }
                 return depth;
             };
+            // Metadata preflight compares 32-byte prefix digests carried by the manifest. It is
+            // a negative filter and an upper bound on reusable depth; it never authorizes an
+            // import, and it costs no chunk I/O.
             const auto metadata_preflight_depth = [&](
-                const cache::SessionCandidateDescriptor& item) {
+                const cache::SessionCandidateDescriptor& item,
+                ContinuationAliasKind alias_kind) {
                 const auto started = Clock::now();
                 ++request->continuation_preflight_operations;
                 const std::uint32_t depth =
@@ -1756,7 +2159,7 @@ private:
                                                                         std::memory_order_relaxed);
                     observe_continuation_miss(request->continuation,
                                               ContinuationMissReason::PreflightRejected,
-                                              ContinuationAliasKind::Session);
+                                              alias_kind);
                 }
                 return depth;
             };
@@ -1792,12 +2195,54 @@ private:
                     candidate.image.reset();
                     return false;
                 }
-                if (instance_.program->has_retained_lane(lane)) { evict_retained_lane(lane); }
+                // The lane's retained session is not released until the import is known to have
+                // succeeded, and the import itself reserves shared KV pages before it materializes
+                // anything. Evicting first meant that a restore refused for KV pressure both
+                // cold-prefilled this request and destroyed an unrelated healthy session.
+                const runtime::KvPageFootprint required =
+                    continuation_image_kv_footprint(*candidate.image, request);
+                const bool occupied = instance_.program->has_retained_lane(lane);
+                if (!instance_.program->kv_reservation_fits(required.text_pages,
+                                                            required.backend_pages)) {
+                    const runtime::KvPageFootprint reclaimable =
+                        occupied ? instance_.program->retained_lane_kv_footprint(lane)
+                                 : runtime::KvPageFootprint{};
+                    if (!occupied || reclaimable.text_pages + reclaimable.backend_pages == 0) {
+                        continuation_stats_.restore_failures.fetch_add(1,
+                                                                        std::memory_order_relaxed);
+                        record_restore_failure(
+                            ContinuationRestoreFailure::KvReservationExhausted);
+                        request->continuation.restore_failure =
+                            ContinuationRestoreFailure::KvReservationExhausted;
+                        observe_continuation_miss(request->continuation,
+                                                  ContinuationMissReason::RestoreFailed,
+                                                  candidate.alias_kind);
+                        candidate.image.reset();
+                        return false;
+                    }
+                    // Only the lane this restore would take is released, and only once its pages
+                    // are the difference between refusing and succeeding.
+                    evict_retained_lane(lane);
+                } else if (occupied) {
+                    evict_retained_lane(lane);
+                }
                 const std::uint64_t restored_bytes =
                     cache::continuation_image_bytes(*candidate.image);
                 const auto restore_started = Clock::now();
-                const bool restored = instance_.program->import_continuation_lane(
-                    lane, *candidate.image, request->prompt, request->options.execution.adapter);
+                // Decoding is the largest CPU term in a restore. The preparation thread decodes
+                // ahead for the queue head, so the common path here is a move; decoding inline is
+                // the same work in the same order, just charged to the executor.
+                std::shared_ptr<targets::qwen3_8::DecodedContinuation> decoded =
+                    take_prepared_continuation(candidate.id);
+                if (!decoded) {
+                    continuation_preparation_inline_.fetch_add(1, std::memory_order_relaxed);
+                    decoded = instance_.program->decode_continuation(*candidate.image);
+                }
+                const ContinuationRestoreFailure failure =
+                    instance_.program->import_continuation_lane(
+                        lane, *candidate.image, *decoded, request->prompt,
+                        request->options.execution.adapter, required);
+                const bool restored = failure == ContinuationRestoreFailure::None;
                 const std::uint64_t restore_microseconds = static_cast<std::uint64_t>(
                     std::chrono::duration_cast<std::chrono::microseconds>(Clock::now() -
                                                                           restore_started)
@@ -1814,11 +2259,6 @@ private:
                     retained_last_used_[lane] = Clock::now();
                     lane_provenance_[lane] =
                         imported_lane_provenance(candidate.alias_kind, candidate.source);
-                    continuation_stats_.restore_successes.fetch_add(1, std::memory_order_relaxed);
-                    continuation_stats_.restored_tokens.fetch_add(reusable_depth,
-                                                                   std::memory_order_relaxed);
-                    continuation_stats_.restored_bytes.fetch_add(
-                        restored_bytes, std::memory_order_relaxed);
                     request->continuation.source = candidate.source == cache::CacheSource::L3
                                                        ? ContinuationSource::L3
                                                        : ContinuationSource::L2;
@@ -1826,8 +2266,11 @@ private:
                     request->continuation.restored_tokens = reusable_depth;
                     request->continuation.restored_bytes = restored_bytes;
                     request->continuation.final_miss_reason = ContinuationMissReason::None;
+                    request->continuation.restore_failure = ContinuationRestoreFailure::None;
                 } else {
                     continuation_stats_.restore_failures.fetch_add(1, std::memory_order_relaxed);
+                    record_restore_failure(failure);
+                    request->continuation.restore_failure = failure;
                     observe_continuation_miss(request->continuation,
                                               ContinuationMissReason::RestoreFailed,
                                               candidate.alias_kind);
@@ -1839,12 +2282,59 @@ private:
             request->continuation_restore_attempted = true;
             bool routed_ready = false;
             std::uint32_t routed_reusable_depth = 0;
-            std::uint32_t stable_reusable_depth = 0;
-            if (request->stable_continuation.image &&
-                request->stable_continuation.image->frontier_tokens > best_resident_reuse) {
-                stable_reusable_depth = preflight_depth(*request->stable_continuation.image,
-                                                        ContinuationAliasKind::StablePrefix);
+
+            // The stable prefix is evaluated in two steps. Its descriptor gives a metadata-only
+            // upper bound on reusable depth at no I/O cost; the image itself is materialized only
+            // when that bound could still win. A stable prefix that lives in L3 costs a full disk
+            // read plus verification, and paying that to lose to a routed candidate was the
+            // single largest avoidable component of TTFT.
+            std::uint32_t stable_bound = 0;
+            if (!request->stable_continuation.candidates.empty()) {
+                stable_bound = metadata_preflight_depth(
+                    request->stable_continuation.candidates.front(),
+                    ContinuationAliasKind::StablePrefix);
+                if (stable_bound <= best_resident_reuse) { stable_bound = 0; }
+            } else if (request->stable_continuation.image) {
+                stable_bound = request->stable_continuation.image->frontier_tokens >
+                                       best_resident_reuse
+                                   ? static_cast<std::uint32_t>(
+                                         request->stable_continuation.image->frontier_tokens)
+                                   : 0;
             }
+            std::optional<std::uint32_t> stable_exact_depth;
+            const auto stable_reusable_depth = [&]() -> std::uint32_t {
+                if (stable_exact_depth) { return *stable_exact_depth; }
+                stable_exact_depth = 0;
+                if (stable_bound == 0) { return 0; }
+                if (!request->stable_continuation.image &&
+                    !request->stable_continuation.candidates.empty()) {
+                    const cache::SessionCandidateDescriptor& descriptor =
+                        request->stable_continuation.candidates.front();
+                    auto lookup = continuation_cache_->resolve_candidate(descriptor);
+                    account_candidate_lookup(request, lookup);
+                    // Carry the content identity with the image: it is what binds a resolved
+                    // image to work done for it elsewhere, such as a prepared decode.
+                    request->stable_continuation.id     = descriptor.id;
+                    request->stable_continuation.image  = std::move(lookup.image);
+                    request->stable_continuation.source = lookup.source;
+                    request->stable_continuation.status = lookup.status;
+                    request->stable_continuation.candidates.clear();
+                }
+                if (request->stable_continuation.image &&
+                    request->stable_continuation.image->frontier_tokens > best_resident_reuse) {
+                    stable_exact_depth = preflight_depth(*request->stable_continuation.image,
+                                                          ContinuationAliasKind::StablePrefix);
+                }
+                return *stable_exact_depth;
+            };
+            // A routed depth that already reaches the stable prefix's upper bound wins without
+            // the stable image ever being materialized.
+            const auto routed_wins = [&](std::uint32_t routed_depth) {
+                if (routed_depth == 0) { return false; }
+                if (routed_depth >= stable_bound) { return true; }
+                return prefer_routed_candidate(routed_depth, stable_reusable_depth());
+            };
+
             if (!request->routed_continuation.candidates.empty()) {
                 bool unavailable = false;
                 bool available = false;
@@ -1853,12 +2343,15 @@ private:
                         item.status == cache::CacheLookupStatus::UnavailableOrCorrupt;
                     available |= item.status == cache::CacheLookupStatus::Hit;
                 }
+                // No stable floor is applied here: ranking uses only what the lane already
+                // holds, and the stable comparison happens once against the winner, so a routed
+                // candidate is never discarded against an upper bound.
                 const auto viable = rank_reusable_candidate_descriptors(
                     std::span<const cache::SessionCandidateDescriptor>(
                         request->routed_continuation.candidates),
-                    best_resident_reuse, stable_reusable_depth,
+                    best_resident_reuse, 0,
                     [&](const auto& item) {
-                        return metadata_preflight_depth(item);
+                        return metadata_preflight_depth(item, ContinuationAliasKind::Session);
                     });
 
                 std::optional<std::size_t> selected_index;
@@ -1869,20 +2362,7 @@ private:
                     const auto& descriptor =
                         request->routed_continuation.candidates[viable_item.index];
                     auto lookup = continuation_cache_->resolve_candidate(descriptor);
-                    request->continuation.lookup_microseconds += lookup.io_microseconds;
-                    if (cache_lookup_accounting_tier(lookup.source) ==
-                        CacheLookupAccountingTier::L3) {
-                        continuation_stats_.l3_lookup_microseconds.fetch_add(
-                            lookup.io_microseconds, std::memory_order_relaxed);
-                        continuation_stats_.l3_lookup_operations.fetch_add(
-                            1, std::memory_order_relaxed);
-                    } else if (cache_lookup_accounting_tier(lookup.source) ==
-                               CacheLookupAccountingTier::L2) {
-                        continuation_stats_.l2_lookup_microseconds.fetch_add(
-                            lookup.io_microseconds, std::memory_order_relaxed);
-                        continuation_stats_.l2_lookup_operations.fetch_add(
-                            1, std::memory_order_relaxed);
-                    }
+                    account_candidate_lookup(request, lookup);
                     if (!lookup.image) {
                         unavailable |=
                             lookup.status == cache::CacheLookupStatus::UnavailableOrCorrupt;
@@ -1891,18 +2371,18 @@ private:
                     resolved_image = true;
                     const std::uint32_t exact =
                         preflight_depth(*lookup.image, ContinuationAliasKind::Session);
-                    if (exact <= best_resident_reuse || exact < stable_reusable_depth ||
+                    if (exact <= best_resident_reuse ||
                         (selected_index && exact <= selected_depth)) {
                         continue;
                     }
                     selected_index = viable_item.index;
                     selected_depth = exact;
-                    request->routed_continuation.image = std::move(lookup.image);
+                    request->routed_continuation.id     = descriptor.id;
+                    request->routed_continuation.image  = std::move(lookup.image);
                     request->routed_continuation.source = lookup.source;
                     request->routed_continuation.status = lookup.status;
                 }
-                if (selected_index && prefer_routed_candidate(selected_depth,
-                                                               stable_reusable_depth)) {
+                if (selected_index && routed_wins(selected_depth)) {
                     const auto& chosen =
                         request->routed_continuation.candidates[*selected_index];
                     if (*selected_index == 0) {
@@ -1944,29 +2424,33 @@ private:
                 if (routed_ready) {
                     routed_reusable_depth = preflight_depth(
                         *request->routed_continuation.image, ContinuationAliasKind::Session);
-                    routed_ready = prefer_routed_candidate(routed_reusable_depth,
-                                                           stable_reusable_depth) &&
-                                   routed_reusable_depth > best_resident_reuse;
+                    routed_ready = routed_reusable_depth > best_resident_reuse &&
+                                   routed_wins(routed_reusable_depth);
                 }
             }
             if (!routed_ready ||
                 !try_candidate(request->routed_continuation, routed_reusable_depth)) {
-                if (stable_reusable_depth > best_resident_reuse) {
-                    (void)try_candidate(request->stable_continuation, stable_reusable_depth);
+                const std::uint32_t stable_depth = stable_reusable_depth();
+                if (stable_depth > best_resident_reuse) {
+                    (void)try_candidate(request->stable_continuation, stable_depth);
                 }
             }
             request->routed_continuation.image.reset();
             request->routed_continuation.candidates.clear();
             request->stable_continuation.image.reset();
+            request->stable_continuation.candidates.clear();
             return;
         } catch (...) {
             request->continuation_restore_attempted = true;
             continuation_stats_.restore_failures.fetch_add(1, std::memory_order_relaxed);
+            record_restore_failure(ContinuationRestoreFailure::DecodeFailed);
+            request->continuation.restore_failure = ContinuationRestoreFailure::DecodeFailed;
             observe_continuation_miss(request->continuation,
                                       ContinuationMissReason::RestoreFailed);
             request->routed_continuation.image.reset();
             request->routed_continuation.candidates.clear();
             request->stable_continuation.image.reset();
+            request->stable_continuation.candidates.clear();
             return;
         }
     }
@@ -2097,13 +2581,18 @@ private:
             request->budget.emplace(summary.effective_output_tokens,
                                     summary.effective_limit_reason);
             request->generated.reserve(summary.effective_output_tokens);
+            const auto admitted_at          = Clock::now();
             request->lane                   = lane;
+            request->admitted               = admitted_at;
             request->admission_resources    = summary.admission;
             request->remaining_service_work = summary.service_work_quanta;
             request->backfill_epoch         = backfill_epoch;
             request->backfill_class         = backfill_class;
             slots_[lane]                    = request;
-            retained_last_used_[lane]       = Clock::now();
+            retained_last_used_[lane]       = admitted_at;
+            cumulative_stats_.queue_seconds_total +=
+                std::chrono::duration<double>(admitted_at - request->submitted).count();
+            ++cumulative_stats_.admitted_requests;
             invalidate_lane_plans(lane);
 
             TransientRegion transient;
@@ -2142,7 +2631,23 @@ private:
         return AdmissionProgress::RanGpuUnit;
     }
 
+    // Accumulates elapsed time into a RuntimeStats field for the enclosing scope.
+    class PhaseTimer {
+    public:
+        PhaseTimer(double& sink) noexcept : sink_(sink), started_(Clock::now()) {}
+        ~PhaseTimer() {
+            sink_ += std::chrono::duration<double>(Clock::now() - started_).count();
+        }
+        PhaseTimer(const PhaseTimer&)            = delete;
+        PhaseTimer& operator=(const PhaseTimer&) = delete;
+
+    private:
+        double& sink_;
+        Clock::time_point started_;
+    };
+
     AdmissionProgress try_admit_one() {
+        ++cumulative_stats_.worker_admission_calls;
         bool control_progress = false;
         for (;;) {
             std::vector<std::shared_ptr<Request>> queued = pending_snapshot();
@@ -2166,6 +2671,8 @@ private:
                 continue;
             }
             if (Clock::now() >= head->deadline) {
+                continuation_stats_.rejected_queue_timeout.fetch_add(1,
+                                                                      std::memory_order_relaxed);
                 (void)remove_pending_error(
                     head, std::make_exception_ptr(RequestError(
                               RequestErrorKind::QueueTimeout,
@@ -2175,13 +2682,17 @@ private:
             }
 
             try {
+                PhaseTimer timer(cumulative_stats_.worker_admission_plan_seconds);
                 ensure_base_plan(head);
             } catch (...) {
                 (void)remove_pending_error(head, std::current_exception());
                 control_progress = true;
                 continue;
             }
-            try_restore_continuation(head);
+            {
+                PhaseTimer timer(cumulative_stats_.worker_admission_restore_seconds);
+                try_restore_continuation(head);
+            }
             const RequestPlanSummary& head_base = head->base_plan->summary();
             if (!admission_resources_fit(head_base.admission, admission_capacity_)) {
                 (void)remove_pending_error(
@@ -2194,6 +2705,7 @@ private:
 
             std::optional<LaneChoice> head_lane;
             try {
+                PhaseTimer timer(cumulative_stats_.worker_admission_plan_seconds);
                 head_lane = find_admission_lane(head);
             } catch (...) {
                 (void)remove_pending_error(head, std::current_exception());
@@ -2201,6 +2713,7 @@ private:
                 continue;
             }
             if (head_lane) {
+                PhaseTimer timer(cumulative_stats_.worker_admission_commit_seconds);
                 return admit_planned_request(head, *head_lane, BackfillClass::None, 0);
             }
 
@@ -2235,6 +2748,8 @@ private:
                     continue;
                 }
                 if (Clock::now() >= candidate->deadline) {
+                    continuation_stats_.rejected_queue_timeout.fetch_add(
+                        1, std::memory_order_relaxed);
                     (void)remove_pending_error(
                         candidate, std::make_exception_ptr(RequestError(
                                        RequestErrorKind::QueueTimeout,
@@ -2244,13 +2759,17 @@ private:
                 }
 
                 try {
+                    PhaseTimer timer(cumulative_stats_.worker_admission_plan_seconds);
                     ensure_base_plan(candidate);
                 } catch (...) {
                     (void)remove_pending_error(candidate, std::current_exception());
                     control_progress = true;
                     continue;
                 }
-                try_restore_continuation(candidate);
+                {
+                    PhaseTimer timer(cumulative_stats_.worker_admission_restore_seconds);
+                    try_restore_continuation(candidate);
+                }
                 const RequestPlanSummary& candidate_base = candidate->base_plan->summary();
                 if (!admission_resources_fit(candidate_base.admission, admission_capacity_)) {
                     (void)remove_pending_error(
@@ -2460,26 +2979,61 @@ private:
 
             try {
                 refresh_stable_flights();
+                refresh_restore_preparation();
                 std::unique_lock execution_lock(execution_mutex_);
+                const auto upkeep_started = Clock::now();
                 if (enforce_l1_retention()) { publish_runtime_stats(); }
                 const bool have_pending          = expire_pending_requests();
                 const auto cancelled_at_boundary = snapshot_cancellations();
                 cancel_active_requests(cancelled_at_boundary);
                 const RoundMembership membership = build_round_membership();
 
+                cumulative_stats_.worker_upkeep_seconds +=
+                    std::chrono::duration<double>(Clock::now() - upkeep_started).count();
+
                 if (prefill_lane_) {
-                    if (!membership.empty() && !previous_unit_was_decode) {
-                        run_decode_round(membership);
+                    // Decode rounds and prefill chunks are not comparable units of work: a chunk
+                    // costs several rounds, so alternating them one for one hands the execution
+                    // thread almost entirely to whichever lane is still consuming its prompt and
+                    // starves every lane that is already generating. Balance them by elapsed time
+                    // instead of by count, which keeps the share independent of the chunk size and
+                    // self-tunes to the measured cost of each unit on this model and device.
+                    // A balance of zero keeps the historical one-for-one alternation: every
+                    // chunk is still followed by exactly one decode round. Larger values buy the
+                    // generating lanes a proportional share of the thread.
+                    const bool decode_is_owed =
+                        !membership.empty() &&
+                        (!previous_unit_was_decode ||
+                         decode_seconds_since_prefill_ <
+                             prefill_decode_balance_ * prefill_step_seconds_);
+                    if (decode_is_owed) {
+                        const auto started = Clock::now();
+                        timed_decode_round(membership);
+                        decode_seconds_since_prefill_ +=
+                            std::chrono::duration<double>(Clock::now() - started).count();
                         previous_unit_was_decode = true;
                     } else {
-                        run_prefill_step();
-                        previous_unit_was_decode = false;
+                        const auto started = Clock::now();
+                        timed_prefill_step();
+                        const double step =
+                            std::chrono::duration<double>(Clock::now() - started).count();
+                        // Track the recent cost of a chunk so the balance follows prompt length
+                        // and batch composition rather than a compiled-in constant.
+                        prefill_step_seconds_ = prefill_step_seconds_ == 0.0
+                                                    ? step
+                                                    : 0.75 * prefill_step_seconds_ + 0.25 * step;
+                        decode_seconds_since_prefill_ = 0.0;
+                        previous_unit_was_decode      = false;
                     }
                     continue;
                 }
+                decode_seconds_since_prefill_ = 0.0;
 
                 if (have_pending && (membership.empty() || previous_unit_was_decode)) {
+                    const auto admission_started = Clock::now();
                     const AdmissionProgress progress = try_admit_one();
+                    cumulative_stats_.worker_admission_seconds +=
+                        std::chrono::duration<double>(Clock::now() - admission_started).count();
                     if (progress == AdmissionProgress::RanGpuUnit) {
                         previous_unit_was_decode = false;
                         continue;
@@ -2490,7 +3044,7 @@ private:
                 }
 
                 if (!membership.empty()) {
-                    run_decode_round(membership);
+                    timed_decode_round(membership);
                     previous_unit_was_decode = true;
                     continue;
                 }
@@ -2555,12 +3109,57 @@ private:
 
     std::mutex publication_mutex_;
     std::condition_variable publication_cv_;
+    // Thread-time balance between decode rounds and prefill chunks while a prefill is in flight.
+    // 1.0 splits the execution thread evenly between the two.
+    const double prefill_decode_balance_ = 0.0;
+    double prefill_step_seconds_        = 0.0;
+    double decode_seconds_since_prefill_ = 0.0;
     std::deque<Publication> publications_;
     std::unordered_map<std::string, PendingSessionPublication> session_publications_;
     std::uint64_t publication_issued_    = 0;
     std::uint64_t publication_completed_ = 0;
     bool publication_stopping_           = false;
     std::thread publication_worker_;
+
+    // Continuation decoding, run ahead of admission.
+    //
+    // Decoding a continuation image is pure host work over startup-fixed geometry: it touches no
+    // lane state, no device memory and no CUDA API, so §2.6 permits it off the execution thread.
+    // Leaving it inline made every restore spend its decode between GPU units, because
+    // try_admit_one() is skipped entirely while a prefill is in flight.
+    //
+    // Preparation is speculative and therefore strictly bounded: only the first
+    // kPreparationDepth queued requests are decoded ahead, at most kPreparedLimit payloads are
+    // resident, and entries whose request has left the queue are pruned every iteration. A miss is
+    // free - the executor decodes inline exactly as before.
+    // A job names a session, never a fixed image. The candidates captured when a request was
+    // submitted are stale by the time it is admitted: it waits in the queue while the previous turn
+    // of the same session completes and publishes a newer image, and that newer image is the one
+    // admission reconciles to. Resolving the session's current head at decode time is what makes
+    // the prepared payload the one the executor actually asks for.
+    struct PreparationJob {
+        std::string session;
+    };
+    struct PreparedContinuationEntry {
+        std::shared_ptr<targets::qwen3_8::DecodedContinuation> payload;
+        Clock::time_point prepared_at{};
+    };
+    static constexpr std::size_t kPreparationDepth = 2;
+    static constexpr std::size_t kPreparedLimit    = 2;
+    // A decoded payload belongs to the image, not to the request that asked for it: sessions share
+    // images, the queue is reordered by stable-flight filtering, and the request that triggers a
+    // decode need not be the one admitted next. Keying by content identity makes the payload
+    // usable by whichever request the executor actually admits.
+    std::mutex preparation_mutex_;
+    std::condition_variable preparation_cv_;
+    std::deque<PreparationJob> preparation_queue_;
+    std::unordered_map<std::string, PreparedContinuationEntry> prepared_;
+    std::unordered_set<std::string> preparation_in_flight_;
+    bool preparation_stopping_ = false;
+    std::thread preparation_worker_;
+    std::atomic<std::uint64_t> continuation_preparation_hits_{0};
+    std::atomic<std::uint64_t> continuation_preparation_decoded_{0};
+    std::atomic<std::uint64_t> continuation_preparation_inline_{0};
 };
 
 } // namespace ninfer::runtime

@@ -755,6 +755,14 @@ carry no user-turn anchor, and a restored image starts without one.
 Changing reasoning effort changes the rendered prompt and therefore does not reuse a prefix whose
 effort instruction differs.
 
+A request's output limit is a limit, not a reservation. Admission holds KV pages for the prompt plus
+a fixed decode window; pages beyond it are acquired per round as they are generated. A large
+`max_tokens` therefore costs nothing when a turn is short, and it no longer crowds concurrent
+sessions out of the shared KV pool. When several long generations compete for the last pages, the
+Engine first reclaims a retained session and then, if that is not enough, ends the request at its
+current length with `length`/ `max_tokens` — its session is still retained and published, so the
+next turn of that conversation still restores. A single request is never shortened this way.
+
 Speculative decoding is an engine option and does not change protocol output shapes, stop behavior,
 or usage accounting. If a stop truncates a multi-token MTP or DFlash round, the Engine commits the
 exact accepted target prefix so a following compatible turn can still reuse it. Output-limit and

@@ -30,8 +30,8 @@ namespace ninfer::cache {
 namespace {
 
 using Clock = std::chrono::system_clock;
-constexpr std::array<char, 8> kImageMagic{'N', 'I', 'C', 'I', 'M', 'G', '0', '2'};
-constexpr std::array<char, 8> kManifestMagic{'N', 'I', 'C', 'M', 'A', 'N', '0', '4'};
+constexpr std::array<char, 8> kImageMagic{'N', 'I', 'C', 'I', 'M', 'G', '0', '3'};
+constexpr std::array<char, 8> kManifestMagic{'N', 'I', 'C', 'M', 'A', 'N', '0', '5'};
 constexpr std::array<char, 8> kAliasMagic{'N', 'I', 'C', 'A', 'L', 'I', 'A', 'S'};
 constexpr std::uint32_t kAliasVersion      = 1;
 constexpr std::size_t kMaxAliasBytes       = 1U << 20;
@@ -39,6 +39,11 @@ constexpr std::size_t kMaxSessionNameBytes = 64U << 10;
 constexpr std::size_t kMaxField                    = 1ULL << 34;
 constexpr std::size_t kMaxSelectionMetadataBytes   = 1U << 20;
 constexpr std::size_t kPrefixDigestBytes            = 32;
+// Chunks stop at segment boundaries, so a manifest carries at most one extra partial chunk per
+// segment beyond the fixed-stride count. This bounds that surplus for manifest sizing and
+// validation; the target's segment inventory (one per KV plane plus the linear/hidden state) is
+// far below it.
+constexpr std::size_t kMaxImageSegments             = 4096;
 
 class Sha256 {
 public:
@@ -165,8 +170,8 @@ void put_string(Bytes& out, std::string_view value) {
     put_bytes(out, reinterpret_cast<const std::uint8_t*>(value.data()), value.size());
 }
 
-template <class Sink>
-void emit_serialized(const ContinuationImage& image, Sink&& sink) {
+template <class Sink, class RegionSink>
+void emit_serialized(const ContinuationImage& image, Sink&& sink, RegionSink&& region) {
     if (image.parent_id && !image.parent_id->valid())
         throw std::invalid_argument("invalid parent ID");
     const auto scalar = [&](std::uint64_t value, std::size_t bytes) {
@@ -199,8 +204,15 @@ void emit_serialized(const ContinuationImage& image, Sink&& sink) {
     for (const auto& [name, value] : image.segments) {
         if (name.empty()) throw std::invalid_argument("empty segment name");
         string(name);
-        bytes(value.data(), value.size());
+        scalar(value.size(), sizeof(std::uint64_t));
+        region();
+        if (!value.empty()) sink(value.data(), value.size());
     }
+}
+
+template <class Sink>
+void emit_serialized(const ContinuationImage& image, Sink&& sink) {
+    emit_serialized(image, std::forward<Sink>(sink), [] {});
 }
 
 class Reader {
@@ -266,6 +278,29 @@ Bytes serialize(const ContinuationImage& image) {
     emit_serialized(image, [&](const std::uint8_t* data, std::size_t size) {
         out.insert(out.end(), data, data + size);
     });
+    return out;
+}
+
+// The serialized image plus the offset of every segment payload. L3 chunks never span a segment,
+// so a segment's chunks depend only on that segment's own bytes. This is what makes an append-only
+// payload share every chunk below its previous length with the image published one turn earlier;
+// chunking the blob as one run instead ties every boundary to the length of everything before it,
+// and the growing prefix identity then moves all of them on every turn.
+struct SerializedImage {
+    Bytes payload;
+    std::vector<std::size_t> region_starts;
+};
+
+SerializedImage serialize_with_regions(const ContinuationImage& image) {
+    SerializedImage out;
+    out.payload.reserve(continuation_image_bytes(image));
+    out.region_starts.reserve(image.segments.size() + 1);
+    emit_serialized(
+        image,
+        [&](const std::uint8_t* data, std::size_t size) {
+            out.payload.insert(out.payload.end(), data, data + size);
+        },
+        [&] { out.region_starts.push_back(out.payload.size()); });
     return out;
 }
 
@@ -526,6 +561,13 @@ Bytes encode_manifest(const Manifest& manifest) {
     return out;
 }
 
+std::size_t max_chunk_count(std::size_t image_limit, std::size_t chunk_limit) {
+    const std::size_t stride = image_limit / chunk_limit + (image_limit % chunk_limit != 0);
+    return stride > std::numeric_limits<std::size_t>::max() - kMaxImageSegments
+               ? std::numeric_limits<std::size_t>::max()
+               : stride + kMaxImageSegments;
+}
+
 Manifest decode_manifest(const Bytes& bytes, std::size_t image_limit, std::size_t chunk_limit) {
     Reader r(bytes);
     r.magic(kManifestMagic);
@@ -550,7 +592,11 @@ Manifest decode_manifest(const Bytes& bytes, std::size_t image_limit, std::size_
         (!m.boundary_prefix_digest.empty() &&
          m.boundary_prefix_digest.size() != kPrefixDigestBytes) ||
         m.boundary_tokens > m.frontier_tokens ||
-        count != m.image_bytes / chunk_limit + (m.image_bytes % chunk_limit != 0) ||
+        // Chunks stop at segment boundaries so a segment's chunks depend only on its own bytes.
+        // The count is therefore not the fixed-stride count; what must hold is that every chunk
+        // is non-empty, none exceeds the configured chunk size, and together they cover the image
+        // exactly. One extra partial chunk per segment is the most the layout can add.
+        count == 0 || count > max_chunk_count(image_limit, chunk_limit) ||
         m.l2_idle_ttl_seconds >
             static_cast<std::uint64_t>(std::numeric_limits<std::int64_t>::max()) ||
         m.l3_idle_ttl_seconds >
@@ -560,10 +606,8 @@ Manifest decode_manifest(const Bytes& bytes, std::size_t image_limit, std::size_
     std::uint64_t total = 0;
     for (std::uint64_t i = 0; i != count; ++i) {
         Chunk c{r.string(), r.u64()};
-        const std::uint64_t expected =
-            i + 1 == count ? m.image_bytes - total : static_cast<std::uint64_t>(chunk_limit);
-        if (!ContentId{c.id}.valid() || c.size != expected || c.size > chunk_limit ||
-             total > kMaxField - c.size)
+        if (!ContentId{c.id}.valid() || c.size == 0 || c.size > chunk_limit ||
+            total > kMaxField - c.size || total + c.size > m.image_bytes)
             throw std::runtime_error("invalid chunk");
         total += c.size;
         m.chunks.push_back(std::move(c));
@@ -785,15 +829,27 @@ public:
             found->second.l3_idle_ttl_seconds = static_cast<std::uint64_t>(l3_ttl.count());
             found->second.expires_ms = expiration_ms(now, l3_ttl);
         }
+        const bool too_large_for_l2 =
+            config_.l2_byte_budget == 0 || image_bytes > config_.l2_byte_budget;
         touch_l2(id.hex, std::move(image), image_bytes, l2_ttl);
         if (found != catalog_.end()) touch(found->second);
-        evict_l2();
+        const bool entered_l2 = l2_.contains(id.hex);
+        // A session publication is the newest state of a live conversation, so it must not be the
+        // victim of the eviction pass its own admission triggers: losing it forfeits the alias
+        // advance and forces the next turn to prefill from nothing.
+        evict_l2(cas_session ? std::string_view(id.hex) : std::string_view());
         evict_l3();
         found = catalog_.find(id.hex);
         const bool stored =
             found != catalog_.end() &&
             (found->second.durable || l2_.contains(id.hex) || (persist_l3 && l3_enabled()));
         bool alias_advanced = false;
+        SessionPublishOutcome outcome = SessionPublishOutcome::Advanced;
+        if (!stored) {
+            outcome = too_large_for_l2 ? SessionPublishOutcome::RejectedTooLarge
+                      : entered_l2     ? SessionPublishOutcome::EvictedOnAdmission
+                                       : SessionPublishOutcome::RejectedTooLarge;
+        }
         if (stored) {
             if (cas_session) {
                 const auto existing = sessions_.find(std::string(*cas_session));
@@ -804,8 +860,11 @@ public:
                 const auto generation = alias_generations_.find(std::string(*cas_session));
                 const std::uint64_t current_generation =
                     generation == alias_generations_.end() ? 0 : generation->second;
-                if (current == expected_head &&
-                    (!expected_generation || *expected_generation == current_generation)) {
+                if (current != expected_head) {
+                    outcome = SessionPublishOutcome::HeadMoved;
+                } else if (expected_generation && *expected_generation != current_generation) {
+                    outcome = SessionPublishOutcome::GenerationMoved;
+                } else {
                     update_session(std::string(*cas_session), id, persist_l3);
                     alias_advanced = true;
                 }
@@ -820,7 +879,10 @@ public:
             std::chrono::duration_cast<std::chrono::microseconds>(
                 std::chrono::steady_clock::now() - admission_started)
                 .count());
-        return {.id = id, .stored = stored, .alias_advanced = alias_advanced};
+        return {.id             = id,
+                .stored         = stored,
+                .alias_advanced = alias_advanced,
+                .outcome        = outcome};
     }
 
     ContentId store(const ContinuationImage& image, const StoreOptions& options) {
@@ -1083,8 +1145,14 @@ public:
         return lookup_shared(candidate.id);
     }
 
-    bool publish_immutable_alias(std::string_view name, const ContentId& id) {
-        if (!name.starts_with(kStableAliasPrefix) || !id.valid()) return false;
+    SessionPublishResult publish_immutable_alias(std::string_view name, const ContentId& id) {
+        const auto reject = [&](SessionPublishOutcome outcome) {
+            return SessionPublishResult{
+                .id = id, .stored = false, .alias_advanced = false, .outcome = outcome};
+        };
+        if (!name.starts_with(kStableAliasPrefix) || !id.valid()) {
+            return reject(SessionPublishOutcome::RejectedTooLarge);
+        }
         std::lock_guard lock(mu_);
         expire_l2(id.hex);
         const auto entry = catalog_.find(id.hex);
@@ -1093,17 +1161,25 @@ public:
              (expired_l3(entry->second) || pending_l3_drops_.contains(id.hex)) &&
              !l2_.contains(id.hex)) ||
             (!entry->second.durable && !l2_.contains(id.hex))) {
-            return false;
+            return reject(SessionPublishOutcome::EvictedOnAdmission);
         }
         const std::string key(name);
         const auto existing = sessions_.find(key);
         if (existing != sessions_.end()) {
-            return existing->second.size() == 1 && existing->second.front() == id;
+            const bool same = existing->second.size() == 1 && existing->second.front() == id;
+            return SessionPublishResult{.id             = id,
+                                        .stored         = true,
+                                        .alias_advanced = same,
+                                        .outcome = same ? SessionPublishOutcome::Advanced
+                                                        : SessionPublishOutcome::AliasAlreadyOwned};
         }
         sessions_.emplace(key, std::vector<ContentId>{id});
         ++alias_generations_[key];
         if (entry->second.durable) persist_session(key, sessions_.at(key));
-        return true;
+        return SessionPublishResult{.id             = id,
+                                    .stored         = true,
+                                    .alias_advanced = true,
+                                    .outcome        = SessionPublishOutcome::Advanced};
     }
 
     bool promote(const ContentId& id) {
@@ -1143,13 +1219,20 @@ public:
 
         Bytes payload;
         try {
-            payload = serialize(*image);
+            auto serialized = serialize_with_regions(*image);
+            payload          = std::move(serialized.payload);
             if (payload.size() != snapshot.image_bytes)
                 throw std::runtime_error("continuation image changed");
             snapshot.chunks.clear();
-            for (std::size_t at = 0; at < payload.size(); at += config_.chunk_bytes) {
-                const auto size = std::min(config_.chunk_bytes, payload.size() - at);
-                snapshot.chunks.push_back({sha256(payload.data() + at, size), size});
+            std::vector<std::size_t> boundaries = std::move(serialized.region_starts);
+            boundaries.push_back(payload.size());
+            std::size_t at = 0;
+            for (const std::size_t boundary : boundaries) {
+                while (at < boundary) {
+                    const auto size = std::min(config_.chunk_bytes, boundary - at);
+                    snapshot.chunks.push_back({sha256(payload.data() + at, size), size});
+                    at += size;
+                }
             }
             snapshot.expires_ms = expiration_ms(
                 config_.now(), std::chrono::seconds(snapshot.l3_idle_ttl_seconds));
@@ -1187,12 +1270,31 @@ public:
         try {
             if (config_.before_persistence_io) config_.before_persistence_io();
             if (!filesystem_has_room(reservation)) throw std::runtime_error("cache disk is full");
-            for (std::size_t at = 0; at < payload.size(); at += config_.chunk_bytes) {
-                const auto size = std::min(config_.chunk_bytes, payload.size() - at);
-                Bytes chunk(payload.begin() + static_cast<std::ptrdiff_t>(at),
-                            payload.begin() + static_cast<std::ptrdiff_t>(at + size));
-                write_atomic_create_if_absent(
-                    chunks_ / snapshot.chunks[at / config_.chunk_bytes].id, chunk, temp_);
+            // Chunks stop at segment boundaries, so their sizes are not a fixed stride and the
+            // offset has to follow the list itself.
+            std::size_t at = 0;
+            for (const auto& descriptor : snapshot.chunks) {
+                const auto size = static_cast<std::size_t>(descriptor.size);
+                if (size == 0 || size > payload.size() - at) {
+                    throw std::runtime_error("chunk layout does not cover the image");
+                }
+                // A chunk file is named by the hash of its contents, so one that is already
+                // present is already this chunk. Writing it again would produce an identical file
+                // and then lose the race to link() with EEXIST, which is what a continuation turn
+                // did to every byte of its unchanged prefix: a full image write and fsync per
+                // turn. Restores verify each chunk's hash, so skipping is not a weaker check.
+                std::error_code present_ec;
+                const auto path     = chunks_ / descriptor.id;
+                const auto on_disk  = std::filesystem::file_size(path, present_ec);
+                if (present_ec || on_disk != size) {
+                    Bytes chunk(payload.begin() + static_cast<std::ptrdiff_t>(at),
+                                payload.begin() + static_cast<std::ptrdiff_t>(at + size));
+                    write_atomic_create_if_absent(path, chunk, temp_);
+                }
+                at += size;
+            }
+            if (at != payload.size()) {
+                throw std::runtime_error("chunk layout does not cover the image");
             }
             auto encoded = encode_manifest(snapshot);
             write_atomic_create_if_absent(manifests_ / (id.hex + ".manifest"), encoded, temp_);
@@ -1423,8 +1525,7 @@ private:
 
     void discover() {
         const std::size_t image_limit = configured_image_limit();
-        const std::size_t chunk_count =
-            image_limit / config_.chunk_bytes + (image_limit % config_.chunk_bytes != 0);
+        const std::size_t chunk_count = max_chunk_count(image_limit, config_.chunk_bytes);
         constexpr std::size_t manifest_header_bytes =
             8 + sizeof(std::uint32_t) + 13 * sizeof(std::uint64_t) +
             kMaxSelectionMetadataBytes + 2 * kPrefixDigestBytes;
@@ -1818,11 +1919,14 @@ private:
         }
     }
 
-    void evict_l2() {
+    // `protected_id`, when set, is the entry this eviction pass must not choose. It is the image a
+    // session publication has just admitted: evicting it would undo the publication that triggered
+    // the pass, so the caller would be told the state was not stored while older states survive.
+    void evict_l2(std::string_view protected_id = {}) {
         while (l2_bytes_ > config_.l2_byte_budget) {
             auto victim = l2_.end();
             for (auto it = l2_.begin(); it != l2_.end(); ++it)
-                if (!pins_.contains(it->first) &&
+                if (!pins_.contains(it->first) && it->first != protected_id &&
                     (victim == l2_.end() || it->second.score < victim->second.score ||
                      (it->second.score == victim->second.score &&
                       it->second.recency < victim->second.recency)))
@@ -2155,7 +2259,8 @@ SessionRollbackResult ContinuationCache::rollback_session_to(
     return impl_->rollback_to(s, id, expected_generation);
 }
 
-bool ContinuationCache::publish_immutable_alias(std::string_view s, const ContentId& id) {
+SessionPublishResult ContinuationCache::publish_immutable_alias(std::string_view s,
+                                                                const ContentId& id) {
     return impl_->publish_immutable_alias(s, id);
 }
 

@@ -716,10 +716,12 @@ runtime::PrefillStepResult ProgramImplCore::start_prefill_lane(std::uint32_t lan
             sequence.turn_checkpoint = {};
         }
         if (!request_plan.keep_user_turn_anchor) { sequence.user_turn_anchor = {}; }
-        request.timings            = {};
-        request.pending            = {};
-        sequence.mtp_draft_count   = 0;
-        sequence.tail_hidden_valid = base == prompt_tokens && sequence.tail_hidden_valid;
+        request.timings                 = {};
+        request.pending                 = {};
+        request.text_kv_page_ceiling    = request_plan.text_kv_page_ceiling;
+        request.backend_kv_page_ceiling = request_plan.backend_kv_page_ceiling;
+        sequence.mtp_draft_count        = 0;
+        sequence.tail_hidden_valid      = base == prompt_tokens && sequence.tail_hidden_valid;
         sequence.ledger.assign(prompt.token_ids.begin(), prompt.token_ids.end());
         sequence.prefix_identity.assign(prompt);
 
@@ -996,6 +998,99 @@ bool ProgramImplCore::has_retained_lane(std::uint32_t lane) const noexcept {
     return lane < max_concurrency && sequences[lane].retained;
 }
 
+bool ProgramImplCore::kv_reservation_fits(std::uint32_t text_pages,
+                                           std::uint32_t backend_pages) const noexcept {
+    if (text_pages == 0) { return false; }
+    if (!decoder->text_kv.pool().can_reserve(text_pages)) { return false; }
+    const qwen3_8::PagedKVCache* backend = backend_kv_cache();
+    if ((backend != nullptr) != (backend_pages != 0)) { return false; }
+    return backend == nullptr || backend->pool().can_reserve(backend_pages);
+}
+
+bool ProgramImplCore::try_grow_decode_headroom(std::uint32_t lane) {
+    if (lane >= max_concurrency) { return false; }
+    SequenceState& sequence       = sequences[lane];
+    const RequestControl& request = requests[lane];
+    if (!sequence.kv || !sequence.kv->text.valid()) { return false; }
+
+    // The widest extent a single round can consume. Speculative rounds append the whole draft
+    // window plus the verified token; an ordinary round appends one.
+    const std::uint32_t round_extent =
+        speculative_backend == SpeculativeBackend::None ? 0U : draft_window;
+    const auto required_main_tokens = static_cast<std::uint32_t>(
+        std::min<std::uint64_t>(capacity, static_cast<std::uint64_t>(sequence.execution_frontier) +
+                                              round_extent + 1ULL));
+
+    // Both caches are one requirement. An MTP round materializes the main extent in the text cache
+    // and that extent plus the draft window in the backend cache, so the backend can exhaust its
+    // entitlement a page before the text cache does. Reporting success on the text extent alone
+    // would let the round materialize past the backend entitlement and abort the engine.
+    const bool has_backend = sequence.kv->backend.has_value();
+    const auto footprint_for = [&](std::uint32_t main_tokens) {
+        runtime::KvPageFootprint out;
+        out.text_pages = pages_for_tokens(main_tokens);
+        if (has_backend) {
+            out.backend_pages = pages_for_tokens(
+                speculative_backend == SpeculativeBackend::Mtp
+                    ? static_cast<std::uint32_t>(std::min<std::uint64_t>(
+                          capacity, static_cast<std::uint64_t>(main_tokens) + draft_window - 1ULL))
+                    : main_tokens);
+        }
+        return out;
+    };
+
+    const runtime::KvPageFootprint required = footprint_for(required_main_tokens);
+    const std::uint32_t current_text        = sequence.kv->text.page_entitlement();
+    const std::uint32_t current_backend =
+        has_backend ? sequence.kv->backend->page_entitlement() : 0U;
+    if (required.text_pages <= current_text && required.backend_pages <= current_backend) {
+        return true;
+    }
+    if (required.text_pages > request.text_kv_page_ceiling ||
+        required.backend_pages > request.backend_kv_page_ceiling) {
+        return false;
+    }
+
+    // Prefer the chunked step, but fall back to the exact requirement so an overshoot the pool
+    // cannot cover does not fail a growth the lane could still afford.
+    const std::uint32_t chunked_main =
+        std::min(capacity, required_main_tokens + kDecodeGrowthChunkTokens);
+    for (const std::uint32_t main_tokens : {chunked_main, required_main_tokens}) {
+        const runtime::KvPageFootprint step = footprint_for(main_tokens);
+        const std::uint32_t text_pages =
+            std::max(current_text, std::clamp(step.text_pages, required.text_pages,
+                                              request.text_kv_page_ceiling));
+        const std::uint32_t backend_pages =
+            has_backend ? std::max(current_backend,
+                                   std::clamp(step.backend_pages, required.backend_pages,
+                                              request.backend_kv_page_ceiling))
+                        : 0U;
+        if (!decoder->text_kv.pool().can_replace_entitlement(current_text, text_pages)) {
+            continue;
+        }
+        if (has_backend && !backend_kv_cache()->pool().can_replace_entitlement(current_backend,
+                                                                              backend_pages)) {
+            continue;
+        }
+        resize_sequence_kv_entitlement(sequence, text_pages, backend_pages);
+        return true;
+    }
+    return false;
+}
+
+runtime::KvPageFootprint
+ProgramImplCore::retained_lane_kv_footprint(std::uint32_t lane) const noexcept {
+    if (lane >= max_concurrency) { return {}; }
+    const SequenceState& sequence = sequences[lane];
+    if (!sequence.retained || !sequence.kv) { return {}; }
+    runtime::KvPageFootprint footprint;
+    footprint.text_pages = sequence.kv->text.page_entitlement();
+    if (sequence.kv->backend) {
+        footprint.backend_pages = sequence.kv->backend->page_entitlement();
+    }
+    return footprint;
+}
+
 std::size_t ProgramImplCore::retained_lane_resident_bytes(std::uint32_t lane) const noexcept {
     if (lane >= max_concurrency) { return 0; }
     const SequenceState& sequence = sequences[lane];
@@ -1255,10 +1350,9 @@ cache::ContinuationImage ProgramImplCore::export_stable_continuation(
     });
     out.boundary_metadata =
         image::encode_boundary(image::BoundaryMetadata{.valid = false, .frontier = 0});
-    out.segments.emplace(
-        "main.text_kv",
-        image::encode_paged(export_paged_kv_logical(sequence.kv->text, frontier,
-                                                    continuation_transfer, device.stream)));
+    image::emit_paged(out.segments, "main.text_kv",
+                      export_paged_kv_logical(sequence.kv->text, frontier, continuation_transfer,
+                                              device.stream));
     out.segments.emplace(
         "main.gdn",
         image::encode_linear(export_linear_attention_state(
@@ -1270,19 +1364,17 @@ cache::ContinuationImage ProgramImplCore::export_stable_continuation(
         image::encode_tensor(copy_tensor_to_host(sequence.turn_checkpoint_hidden,
                                                  continuation_transfer, device.stream)));
     if (mtp_backend) {
-        out.segments.emplace(
-            "mtp.kv", image::encode_paged(export_paged_kv_logical(
-                           *sequence.kv->backend, frontier, continuation_transfer,
-                           device.stream)));
+        image::emit_paged(out.segments, "mtp.kv",
+                          export_paged_kv_logical(*sequence.kv->backend, frontier,
+                                                  continuation_transfer, device.stream));
     }
     if (dflash_backend) {
         if (!dflash || !sequence.kv->backend) {
             throw std::logic_error("stable DFlash state is incomplete");
         }
-        out.segments.emplace(
-            "dflash.full_kv", image::encode_paged(export_paged_kv_logical(
-                                   *sequence.kv->backend, frontier, continuation_transfer,
-                                   device.stream)));
+        image::emit_paged(out.segments, "dflash.full_kv",
+                          export_paged_kv_logical(*sequence.kv->backend, frontier,
+                                                  continuation_transfer, device.stream));
         out.segments.emplace(
             "dflash.local",
             image::encode_cyclic(export_cyclic_kv_lane(
@@ -1353,10 +1445,9 @@ cache::ContinuationImage ProgramImplCore::export_continuation_lane(std::uint32_t
         .frontier = sequence.turn_checkpoint.frontier,
     });
 
-    out.segments.emplace(
-        "main.text_kv",
-        image::encode_paged(export_paged_kv_logical(sequence.kv->text, sequence.text_kv_valid,
-                                                     continuation_transfer, device.stream)));
+    image::emit_paged(out.segments, "main.text_kv",
+                      export_paged_kv_logical(sequence.kv->text, sequence.text_kv_valid,
+                                              continuation_transfer, device.stream));
     out.segments.emplace(
         "main.gdn",
         image::encode_linear(export_linear_attention_state(
@@ -1379,17 +1470,16 @@ cache::ContinuationImage ProgramImplCore::export_continuation_lane(std::uint32_t
                 sequence.turn_checkpoint_hidden, continuation_transfer, device.stream)));
     }
     if (mtp_backend) {
-        out.segments.emplace(
-            "mtp.kv", image::encode_paged(export_paged_kv_logical(
-                           *sequence.kv->backend, sequence.mtp_kv_valid, continuation_transfer,
-                           device.stream)));
+        image::emit_paged(out.segments, "mtp.kv",
+                          export_paged_kv_logical(*sequence.kv->backend, sequence.mtp_kv_valid,
+                                                  continuation_transfer, device.stream));
     }
     if (dflash_backend) {
         if (!dflash) { throw std::logic_error("DFlash continuation has no persistent state"); }
-        out.segments.emplace(
-            "dflash.full_kv", image::encode_paged(export_paged_kv_logical(
-                                   *sequence.kv->backend, sequence.dflash_context_frontier,
-                                   continuation_transfer, device.stream)));
+        image::emit_paged(out.segments, "dflash.full_kv",
+                          export_paged_kv_logical(*sequence.kv->backend,
+                                                  sequence.dflash_context_frontier,
+                                                  continuation_transfer, device.stream));
         out.segments.emplace(
             "dflash.local",
             image::encode_cyclic(export_cyclic_kv_lane(dflash->local,
@@ -1439,6 +1529,30 @@ ProgramImplCore::preflight_continuation_metadata(
                    ? boundary
                    : 0;
     } catch (...) { return 0; }
+}
+
+// The exported inventory is a property of the enabled state, not of a call site. The reuse-depth
+// probe and the restore preflight both compare against it, and while each spelled it out a format
+// change could satisfy one and silently fail the other.
+std::set<std::string> ProgramImplCore::continuation_segment_inventory(bool boundary_valid,
+                                                                     bool mtp_backend,
+                                                                     bool dflash_backend) const {
+    std::set<std::string> names{"main.gdn", "main.tail_hidden"};
+    image::paged_segment_names("main.text_kv", decoder->text_kv.pool().plane_count(), names);
+    if (boundary_valid) {
+        names.emplace("checkpoint.gdn");
+        names.emplace("checkpoint.hidden");
+    }
+    if (mtp_backend) {
+        image::paged_segment_names("mtp.kv", backend_kv_cache()->pool().plane_count(), names);
+    }
+    if (dflash_backend) {
+        image::paged_segment_names("dflash.full_kv", backend_kv_cache()->pool().plane_count(),
+                                   names);
+        names.emplace("dflash.local");
+        if (boundary_valid) { names.emplace("dflash.checkpoint_local"); }
+    }
+    return names;
 }
 
 std::uint32_t
@@ -1506,17 +1620,8 @@ ProgramImplCore::preflight_continuation(const cache::ContinuationImage& candidat
             return 0;
         }
 
-        std::set<std::string> expected{"main.gdn", "main.tail_hidden", "main.text_kv"};
-        if (boundary.valid) {
-            expected.emplace("checkpoint.gdn");
-            expected.emplace("checkpoint.hidden");
-        }
-        if (mtp_backend) { expected.emplace("mtp.kv"); }
-        if (dflash_backend) {
-            expected.emplace("dflash.full_kv");
-            expected.emplace("dflash.local");
-            if (boundary.valid) { expected.emplace("dflash.checkpoint_local"); }
-        }
+        const auto expected =
+            continuation_segment_inventory(boundary.valid, mtp_backend, dflash_backend);
         std::set<std::string> actual;
         for (const auto& [name, unused] : candidate.segments) {
             (void)unused;
@@ -1524,53 +1629,81 @@ ProgramImplCore::preflight_continuation(const cache::ContinuationImage& candidat
         }
         if (actual != expected) { return 0; }
 
-        (void)image::decode_paged(candidate.segments.at("main.text_kv"), decoder->text_kv.pool(),
-                                  metadata.text_kv_valid);
-        (void)image::decode_linear(candidate.segments.at("main.gdn"), decoder->linear_attention);
-        (void)image::decode_tensor(candidate.segments.at("main.tail_hidden"),
-                                   sequences[0].tail_hidden.bytes());
-        if (boundary.valid) {
-            (void)image::decode_linear(candidate.segments.at("checkpoint.gdn"),
-                                       decoder->linear_attention);
-            (void)image::decode_tensor(candidate.segments.at("checkpoint.hidden"),
-                                       sequences[0].turn_checkpoint_hidden.bytes());
-        }
-        if (mtp_backend) {
-            (void)image::decode_paged(candidate.segments.at("mtp.kv"), backend_kv_cache()->pool(),
-                                      metadata.backend_kv_valid);
-        } else if (dflash_backend) {
-            if (!dflash) { return 0; }
-            (void)image::decode_paged(candidate.segments.at("dflash.full_kv"),
-                                      backend_kv_cache()->pool(), metadata.backend_kv_valid);
-            (void)image::decode_cyclic(candidate.segments.at("dflash.local"), dflash->local);
-            if (boundary.valid) {
-                (void)image::decode_cyclic(candidate.segments.at("dflash.checkpoint_local"),
-                                           dflash->turn_checkpoint_local);
-            }
-        }
+        if (dflash_backend && !dflash) { return 0; }
+        // Preflight deliberately stops at metadata, prefix digests, and the segment inventory. It
+        // does not decode the payload: decoding materialises the whole image on the host, and
+        // import_continuation_lane decodes the same segments itself before it writes anything to
+        // the device, with clear_lane() on failure. Validating here as well made every restore
+        // materialise the image twice - once discarded, once kept - which measured as ~270 ms of
+        // duplicated host work per restore, the single largest term in a restore.
         return reusable_depth;
     } catch (...) { return 0; }
 }
 
-bool ProgramImplCore::import_continuation_lane(std::uint32_t lane,
-                                                 const cache::ContinuationImage& candidate,
-                                                 const PreparedPromptData& prompt,
-                                                 std::int32_t adapter) noexcept {
-    if (lane >= max_concurrency) { return false; }
+std::shared_ptr<DecodedContinuation>
+ProgramImplCore::decode_continuation(const cache::ContinuationImage& candidate) const {
+    // Startup-fixed geometry only: pool plane specs, linear/cyclic state shapes and lane-invariant
+    // tensor extents. No lane state, no device memory, no CUDA call - see the class comment on
+    // DecodedContinuation for why that matters.
+    const image::FrontierMetadata metadata = image::decode_frontier(candidate.frontier_metadata);
+    const image::BoundaryMetadata boundary = image::decode_boundary(candidate.boundary_metadata);
+    const bool mtp_backend                 = speculative_backend == SpeculativeBackend::Mtp;
+    const bool dflash_backend              = speculative_backend == SpeculativeBackend::DFlash;
+
+    auto out     = std::make_shared<DecodedContinuation>();
+    out->text_kv = image::decode_paged(candidate.segments, "main.text_kv", decoder->text_kv.pool(),
+                                       metadata.text_kv_valid);
+    out->current_gdn =
+        image::decode_linear(candidate.segments.at("main.gdn"), decoder->linear_attention);
+    out->tail_hidden = image::decode_tensor(candidate.segments.at("main.tail_hidden"),
+                                            sequences[0].tail_hidden.bytes());
+    if (boundary.valid) {
+        out->checkpoint_gdn.emplace(image::decode_linear(candidate.segments.at("checkpoint.gdn"),
+                                                         decoder->linear_attention));
+        out->checkpoint_hidden.emplace(
+            image::decode_tensor(candidate.segments.at("checkpoint.hidden"),
+                                 sequences[0].turn_checkpoint_hidden.bytes()));
+    }
+    if (mtp_backend) {
+        out->backend_kv.emplace(image::decode_paged(candidate.segments, "mtp.kv",
+                                                    backend_kv_cache()->pool(),
+                                                    metadata.backend_kv_valid));
+    } else if (dflash_backend) {
+        if (!dflash) { throw std::invalid_argument("DFlash continuation state is unavailable"); }
+        out->backend_kv.emplace(image::decode_paged(candidate.segments, "dflash.full_kv",
+                                                    backend_kv_cache()->pool(),
+                                                    metadata.backend_kv_valid));
+        out->dflash_local.emplace(
+            image::decode_cyclic(candidate.segments.at("dflash.local"), dflash->local));
+        if (boundary.valid) {
+            out->dflash_checkpoint_local.emplace(
+                image::decode_cyclic(candidate.segments.at("dflash.checkpoint_local"),
+                                     dflash->turn_checkpoint_local));
+        }
+    }
+    return out;
+}
+
+ContinuationRestoreFailure ProgramImplCore::import_continuation_lane(
+    std::uint32_t lane, const cache::ContinuationImage& candidate,
+    const DecodedContinuation& decoded, const PreparedPromptData& prompt, std::int32_t adapter,
+    runtime::KvPageFootprint entitlement) noexcept {
+    using Failure = ContinuationRestoreFailure;
+    if (lane >= max_concurrency) { return Failure::LaneUnavailable; }
     SequenceState& sequence = sequences[lane];
     RequestControl& request = requests[lane];
     if (request.lifecycle != Lifecycle::Empty || request.prefill ||
         request.pending.kind != PendingKind::None || sequence.retained || sequence.kv) {
-        return false;
+        return Failure::LaneUnavailable;
     }
 
     const std::uint32_t reusable_depth = preflight_continuation(candidate, prompt);
-    if (reusable_depth == 0) { return false; }
+    if (reusable_depth == 0) { return Failure::VerifyDepthMismatch; }
 
     try {
         if (candidate.format_version != image::kTargetImageVersion ||
             candidate.compatibility_key != continuation_compatibility_key) {
-            return false;
+            return Failure::MetadataMismatch;
         }
 
         const image::FrontierMetadata metadata =
@@ -1584,11 +1717,11 @@ bool ProgramImplCore::import_continuation_lane(std::uint32_t lane,
             metadata.text_kv_valid != frontier ||
             candidate.boundary_tokens != (boundary.valid ? boundary.frontier : 0U) ||
             (boundary.valid && (boundary.frontier == 0 || boundary.frontier > frontier))) {
-            return false;
+            return Failure::MetadataMismatch;
         }
         image::PrefixData prefix =
             image::decode_prefix(candidate.prefix_identity, metadata.ledger_frontier);
-        if (prefix.ledger.size() != metadata.ledger_frontier) { return false; }
+        if (prefix.ledger.size() != metadata.ledger_frontier) { return Failure::DecodeFailed; }
 
         if (!prefix_only) {
             const std::int64_t generated_position =
@@ -1601,7 +1734,7 @@ bool ProgramImplCore::import_continuation_lane(std::uint32_t lane,
                                 return axis[frontier] !=
                                        static_cast<std::int32_t>(generated_position);
                             })) {
-                return false;
+                return Failure::MetadataMismatch;
             }
         }
 
@@ -1620,7 +1753,7 @@ bool ProgramImplCore::import_continuation_lane(std::uint32_t lane,
             verified_depth = boundary.frontier;
         }
         if (verified_depth != reusable_depth) {
-            return false;
+            return Failure::VerifyDepthMismatch;
         }
 
         const bool mtp_backend    = speculative_backend == SpeculativeBackend::Mtp;
@@ -1630,77 +1763,65 @@ bool ProgramImplCore::import_continuation_lane(std::uint32_t lane,
             metadata.mtp_drafts.size() > qwen3_8::kMtpDecodeMaximumDrafts ||
             ((!mtp_backend && !dflash_backend) != (metadata.backend_kv_valid == 0)) ||
             ((mtp_backend || dflash_backend) && metadata.backend_kv_valid != frontier)) {
-            return false;
+            return Failure::MetadataMismatch;
         }
 
-        std::set<std::string> expected{"main.gdn", "main.tail_hidden", "main.text_kv"};
-        if (boundary.valid) {
-            expected.emplace("checkpoint.gdn");
-            expected.emplace("checkpoint.hidden");
-        }
-        if (mtp_backend) { expected.emplace("mtp.kv"); }
-        if (dflash_backend) {
-            expected.emplace("dflash.full_kv");
-            expected.emplace("dflash.local");
-            if (boundary.valid) { expected.emplace("dflash.checkpoint_local"); }
-        }
+        const auto expected =
+            continuation_segment_inventory(boundary.valid, mtp_backend, dflash_backend);
         std::set<std::string> actual;
         for (const auto& [name, unused] : candidate.segments) {
             (void)unused;
             actual.emplace(name);
         }
-        if (actual != expected) { return false; }
+        if (actual != expected) { return Failure::SegmentInventoryMismatch; }
 
-        const PagedKVLogicalImage text_kv =
-            image::decode_paged(candidate.segments.at("main.text_kv"), decoder->text_kv.pool(),
-                                metadata.text_kv_valid);
-        const LinearAttentionStateImage current_gdn =
-            image::decode_linear(candidate.segments.at("main.gdn"), decoder->linear_attention);
-        const cache::Bytes tail_hidden = image::decode_tensor(
-            candidate.segments.at("main.tail_hidden"), sequence.tail_hidden.bytes());
-        if (text_kv.valid_tokens != frontier) { return false; }
-
-        std::optional<LinearAttentionStateImage> checkpoint_gdn;
-        std::optional<cache::Bytes> checkpoint_hidden;
-        if (boundary.valid) {
-            checkpoint_gdn.emplace(
-                image::decode_linear(candidate.segments.at("checkpoint.gdn"),
-                                     decoder->linear_attention));
-            checkpoint_hidden.emplace(image::decode_tensor(
-                candidate.segments.at("checkpoint.hidden"),
-                sequence.turn_checkpoint_hidden.bytes()));
-        }
-
-        std::optional<PagedKVLogicalImage> backend_kv;
-        std::optional<CyclicKVCacheImage> dflash_local;
-        std::optional<CyclicKVCacheImage> dflash_checkpoint_local;
-        if (mtp_backend) {
-            backend_kv.emplace(image::decode_paged(candidate.segments.at("mtp.kv"),
-                                                   backend_kv_cache()->pool(),
-                                                   metadata.backend_kv_valid));
-        } else if (dflash_backend) {
-            backend_kv.emplace(image::decode_paged(candidate.segments.at("dflash.full_kv"),
-                                                   backend_kv_cache()->pool(),
-                                                   metadata.backend_kv_valid));
-            dflash_local.emplace(
-                image::decode_cyclic(candidate.segments.at("dflash.local"), dflash->local));
-            if (boundary.valid) {
-                dflash_checkpoint_local.emplace(image::decode_cyclic(
-                    candidate.segments.at("dflash.checkpoint_local"),
-                    dflash->turn_checkpoint_local));
-            }
-        }
-        if (backend_kv && backend_kv->valid_tokens != metadata.backend_kv_valid) { return false; }
-
-        const std::uint32_t text_pages =
-            (metadata.text_kv_valid + static_cast<std::uint32_t>(kPagedKVPageSize) - 1U) /
-            static_cast<std::uint32_t>(kPagedKVPageSize);
+        // Reserve the shared paged-KV pages before decoding anything. Decoding materialises the
+        // whole image on the host, so a reservation that cannot be satisfied must be discovered
+        // first: paying a half-gigabyte of host copies only to fail is what turned KV pressure
+        // into a silent cold prefill. The entitlement is the caller's planned allocation, not the
+        // bare frontier, so the restored lane does not have to grow on its first decode round.
+        const std::uint32_t frontier_pages =
+            metadata.text_kv_valid == 0 ? 0U : pages_for_tokens(metadata.text_kv_valid);
+        const std::uint32_t text_pages = std::max(frontier_pages, entitlement.text_pages);
         const std::uint32_t backend_pages =
             metadata.backend_kv_valid == 0
                 ? 0U
-                : (metadata.backend_kv_valid + static_cast<std::uint32_t>(kPagedKVPageSize) - 1U) /
-                      static_cast<std::uint32_t>(kPagedKVPageSize);
-        reserve_sequence_kv(sequence, text_pages, backend_pages);
+                : std::max(pages_for_tokens(metadata.backend_kv_valid), entitlement.backend_pages);
+        if (!kv_reservation_fits(text_pages, backend_pages)) {
+            return Failure::KvReservationExhausted;
+        }
+        try {
+            reserve_sequence_kv(sequence, text_pages, backend_pages);
+        } catch (...) {
+            return Failure::KvReservationExhausted;
+        }
+
+        // The payload was decoded by decode_continuation(), possibly on a preparation thread. It
+        // is bound to this exact image by content identity at the caller; these checks confirm it
+        // describes the state this lane is about to receive.
+        const PagedKVLogicalImage& text_kv                    = decoded.text_kv;
+        const LinearAttentionStateImage& current_gdn          = decoded.current_gdn;
+        const cache::Bytes& tail_hidden                       = decoded.tail_hidden;
+        const std::optional<LinearAttentionStateImage>& checkpoint_gdn = decoded.checkpoint_gdn;
+        const std::optional<cache::Bytes>& checkpoint_hidden  = decoded.checkpoint_hidden;
+        const std::optional<PagedKVLogicalImage>& backend_kv  = decoded.backend_kv;
+        const std::optional<CyclicKVCacheImage>& dflash_local = decoded.dflash_local;
+        const std::optional<CyclicKVCacheImage>& dflash_checkpoint_local =
+            decoded.dflash_checkpoint_local;
+        if (text_kv.valid_tokens != frontier || tail_hidden.size() != sequence.tail_hidden.bytes() ||
+            checkpoint_gdn.has_value() != boundary.valid ||
+            checkpoint_hidden.has_value() != boundary.valid ||
+            backend_kv.has_value() != (mtp_backend || dflash_backend) ||
+            dflash_local.has_value() != dflash_backend ||
+            dflash_checkpoint_local.has_value() != (dflash_backend && boundary.valid) ||
+            (checkpoint_hidden &&
+             checkpoint_hidden->size() != sequence.turn_checkpoint_hidden.bytes())) {
+            return Failure::MetadataMismatch;
+        }
+        if (backend_kv && backend_kv->valid_tokens != metadata.backend_kv_valid) {
+            return Failure::MetadataMismatch;
+        }
+
         import_paged_kv_logical(sequence.kv->text, text_kv, continuation_transfer, device.stream);
         if (backend_kv) {
             import_paged_kv_logical(*sequence.kv->backend, *backend_kv, continuation_transfer,
@@ -1756,13 +1877,13 @@ bool ProgramImplCore::import_continuation_lane(std::uint32_t lane,
         sequence.adapter          = adapter;
         sequence.retained         = true;
         request.lifecycle = Lifecycle::Complete;
-        return true;
+        return Failure::None;
     } catch (...) {
         try {
             device.synchronize();
         } catch (...) {}
         clear_lane(sequence, request);
-        return false;
+        return Failure::DecodeFailed;
     }
 }
 
@@ -3297,6 +3418,24 @@ void ProgramImplCore::resolve_non_speculative_pending(SequenceState& sequence,
     }
     request.lifecycle = terminal ? Lifecycle::Complete : Lifecycle::Active;
     request.pending   = {};
+}
+
+void ProgramImplCore::retire_lane(std::uint32_t lane) {
+    if (lane >= max_concurrency) { throw std::out_of_range("request lane is out of range"); }
+    SequenceState& sequence = sequences[lane];
+    RequestControl& request = requests[lane];
+    if (request.lifecycle != Lifecycle::Active || request.pending.kind != PendingKind::None ||
+        request.prefill) {
+        throw std::logic_error("retire_lane requires an active lane at a round boundary");
+    }
+    // The same terminal transition a resolved final round performs, without a round: the lane
+    // gives back the entitlement it never mapped, releases its KV table row, and keeps its state
+    // as a retained session the next turn can reuse.
+    sequence.mtp_draft_count = 0;
+    release_sequence_growth_entitlement(sequence);
+    unbind_sequence_kv(sequence);
+    sequence.retained = true;
+    request.lifecycle = Lifecycle::Complete;
 }
 
 MemorySummary ProgramImplCore::memory_summary() const noexcept {

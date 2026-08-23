@@ -143,6 +143,10 @@ public:
     [[nodiscard]] std::uint32_t mapped_pages() const noexcept;
     [[nodiscard]] std::uint32_t free_pages() const noexcept;
     [[nodiscard]] bool can_reserve(std::uint32_t page_entitlement) const noexcept;
+    // Whether an existing allocation could move from `old_pages` to `new_pages`. The pre-check
+    // twin of can_reserve for a live allocation, used to decide a resize before attempting it.
+    [[nodiscard]] bool can_replace_entitlement(std::uint32_t old_pages,
+                                               std::uint32_t new_pages) const noexcept;
     [[nodiscard]] PagedKVAllocation reserve(std::uint32_t page_entitlement);
 
     // Zeros only the named physical page groups across every storage plane.
@@ -176,8 +180,6 @@ private:
                                          const PagedKVLogicalImage& image,
                                          PinnedTransferBuffer& transfer, cudaStream_t stream);
 
-    [[nodiscard]] bool can_replace_entitlement(std::uint32_t old_pages,
-                                               std::uint32_t new_pages) const noexcept;
     [[nodiscard]] std::vector<std::int32_t> take_pages(std::uint32_t count,
                                                        std::int32_t preferred_first);
     void return_pages(std::span<const std::int32_t> pages) noexcept;

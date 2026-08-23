@@ -202,6 +202,9 @@ int main() {
     request.max_tokens     = 4096;
     request.max_tokens_set = true;
     request.messages.resize(2);
+    request.adapter        = "sudoku-lora";
+    // A routed session is logged as a digest, never as the caller's key.
+    request.prompt_cache_routing_hint = "opencode-session-7f31";
 
     PreparedRequest prepared;
     prepared.enable_thinking                   = false;
@@ -231,6 +234,12 @@ int main() {
                       "resolved preserve-thinking metadata missing");
     failures += check(started.at("request").at("sampling").at("seed") == 7632647173703958409ULL,
                       "resolved seed missing");
+    failures += check(started.at("request").at("adapter") == "sudoku-lora",
+                      "adapter missing from start record");
+    failures += check(started.at("request").at("prompt_cache_key_digest").is_string() &&
+                          started.at("request").at("prompt_cache_key_digest") !=
+                              "opencode-session-7f31",
+                      "routing hint must be logged as a digest, not verbatim");
 
     GenerationOutcome outcome;
     outcome.prompt_tokens                       = 401;
@@ -261,6 +270,11 @@ int main() {
     outcome.metrics.continuation.restored_bytes = 4096;
     outcome.metrics.continuation.destructive_rollback = true;
     outcome.metrics.continuation.completion_publication_queued = true;
+    outcome.metrics.continuation.restore_failure =
+        ninfer::ContinuationRestoreFailure::KvReservationExhausted;
+    // Queueing is the dominant TTFT term under concurrency, so it is part of the logged contract.
+    outcome.metrics.queue_seconds   = 12.3456789012345;
+    outcome.metrics.restore_seconds = 0.7890123456789;
 
     const Json done = Json::parse(format_request_done_json("serve-test", 3000, context, outcome));
     failures += check(done.at("request").at("x_request_id") == "req_public_abc",
@@ -286,7 +300,7 @@ int main() {
     failures +=
         check(done.at("speculative").at("accepted_per_position") == Json::array({290, 240, 190}),
                "speculative position counts missing");
-    failures += check(done.at("schema_version") == 12 &&
+    failures += check(done.at("schema_version") == 14 &&
                           done.at("continuation_cache").at("source") == "l3" &&
                            done.at("continuation_cache").at("alias_kind") == "routed_session" &&
                           done.at("continuation_cache").at("final_miss_reason") == "none" &&
@@ -295,7 +309,15 @@ int main() {
                           done.at("continuation_cache").at("destructive_rollback") == true &&
                           done.at("continuation_cache")
                                   .at("completion_publication_queued") == true,
-                       "schema-v12 continuation diagnostics missing");
+                       "schema-v13 continuation diagnostics missing");
+    failures += check(done.at("continuation_cache").at("restore_failure") ==
+                          "kv_reservation_exhausted",
+                      "restore failure must be attributed, not discarded");
+    failures += check(done.at("timings_seconds").at("queue").get<double>() ==
+                              outcome.metrics.queue_seconds &&
+                          done.at("timings_seconds").at("restore").get<double>() ==
+                              outcome.metrics.restore_seconds,
+                      "TTFT decomposition into queue and restore missing or imprecise");
 
     const Json error =
         Json::parse(format_request_error_json("serve-test", 4000, context, "generation failed"));

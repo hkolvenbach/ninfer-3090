@@ -53,6 +53,13 @@ struct AdmissionResources {
     std::uint32_t backend_kv_pages = 0;
 };
 
+// Paged-KV pages held by one lane, or required by one reservation. The engine reasons about
+// restore feasibility in these units so it can pick a target lane before disturbing anything.
+struct KvPageFootprint {
+    std::uint32_t text_pages    = 0;
+    std::uint32_t backend_pages = 0;
+};
+
 struct RequestPlanSummary {
     std::uint32_t prompt_tokens           = 0;
     std::uint32_t reusable_prompt_tokens  = 0;

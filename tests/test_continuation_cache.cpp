@@ -7,6 +7,7 @@
 #include <iostream>
 #include <limits>
 #include <stdexcept>
+#include <set>
 #include <string>
 #include <string_view>
 #include <thread>
@@ -73,6 +74,27 @@ void check(bool condition, const char* message) {
 std::filesystem::path only_file(const std::filesystem::path& directory) {
     for (const auto& item : std::filesystem::directory_iterator(directory))
         if (item.is_regular_file()) return item.path();
+    return {};
+}
+
+// Chunk boundaries follow the image's segment layout, so an image is generally several chunks and
+// no chunk file is named after the image. Tests that need "a chunk owned by this image" take the
+// difference of the chunk directory across the store that created it.
+std::set<std::filesystem::path> chunk_snapshot(const std::filesystem::path& root) {
+    std::set<std::filesystem::path> out;
+    std::error_code ec;
+    for (std::filesystem::directory_iterator it(root / "chunks", ec), end; !ec && it != end;
+         it.increment(ec)) {
+        if (it->is_regular_file()) out.insert(it->path());
+    }
+    return out;
+}
+
+std::filesystem::path new_chunk(const std::filesystem::path& root,
+                                const std::set<std::filesystem::path>& before) {
+    for (const auto& path : chunk_snapshot(root)) {
+        if (!before.contains(path)) return path;
+    }
     return {};
 }
 
@@ -163,11 +185,13 @@ void test_l2_eviction() {
                        .l3_byte_budget = 1 << 20,
                        .chunk_bytes    = 4096};
     ContinuationCache cache(config);
+    const auto empty  = chunk_snapshot(dir.path);
     const auto first  = cache.store(image(1));
+    const auto first_chunk = new_chunk(dir.path, empty);
     const auto second = cache.store(image(2));
     check(cache.stats().l2_bytes <= config.l2_byte_budget, "L2 obeys byte budget");
     check(cache.stats().l2_bytes != 0, "L2 budget admits exactly one test image");
-    overwrite_short(dir.path / "chunks" / first.hex); // Whole-image chunks use the image ID.
+    overwrite_short(first_chunk);
     check(!cache.get(first), "evicted L2 entry observes corrupt L3 as a miss");
     check(cache.get(second).has_value(), "most-recent L2 entry survives eviction");
 }
@@ -350,11 +374,13 @@ void test_async_stable_alias_first_writer_and_restart() {
         ContinuationCache cache(config);
         first = cache.admit(first_image);
         const auto second = cache.admit(second_image);
-        check(cache.publish_immutable_alias(alias, first) &&
+        check(cache.publish_immutable_alias(alias, first).alias_advanced &&
                   cache.session_current(alias) == first,
               "stable alias is promptly visible from L2");
-        check(!cache.publish_immutable_alias(alias, second),
-              "L2 stable alias remains first-writer immutable");
+        const auto contested = cache.publish_immutable_alias(alias, second);
+        check(!contested.alias_advanced &&
+                  contested.outcome == SessionPublishOutcome::AliasAlreadyOwned,
+              "L2 stable alias remains first-writer immutable and reports a lost race");
         check(cache.queue_persistence(alias, first, first_image.frontier_tokens, true),
               "stable L2 alias queues its durable promotion");
     }
@@ -363,12 +389,74 @@ void test_async_stable_alias_first_writer_and_restart() {
           "stable alias is written only after its manifest is durable");
 }
 
-void test_pin_protects_from_l3_eviction() {
+// A continuation turn keeps the previous turn's KV bytes and appends to them, but the prefix
+// identity that precedes them in the serialised image grows by every accepted token. Content
+// chunking that walked the image at a fixed stride therefore re-hashed the entire payload after a
+// shift of a few hundred bytes, and L3 stored a full private copy per turn. Chunks now restart at
+// each segment, so an unchanged segment prefix keeps its chunk identities regardless of what the
+// header did.
+void test_appended_segment_shares_chunks_across_turns() {
     TempDir dir;
+    constexpr std::size_t kChunk = 4096;
+    constexpr std::size_t kBody  = 64 * kChunk;
     CacheConfig config{.enable_l3      = true,
                        .root           = dir.path,
                        .l2_byte_budget = 0,
-                       .l3_byte_budget = 700,
+                       .l3_byte_budget = 1 << 24,
+                       .chunk_bytes    = kChunk};
+    ContinuationCache cache(config);
+
+    const auto plane = [](std::size_t size) {
+        Bytes out(size);
+        for (std::size_t i = 0; i != size; ++i)
+            out[i] = static_cast<std::uint8_t>((i * 2654435761ULL) >> 19);
+        return out;
+    };
+    const auto turn = [&](std::uint64_t tokens, std::size_t tail) {
+        ContinuationImage out;
+        out.compatibility_key      = {1, 2, 0, 4};
+        out.prefix_identity        = Bytes(static_cast<std::size_t>(tokens) * 17, 0x5a);
+        out.frontier_tokens        = tokens;
+        out.boundary_tokens        = 0;
+        out.frontier_prefix_digest = Bytes(32, 1);
+        out.frontier_metadata      = {1};
+        out.segments               = {{"main.gdn", Bytes(1024, 3)},
+                                      {"main.text_kv.p000", plane(kBody + tail)}};
+        return out;
+    };
+
+    const auto first     = turn(64, 0);
+    const auto first_id  = cache.store(first);
+    const auto after_first = cache.stats().l3_bytes;
+    const auto second    = turn(192, 3 * kChunk);
+    const auto second_id = cache.store(second);
+    const auto growth    = cache.stats().l3_bytes - after_first;
+
+    check(cache.get(first_id) == first && cache.get(second_id) == second,
+          "both turns restore exactly under segment-aligned chunking");
+    check(growth < kBody / 2, "an appended turn stores its delta, not a second full copy");
+    check(growth >= 3 * kChunk, "the appended tail itself is stored");
+}
+
+void test_pin_protects_from_l3_eviction() {
+    TempDir dir;
+    // The budget has to hold one durable image but not two. Measure one instead of hard-coding a
+    // byte count that the image layout would silently invalidate.
+    std::size_t one_image = 0;
+    {
+        TempDir probe;
+        ContinuationCache measure(CacheConfig{.enable_l3      = true,
+                                              .root           = probe.path,
+                                              .l2_byte_budget = 0,
+                                              .l3_byte_budget = 1 << 20,
+                                              .chunk_bytes    = 4096});
+        (void)measure.store(image(6));
+        one_image = measure.stats().l3_bytes;
+    }
+    CacheConfig config{.enable_l3      = true,
+                       .root           = dir.path,
+                       .l2_byte_budget = 0,
+                       .l3_byte_budget = one_image + one_image / 2,
                        .chunk_bytes    = 4096};
     ContinuationCache cache(config);
     const auto pinned = cache.store(image(6));
@@ -408,14 +496,14 @@ void test_l3_expiry_defers_cleanup_until_restore_and_explicit_pins_release() {
     now += std::chrono::seconds(11);
     check(!cache.get(restoring), "expired L3 is unavailable while an older restore pins it");
     check(std::filesystem::exists(dir.path / "manifests" / (restoring.hex + ".manifest")) &&
-              std::filesystem::exists(dir.path / "chunks" / restoring.hex),
+              !chunk_snapshot(dir.path).empty(),
           "restore pin defers expired L3 file deletion");
     block_restore.store(false, std::memory_order_release);
     restore.join();
     check(static_cast<bool>(restored), "restore already in flight may finish after expiry");
     restored.reset();
     check(!std::filesystem::exists(dir.path / "manifests" / (restoring.hex + ".manifest")) &&
-              !std::filesystem::exists(dir.path / "chunks" / restoring.hex),
+              chunk_snapshot(dir.path).empty(),
           "final restore unpin performs deferred L3 cleanup");
 
     block_restore.store(false, std::memory_order_release);
@@ -492,7 +580,7 @@ void test_corrupt_truncated_and_remnants() {
         .enable_l3 = true, .root = corrupt_dir.path, .l2_byte_budget = 0, .chunk_bytes = 4096};
     ContinuationCache corrupt(config);
     const auto corrupt_id = corrupt.store(image(4));
-    overwrite_short(corrupt_dir.path / "chunks" / corrupt_id.hex);
+    overwrite_short(only_file(corrupt_dir.path / "chunks"));
     check(!corrupt.get(corrupt_id), "corrupt chunk is a cache miss");
 
     TempDir truncated_dir;
@@ -546,7 +634,7 @@ void test_oversized_manifest_chunk_and_orphan_cleanup() {
         chunk_id = cache.store(image(83));
     }
     {
-        std::ofstream out(chunk_dir.path / "chunks" / chunk_id.hex,
+        std::ofstream out(only_file(chunk_dir.path / "chunks"),
                           std::ios::binary | std::ios::app);
         out.put('x');
     }
@@ -708,11 +796,13 @@ void test_corrupt_historical_candidate_keeps_other_shared_leases() {
                        .before_l3_restore_io = [&] { ++payload_reads; }};
     ContinuationCache cache(config);
     const auto first = cache.publish_session(image(106), "corrupt-history", std::nullopt);
+    const auto before_second = chunk_snapshot(dir.path);
     const auto second =
         cache.publish_session(image(107, first.id), "corrupt-history", first.id);
+    const auto second_chunk = new_chunk(dir.path, before_second);
     const auto third =
         cache.publish_session(image(108, second.id), "corrupt-history", second.id);
-    overwrite_short(dir.path / "chunks" / second.id.hex);
+    overwrite_short(second_chunk);
     const auto candidates = cache.session_candidates("corrupt-history");
     check(candidates.newest_to_oldest.size() == 3 &&
               candidates.newest_to_oldest[0].status == CacheLookupStatus::Hit &&
@@ -862,11 +952,12 @@ void test_immutable_alias_restart_and_classification_isolation() {
     {
         ContinuationCache cache(config);
         check(cache.store(first_image) == first, "stable image is stored before alias publication");
-        check(cache.publish_immutable_alias(alias, first), "stable alias publishes once");
+        check(cache.publish_immutable_alias(alias, first).alias_advanced,
+              "stable alias publishes once");
         const ContentId second = cache.store(second_image, StoreOptions{.session = alias});
         check(second != first && cache.session_current(alias) == first,
               "session classification cannot replace a reserved stable alias");
-        check(!cache.publish_immutable_alias(alias, second),
+        check(!cache.publish_immutable_alias(alias, second).alias_advanced,
               "stable alias cannot be rebound to another image");
         check(!cache.rollback_session(alias, 0), "stable alias cannot enter rollback machinery");
         check(cache.session_history(alias) == std::vector<ContentId>({first}),
@@ -1014,7 +1105,7 @@ void test_concurrent_corruption_is_a_safe_miss() {
                        .chunk_bytes    = 4096};
     ContinuationCache cache(config);
     const auto id = cache.store(image(23));
-    overwrite_short(dir.path / "chunks" / id.hex);
+    overwrite_short(only_file(dir.path / "chunks"));
     std::atomic<int> hits       = 0;
     std::atomic<int> exceptions = 0;
     std::vector<std::thread> readers;
@@ -1056,8 +1147,9 @@ void test_lookup_diagnostics_classify_tier_and_failure() {
               l3_hit.status == CacheLookupStatus::Hit,
           "lookup reports an authoritative L3 restore");
 
+    const auto before_corrupt = chunk_snapshot(dir.path);
     const auto corrupt_id = l3.store(image(26));
-    overwrite_short(dir.path / "chunks" / corrupt_id.hex);
+    overwrite_short(new_chunk(dir.path, before_corrupt));
     const auto corrupt = l3.lookup_shared(corrupt_id);
     check(!corrupt.image && corrupt.source == CacheSource::L3 &&
               corrupt.status == CacheLookupStatus::UnavailableOrCorrupt,
@@ -1066,6 +1158,53 @@ void test_lookup_diagnostics_classify_tier_and_failure() {
 }
 
 } // namespace
+
+
+// A session publication must survive the eviction pass that its own admission triggers, and a
+// publication that does not advance the alias must say why. Losing the newest state of a live
+// conversation to its own admission is indistinguishable, from the caller, from a cache that never
+// stored anything: the alias stays behind and the next turn prefills from nothing.
+void test_session_publication_survives_its_own_admission() {
+    TempDir dir;
+    auto now = std::chrono::system_clock::now();
+    // The two fillers occupy 736 bytes and the crowded image is 1064, so the third admission must
+    // evict to fit while the image itself stays comfortably inside the budget.
+    const CacheConfig config{.enable_l3 = false,
+                             .root = dir.path,
+                             .l2_byte_budget = 1500,
+                             .l3_byte_budget = 0,
+                             .persist_interval = std::chrono::seconds(0),
+                             .persist_min_tokens = 1000,
+                             .now = [&] { return now; }};
+    ContinuationCache cache(config);
+
+    // The fillers are small and expensive to recompute, so cost-aware admission scores them far
+    // above the large cheap image that arrives next. Without an explicit protection the incoming
+    // publication is exactly the entry its own eviction pass selects.
+    const StoreOptions valuable{.recompute_cost = 1e9};
+    const StoreOptions cheap{.recompute_cost = 1.0};
+    const auto filler_a = cache.publish_session_l2(image(11), "filler-a", std::nullopt, valuable);
+    const auto filler_b = cache.publish_session_l2(image(12), "filler-b", std::nullopt, valuable);
+    check(filler_a.alias_advanced && filler_b.alias_advanced,
+          "unconstrained session publications advance their aliases");
+
+    ContinuationImage large = image(13);
+    large.segments["kv.layers"] = Bytes(700, 13);
+    const auto crowded = cache.publish_session_l2(large, "crowded", std::nullopt, cheap);
+    check(crowded.alias_advanced && crowded.outcome == SessionPublishOutcome::Advanced,
+          "a session publication is not evicted by the pass its own admission triggers");
+    check(cache.session_current("crowded") == crowded.id,
+          "the crowded session alias points at the state just published");
+    check(cache.get(crowded.id).has_value(),
+          "the surviving publication is readable from L2");
+
+    // A publication whose expected head is stale must be reported as a lost race, not as capacity.
+    ContinuationImage stale = image(14);
+    stale.parent_id = std::nullopt;
+    const auto lost = cache.publish_session_l2(stale, "crowded", std::nullopt, cheap);
+    check(!lost.alias_advanced && lost.outcome == SessionPublishOutcome::HeadMoved,
+          "a stale expected head is attributed to the alias moving, not to capacity");
+}
 
 int main() {
     test_roundtrip_dedup_restart_and_permissions();
@@ -1080,6 +1219,7 @@ int main() {
     test_l2_access_does_not_wait_for_persistence_io();
     test_async_coalescing_shutdown_and_restart();
     test_async_stable_alias_first_writer_and_restart();
+    test_appended_segment_shares_chunks_across_turns();
     test_pin_protects_from_l3_eviction();
     test_l3_expiry_defers_cleanup_until_restore_and_explicit_pins_release();
     test_independent_idle_ttls_and_refresh();
@@ -1101,5 +1241,6 @@ int main() {
     test_filesystem_reserve_falls_back_to_l2();
     test_concurrent_corruption_is_a_safe_miss();
     test_lookup_diagnostics_classify_tier_and_failure();
+    test_session_publication_survives_its_own_admission();
     return failures == 0 ? 0 : 1;
 }

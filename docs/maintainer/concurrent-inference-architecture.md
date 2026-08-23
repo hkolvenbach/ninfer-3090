@@ -79,10 +79,29 @@ metadata 和一份 shared executor workspace；否则该 `max_concurrency` 无�
 因此不能降低 `C` 个 active sequences 的 guarantee。Growing context 仍是 shared capacity，所以不承诺
 任意 `C` 个长上下文都能同时 admission。
 
-### 2.4 Admission guarantees completion capacity
+### 2.4 Admission guarantees a decode window, growth is best-effort
 
-NInfer 不支持 preemption，因此 request 只有在其 prompt、声明的最大生成长度和必要的临时增长都能
-获得完整资源承诺后才可 admission。已经 admitted 的 request 不会因为后来请求到达而被截断或逐出。
+NInfer 不支持 preemption。Request 只有在其 prompt、`kDecodeReservationWindow` 个 output tokens 和
+必要的临时增长都能获得完整资源承诺后才可 admission。已经 admitted 的 request 不会因为后来请求到达
+而被截断或逐出。
+
+`max_tokens` 是 limit，不是 reservation。声明的最大生成长度只作为 growth ceiling：admission 只承诺
+window 内的 output tokens，超出部分在每个 round boundary 按需取得。这是刻意的取舍——按 `max_tokens`
+预留会让一个只生成几百 token 的 request 长期占住数千 pages，把同样大小的 prompt 挤出 shared pool，
+表现为 restore 被 `kv_reservation_exhausted` 拒绝后改走 full prefill。
+
+Round boundary 上的 growth 有三级 ladder，逐级变贵：
+
+1. 从 pool 取 free pages；
+2. 逐出一个没有 request 占用的 retained session（L1 → L2/L3 降级，state 先发布再释放）；
+3. 两者都失败时，request 以 `ContextCapacity` 在当前长度正常结束。
+
+第三级不是错误路径：request 走完整的 terminal path，lane 被 retire，session 照常 retain 并发布，
+client 看到 `finish_reason: length`。单个 request 永远不会被 curtail——`--kv-capacity` 不得小于
+`--max-context`，因此一个 lane 的 ceiling 始终在 pool 之内；curtailment 只在多个 lane 竞争时出现。
+
+Window 的取值来自实测负载：agent turn 的生成长度 mean 263、p90 331，4096 覆盖到极少数例外之外的
+全部 turn，同时让四个 p90 规模的 session 仍能同时驻留 262144-token pool。
 
 ### 2.5 One prefill owner
 
@@ -94,6 +113,21 @@ NInfer 不支持 preemption，因此 request 只有在其 prompt、声明的最�
 一个 GPU executor 串行提交所有 prefill chunks 和 decode rounds，并且是 active slot、sequence state
 和下一轮 batch 的唯一修改者。CPU preparation、request ingress 和 output I/O 可以并行，但不能直接
 推进模型状态。
+
+Continuation decode 是这条规则最重要的应用。把 continuation image 解码成 host payload 是纯 CPU 工作：
+只读 startup 固定的 geometry（pool plane spec、linear/cyclic state 形状、lane-invariant tensor extent），
+不接触 pool 的可变分配状态、lane state、device memory 或任何 CUDA API，因此交给独立的 preparation
+thread。解码之后的一切——KV reservation、device transfer、sequence-state 写入——仍然只属于 executor。
+留在 executor 上时它的代价无法与 GPU 重叠：`try_admit_one` 在 prefill 进行中根本不会被调用，解码只能
+排在两个 GPU 单元之间。
+
+Preparation job 命名的是 session，不是某个固定 image。Request 在 queue 中等待期间，同一 session 的
+上一轮 turn 会完成并发布更新的 image，admission 最终 reconcile 到那个新 head；因此 job 必须在解码时
+才解析 session 的当前 head，否则准备的永远是上一轮的 image。Payload 以 content identity 存放，由真正
+admit 该 image 的 request 认领——image 在 session 之间共享，而 stable-flight 过滤会改变队列顺序，所以
+触发解码的 request 未必就是下一个被 admit 的。Preparation 是投机的，因此严格有界：只为队首少量
+request 预解码，常驻 payload 数量有上限，未被认领的 payload 在 10 秒后丢弃。Miss 没有代价，executor
+原地解码，工作内容与顺序和之前完全一致。
 
 ### 2.7 Bounded ingress and output
 

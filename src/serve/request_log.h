@@ -17,7 +17,7 @@
 
 namespace ninfer::serve {
 
-inline constexpr int kRequestLogSchemaVersion        = 12;
+inline constexpr int kRequestLogSchemaVersion        = 14;
 inline constexpr const char* kRequestLogArtifactType = "ninfer_serve_request_log";
 
 struct RequestLogContext {
@@ -36,6 +36,13 @@ struct RequestLogContext {
     bool enable_thinking                   = true;
     bool preserve_thinking                 = false;
     bool preserve_thinking_semantic_change = false;
+    // Adapter selected by the model string; empty means base weights. Continuation aliases are
+    // namespaced by adapter, so cache behaviour cannot be read without it.
+    std::string adapter;
+    // Truncated digest of the client's prompt_cache_key, or empty when the client sent none.
+    // The key itself can carry client-chosen text, and only its identity matters here: equal
+    // digests are the same routed session, different digests are different sessions.
+    std::string prompt_cache_key_digest;
     ninfer::ResolvedSamplingParameters sampling;
 };
 

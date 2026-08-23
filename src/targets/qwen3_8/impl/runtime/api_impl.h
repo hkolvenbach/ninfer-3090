@@ -199,6 +199,11 @@ void Program<Variant>::resolve_prefill_lane(std::uint32_t lane, bool terminal) {
 }
 
 template <>
+void Program<Variant>::retire_lane(std::uint32_t lane) {
+    impl_->retire_lane(lane);
+}
+
+template <>
 void Program<Variant>::abort_lane(std::uint32_t lane) noexcept {
     impl_->abort_lane(lane);
 }
@@ -262,14 +267,38 @@ Program<Variant>::preflight_continuation(const cache::ContinuationImage& image,
 }
 
 template <>
-bool Program<Variant>::import_continuation_lane(std::uint32_t lane,
-                                                const cache::ContinuationImage& image,
-                                                const PreparedPrompt& prompt,
-                                                std::int32_t adapter) noexcept {
+std::shared_ptr<DecodedContinuation>
+Program<Variant>::decode_continuation(const cache::ContinuationImage& image) const {
+    return impl_->decode_continuation(image);
+}
+
+template <>
+ContinuationRestoreFailure Program<Variant>::import_continuation_lane(
+    std::uint32_t lane, const cache::ContinuationImage& image, const DecodedContinuation& decoded,
+    const PreparedPrompt& prompt, std::int32_t adapter,
+    runtime::KvPageFootprint entitlement) noexcept {
     try {
-        return impl_->import_continuation_lane(lane, image, PreparedPromptAccess::view(prompt),
-                                               adapter);
-    } catch (...) { return false; }
+        return impl_->import_continuation_lane(lane, image, decoded,
+                                               PreparedPromptAccess::view(prompt), adapter,
+                                               entitlement);
+    } catch (...) { return ContinuationRestoreFailure::DecodeFailed; }
+}
+
+template <>
+bool Program<Variant>::kv_reservation_fits(std::uint32_t text_pages,
+                                            std::uint32_t backend_pages) const noexcept {
+    return impl_->kv_reservation_fits(text_pages, backend_pages);
+}
+
+template <>
+bool Program<Variant>::try_grow_decode_headroom(std::uint32_t lane) {
+    return impl_->try_grow_decode_headroom(lane);
+}
+
+template <>
+runtime::KvPageFootprint
+Program<Variant>::retained_lane_kv_footprint(std::uint32_t lane) const noexcept {
+    return impl_->retained_lane_kv_footprint(lane);
 }
 
 template <>

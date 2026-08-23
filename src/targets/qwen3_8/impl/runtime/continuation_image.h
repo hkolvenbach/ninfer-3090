@@ -9,6 +9,9 @@
 
 #include <bit>
 #include <algorithm>
+#include <cstdio>
+#include <map>
+#include <set>
 #include <cstddef>
 #include <cstdint>
 #include <limits>
@@ -22,7 +25,7 @@
 
 namespace ninfer::targets::qwen3_8::detail::continuation {
 
-inline constexpr std::uint32_t kTargetImageVersion = 2;
+inline constexpr std::uint32_t kTargetImageVersion = 3;
 class Writer {
 public:
     void u8(std::uint8_t value) { bytes_.push_back(value); }
@@ -412,7 +415,30 @@ inline PagedKVPlaneSpec read_plane_spec(Reader& in) {
                             .alignment = static_cast<std::size_t>(in.u64())};
 }
 
-inline cache::Bytes encode_paged(const PagedKVLogicalImage& image) {
+using Segments = std::map<std::string, cache::Bytes>;
+
+// Paged KV is emitted as one small descriptor segment plus one segment per plane, rather than as a
+// single blob. Keeping a plane in its own segment is what lets the cache's content-addressed
+// chunking share bytes with the image published one turn earlier: concatenated into one blob,
+// every plane after the first is displaced as soon as an earlier plane grows, and nothing below
+// the frontier is ever recognised again.
+//
+// For a PageMajor pool - which is what the text and MTP caches use - a plane payload is dense in
+// logical page order, so pages [0, P) are a byte prefix of pages [0, P+k) and the whole unchanged
+// prefix is recognised. A HeadMajor payload interleaves heads at a stride that grows with the page
+// count, so only its first head keeps its offsets; those planes dedup when they are unchanged and
+// otherwise fall back to a private copy. Only the DFlash full pool is HeadMajor.
+[[nodiscard]] inline std::string paged_plane_segment(std::string_view base, std::size_t plane) {
+    char suffix[16];
+    std::snprintf(suffix, sizeof(suffix), ".p%03zu", plane);
+    return std::string(base) + suffix;
+}
+
+[[nodiscard]] inline std::string paged_descriptor_segment(std::string_view base) {
+    return std::string(base) + ".kv";
+}
+
+inline void emit_paged(Segments& segments, std::string_view base, PagedKVLogicalImage&& image) {
     Writer out;
     write_header(out, "paged-kv");
     out.u32(image.valid_tokens);
@@ -420,14 +446,30 @@ inline cache::Bytes encode_paged(const PagedKVLogicalImage& image) {
     out.u64(image.planes.size());
     for (const auto& spec : image.planes) { write_plane_spec(out, spec); }
     out.u64(image.payloads.size());
-    for (const auto& payload : image.payloads) { out.blob(payload); }
-    return std::move(out).finish();
+    for (const auto& payload : image.payloads) { out.u64(payload.size()); }
+    segments.emplace(paged_descriptor_segment(base), std::move(out).finish());
+    for (std::size_t index = 0; index < image.payloads.size(); ++index) {
+        segments.emplace(paged_plane_segment(base, index), std::move(image.payloads[index]));
+    }
 }
 
-inline PagedKVLogicalImage decode_paged(std::span<const std::uint8_t> bytes,
-                                        const PagedKVPool& pool,
-                                        std::uint32_t expected_valid_tokens) {
-    Reader in(bytes);
+inline void paged_segment_names(std::string_view base, std::size_t plane_count,
+                                std::set<std::string>& out) {
+    out.emplace(paged_descriptor_segment(base));
+    for (std::size_t index = 0; index < plane_count; ++index) {
+        out.emplace(paged_plane_segment(base, index));
+    }
+}
+
+[[nodiscard]] inline PagedKVLogicalImage decode_paged(const Segments& segments,
+                                                      std::string_view base,
+                                                      const PagedKVPool& pool,
+                                                      std::uint32_t expected_valid_tokens) {
+    const auto descriptor = segments.find(paged_descriptor_segment(base));
+    if (descriptor == segments.end()) {
+        throw std::invalid_argument("paged KV image is missing its descriptor");
+    }
+    Reader in(descriptor->second);
     read_header(in, "paged-kv");
     PagedKVLogicalImage out;
     out.valid_tokens = in.u32();
@@ -460,14 +502,19 @@ inline PagedKVLogicalImage decode_paged(std::span<const std::uint8_t> bytes,
             throw std::invalid_argument("paged KV image plane geometry differs from pool");
         }
     }
-    out.payloads.resize(in.count(pool.plane_count()));
-    if (out.payloads.size() != pool.plane_count()) {
+    const std::size_t payload_count = in.count(pool.plane_count());
+    if (payload_count != pool.plane_count()) {
         throw std::invalid_argument("paged KV image has an incompatible payload inventory");
     }
+    std::vector<std::uint64_t> declared(payload_count);
+    for (auto& size : declared) { size = in.u64(); }
+    in.finish();
+
     const std::size_t pages = expected_valid_tokens == 0
                                   ? 0
                                   : 1U + (expected_valid_tokens - 1U) / kPagedKVPageSize;
-    for (std::size_t index = 0; index < out.payloads.size(); ++index) {
+    out.payloads.resize(payload_count);
+    for (std::size_t index = 0; index < payload_count; ++index) {
         const Tensor& plane = pool.plane(index);
         const std::size_t page_bytes =
             out.plane_order == PagedKVPlaneOrder::PageMajor
@@ -476,9 +523,14 @@ inline PagedKVLogicalImage decode_paged(std::span<const std::uint8_t> bytes,
         if (pages != 0 && page_bytes > std::numeric_limits<std::size_t>::max() / pages) {
             throw std::invalid_argument("paged KV image payload extent overflows size_t");
         }
-        out.payloads[index] = in.blob_exact(page_bytes * pages);
+        const std::size_t expected_bytes = page_bytes * pages;
+        const auto payload = segments.find(paged_plane_segment(base, index));
+        if (payload == segments.end() || payload->second.size() != expected_bytes ||
+            declared[index] != expected_bytes) {
+            throw std::invalid_argument("paged KV plane payload is missing or missized");
+        }
+        out.payloads[index] = payload->second;
     }
-    in.finish();
     if (out.planes.size() != out.payloads.size()) {
         throw std::invalid_argument("paged KV image has inconsistent planes");
     }
@@ -611,3 +663,54 @@ inline cache::Bytes decode_tensor(std::span<const std::uint8_t> bytes, std::size
 }
 
 } // namespace ninfer::targets::qwen3_8::detail::continuation
+
+namespace ninfer::targets::qwen3_8 {
+
+// The host-side product of decoding a continuation image, owned and pointer-free.
+//
+// Decoding materialises the whole image on the host and is the largest CPU term in a restore. It
+// reads only startup-fixed pool geometry, touches no lane state, no device memory and no CUDA API,
+// so it is separated from the import step and may be produced on a preparation thread while the
+// GPU executor runs. Everything that follows decoding - the KV reservation, the device transfers
+// and the sequence-state writes - remains the executor's exclusive work.
+struct DecodedContinuation {
+    PagedKVLogicalImage text_kv;
+    LinearAttentionStateImage current_gdn;
+    cache::Bytes tail_hidden;
+    std::optional<LinearAttentionStateImage> checkpoint_gdn;
+    std::optional<cache::Bytes> checkpoint_hidden;
+    std::optional<PagedKVLogicalImage> backend_kv;
+    std::optional<CyclicKVCacheImage> dflash_local;
+    std::optional<CyclicKVCacheImage> dflash_checkpoint_local;
+
+    // Resident host cost, used by the engine to bound how much decoding it runs ahead.
+    [[nodiscard]] std::uint64_t host_bytes() const noexcept {
+        std::uint64_t total = tail_hidden.size();
+        const auto paged = [](const PagedKVLogicalImage& image) {
+            std::uint64_t bytes = 0;
+            for (const auto& payload : image.payloads) { bytes += payload.size(); }
+            return bytes;
+        };
+        const auto linear = [](const LinearAttentionStateImage& image) {
+            std::uint64_t bytes = 0;
+            for (const auto& layer : image.conv) { bytes += layer.size(); }
+            for (const auto& layer : image.recurrent) { bytes += layer.size(); }
+            return bytes;
+        };
+        const auto cyclic = [](const CyclicKVCacheImage& image) {
+            std::uint64_t bytes = 0;
+            for (const auto& layer : image.k) { bytes += layer.size(); }
+            for (const auto& layer : image.v) { bytes += layer.size(); }
+            return bytes;
+        };
+        total += paged(text_kv) + linear(current_gdn);
+        if (checkpoint_gdn) { total += linear(*checkpoint_gdn); }
+        if (checkpoint_hidden) { total += checkpoint_hidden->size(); }
+        if (backend_kv) { total += paged(*backend_kv); }
+        if (dflash_local) { total += cyclic(*dflash_local); }
+        if (dflash_checkpoint_local) { total += cyclic(*dflash_checkpoint_local); }
+        return total;
+    }
+};
+
+} // namespace ninfer::targets::qwen3_8

@@ -310,9 +310,22 @@ deployed workload rather than treating these values as fixed costs.
   `...publication_superseded_total`;
 - `ninfer:continuation_persistence_queued_total`, `...coalesced_total`,
   `...successes_total`, and `...failures_total`;
+- `ninfer:continuation_preparation_decoded_total`, `...preparation_hits_total`, and
+  `...preparation_inline_total`. Decoding a restored image into host memory is the largest CPU term
+  in a restore, so a preparation thread decodes ahead for the queue head and admission claims the
+  payload by content identity. `hits / (hits + inline)` is the health signal: `inline` counts
+  restores the executor had to decode itself, which is correct but costs the execution thread. A
+  `decoded` count well above `hits` means preparation is choosing images admission does not use and
+  is spending host memory and CPU for nothing;
 - `ninfer:continuation_l2_entries`, `...l2_bytes`, `...l3_entries`, and `...l3_bytes`;
 - `ninfer:l1_evictions_total`, `...l1_demotions_total`, `...l1_resident_entries`, and
-  `...l1_resident_bytes`.
+  `...l1_resident_bytes`;
+- `ninfer:kv_growth_attempts_total`, `...forced_spills_total`, and `...curtailed_total`. A
+  generating lane holds pages for its prompt plus a fixed decode window and asks for the rest per
+  round. `forced_spills` counts retained sessions demoted to L2/L3 to satisfy such a request, and
+  `curtailed` counts requests that ended at `length` because no rung found pages. Sustained
+  `forced_spills` means L1 residency is being paid for by concurrent generation; sustained
+  `curtailed` means the pool is too small for the configured concurrency.
 - fixed L1/L2/L3 `...restore_successes_total`, `...restored_tokens_total`, and
   `...restored_bytes_total` series, plus `...session_restores_total` and
   `...stable_prefix_restores_total`;

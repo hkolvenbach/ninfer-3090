@@ -263,6 +263,7 @@ GenerationService::GenerationService(ServeOptions options, LoadProgress load_pro
     engine_options.max_pending_requests = options_.max_pending_requests;
     engine_options.pending_timeout_ms   = options_.pending_timeout_ms;
     engine_options.prefill_chunk        = options_.prefill_chunk;
+    engine_options.prefill_decode_balance = options_.prefill_decode_balance;
     engine_options.turn_checkpoint_ring = options_.turn_checkpoint_ring;
     engine_options.auto_save_evicted    = options_.auto_save_evicted;
     if (options_.auto_save_evicted) {
@@ -470,6 +471,9 @@ GenerationOutcome GenerationService::run(PreparedRequest& prepared, const Stream
         prepared.prepare_seconds +
         std::max(0.0, result.timings.first_token_seconds - result.timings.prepare_seconds);
     outcome.metrics.vision_seconds  = result.timings.vision_seconds;
+    outcome.metrics.queue_seconds   = result.timings.queue_seconds;
+    outcome.metrics.restore_seconds = result.timings.restore_seconds;
+    outcome.metrics.publish_seconds = result.timings.publish_seconds;
     outcome.metrics.prefill_seconds = result.timings.prefill_seconds;
     outcome.metrics.decode_seconds  = result.timings.decode_seconds;
     outcome.metrics.total_seconds =

@@ -20,6 +20,23 @@ std::size_t checked_slot_capacity(std::size_t capacity_bytes) {
     return capacity_bytes / 2;
 }
 
+// Adjacent descriptors that are contiguous on both sides describe one larger copy. Callers build
+// these lists per logical element - paged KV emits one descriptor per page per plane, tens of
+// thousands for a long session - and the pinned pipeline pays an event synchronize and a launch
+// for every descriptor regardless of size. Physical pages are handed out in ascending runs, so
+// merging turns that back into a handful of large transfers. The bytes moved are identical.
+bool contiguous(const DeviceToHostTransfer& a, const DeviceToHostTransfer& b) noexcept {
+    return a.destination == b.destination && a.destination_offset + a.bytes == b.destination_offset &&
+           static_cast<const std::uint8_t*>(a.source) + a.bytes ==
+               static_cast<const std::uint8_t*>(b.source);
+}
+
+bool contiguous(const HostToDeviceTransfer& a, const HostToDeviceTransfer& b) noexcept {
+    return a.source == b.source && a.source_offset + a.bytes == b.source_offset &&
+           static_cast<std::uint8_t*>(a.destination) + a.bytes ==
+               static_cast<std::uint8_t*>(b.destination);
+}
+
 } // namespace
 
 struct PinnedTransferBuffer::Impl {
@@ -66,24 +83,65 @@ std::size_t PinnedTransferBuffer::slot_capacity() const noexcept {
 
 void PinnedTransferBuffer::copy_device_to_host(
     std::span<const DeviceToHostTransfer> transfers, cudaStream_t stream) {
-    struct Pending {
+    // One slot carries as many descriptors as fit and is synchronized once. Callers describe
+    // transfers per logical element, and a shared KV pool in steady use hands out scattered
+    // physical pages, so contiguous merging alone cannot reduce that count - a long session still
+    // produces tens of thousands of descriptors. Synchronizing per slot instead of per descriptor
+    // is what makes the cost track bytes moved rather than element count.
+    struct Piece {
         std::vector<std::uint8_t>* destination = nullptr;
-        std::size_t offset                     = 0;
+        std::size_t destination_offset         = 0;
+        std::size_t slot_offset                = 0;
         std::size_t bytes                      = 0;
-        bool active                            = false;
     };
-    std::array<Pending, 2> pending{};
-    std::size_t next_slot = 0;
+    std::array<std::vector<Piece>, 2> staged;
+    std::array<bool, 2> pending{};
+    std::size_t slot = 0;
+    std::size_t used = 0;
 
-    const auto finish = [&](std::size_t slot) {
-        if (!pending[slot].active) { return; }
-        CUDA_CHECK(cudaEventSynchronize(impl_->events[slot]));
-        std::memcpy(pending[slot].destination->data() + pending[slot].offset,
-                    impl_->slots[slot].data(), pending[slot].bytes);
-        pending[slot].active = false;
+    const auto finish = [&](std::size_t index) {
+        if (!pending[index]) { return; }
+        CUDA_CHECK(cudaEventSynchronize(impl_->events[index]));
+        for (const Piece& piece : staged[index]) {
+            std::memcpy(piece.destination->data() + piece.destination_offset,
+                        impl_->slots[index].data() + piece.slot_offset, piece.bytes);
+        }
+        staged[index].clear();
+        pending[index] = false;
+    };
+
+    // Hand the open slot to the device, then take the other one back from it.
+    const auto rotate = [&] {
+        if (!staged[slot].empty()) {
+            CUDA_CHECK(cudaEventRecord(impl_->events[slot], stream));
+            pending[slot] = true;
+        }
+        slot = (slot + 1) % staged.size();
+        finish(slot);
+        used = 0;
     };
 
     try {
+        finish(slot);
+        // Every descriptor is validated as given; only their submission is packed.
+        DeviceToHostTransfer run{};
+        bool have_run = false;
+        const auto submit = [&](const DeviceToHostTransfer& transfer) {
+            std::size_t copied = 0;
+            while (copied < transfer.bytes) {
+                if (used == impl_->slot_bytes) { rotate(); }
+                const std::size_t chunk =
+                    std::min(impl_->slot_bytes - used, transfer.bytes - copied);
+                CUDA_CHECK(cudaMemcpyAsync(
+                    impl_->slots[slot].data() + used,
+                    static_cast<const std::uint8_t*>(transfer.source) + copied, chunk,
+                    cudaMemcpyDeviceToHost, stream));
+                staged[slot].push_back(
+                    {transfer.destination, transfer.destination_offset + copied, used, chunk});
+                used += chunk;
+                copied += chunk;
+            }
+        };
         for (const DeviceToHostTransfer& transfer : transfers) {
             if (transfer.destination == nullptr ||
                 (transfer.bytes != 0 && transfer.source == nullptr) ||
@@ -91,22 +149,17 @@ void PinnedTransferBuffer::copy_device_to_host(
                 transfer.bytes > transfer.destination->size() - transfer.destination_offset) {
                 throw std::invalid_argument("device-to-host pinned transfer is out of bounds");
             }
-            std::size_t copied = 0;
-            while (copied < transfer.bytes) {
-                const std::size_t slot = next_slot++ % pending.size();
-                finish(slot);
-                const std::size_t chunk = std::min(impl_->slot_bytes, transfer.bytes - copied);
-                CUDA_CHECK(cudaMemcpyAsync(
-                    impl_->slots[slot].data(),
-                    static_cast<const std::uint8_t*>(transfer.source) + copied, chunk,
-                    cudaMemcpyDeviceToHost, stream));
-                CUDA_CHECK(cudaEventRecord(impl_->events[slot], stream));
-                pending[slot] =
-                    {transfer.destination, transfer.destination_offset + copied, chunk, true};
-                copied += chunk;
+            if (have_run && contiguous(run, transfer)) {
+                run.bytes += transfer.bytes;
+                continue;
             }
+            if (have_run) { submit(run); }
+            run      = transfer;
+            have_run = true;
         }
-        for (std::size_t slot = 0; slot < pending.size(); ++slot) { finish(slot); }
+        if (have_run) { submit(run); }
+        rotate();
+        for (std::size_t index = 0; index < staged.size(); ++index) { finish(index); }
     } catch (...) {
         // A failed enqueue/record must not let pinned storage die while prior work still references it.
         (void)cudaStreamSynchronize(stream);
@@ -117,15 +170,48 @@ void PinnedTransferBuffer::copy_device_to_host(
 void PinnedTransferBuffer::copy_host_to_device(
     std::span<const HostToDeviceTransfer> transfers, cudaStream_t stream) {
     std::array<bool, 2> pending{};
-    std::size_t next_slot = 0;
+    std::size_t slot   = 0;
+    std::size_t used   = 0;
+    bool slot_has_work = false;
 
-    const auto finish = [&](std::size_t slot) {
-        if (!pending[slot]) { return; }
-        CUDA_CHECK(cudaEventSynchronize(impl_->events[slot]));
-        pending[slot] = false;
+    const auto finish = [&](std::size_t index) {
+        if (!pending[index]) { return; }
+        CUDA_CHECK(cudaEventSynchronize(impl_->events[index]));
+        pending[index] = false;
+    };
+
+    const auto rotate = [&] {
+        if (slot_has_work) {
+            CUDA_CHECK(cudaEventRecord(impl_->events[slot], stream));
+            pending[slot] = true;
+        }
+        slot = (slot + 1) % pending.size();
+        finish(slot);
+        used          = 0;
+        slot_has_work = false;
     };
 
     try {
+        finish(slot);
+        // Every descriptor is validated as given; only their submission is packed.
+        HostToDeviceTransfer run{};
+        bool have_run     = false;
+        const auto submit = [&](const HostToDeviceTransfer& transfer) {
+            std::size_t copied = 0;
+            while (copied < transfer.bytes) {
+                if (used == impl_->slot_bytes) { rotate(); }
+                const std::size_t chunk =
+                    std::min(impl_->slot_bytes - used, transfer.bytes - copied);
+                std::memcpy(impl_->slots[slot].data() + used,
+                            transfer.source->data() + transfer.source_offset + copied, chunk);
+                CUDA_CHECK(cudaMemcpyAsync(
+                    static_cast<std::uint8_t*>(transfer.destination) + copied,
+                    impl_->slots[slot].data() + used, chunk, cudaMemcpyHostToDevice, stream));
+                used += chunk;
+                copied += chunk;
+                slot_has_work = true;
+            }
+        };
         for (const HostToDeviceTransfer& transfer : transfers) {
             if (transfer.source == nullptr ||
                 (transfer.bytes != 0 && transfer.destination == nullptr) ||
@@ -133,22 +219,17 @@ void PinnedTransferBuffer::copy_host_to_device(
                 transfer.bytes > transfer.source->size() - transfer.source_offset) {
                 throw std::invalid_argument("host-to-device pinned transfer is out of bounds");
             }
-            std::size_t copied = 0;
-            while (copied < transfer.bytes) {
-                const std::size_t slot = next_slot++ % pending.size();
-                finish(slot);
-                const std::size_t chunk = std::min(impl_->slot_bytes, transfer.bytes - copied);
-                std::memcpy(impl_->slots[slot].data(),
-                            transfer.source->data() + transfer.source_offset + copied, chunk);
-                CUDA_CHECK(cudaMemcpyAsync(static_cast<std::uint8_t*>(transfer.destination) + copied,
-                                           impl_->slots[slot].data(), chunk, cudaMemcpyHostToDevice,
-                                           stream));
-                CUDA_CHECK(cudaEventRecord(impl_->events[slot], stream));
-                pending[slot] = true;
-                copied += chunk;
+            if (have_run && contiguous(run, transfer)) {
+                run.bytes += transfer.bytes;
+                continue;
             }
+            if (have_run) { submit(run); }
+            run      = transfer;
+            have_run = true;
         }
-        for (std::size_t slot = 0; slot < pending.size(); ++slot) { finish(slot); }
+        if (have_run) { submit(run); }
+        rotate();
+        for (std::size_t index = 0; index < pending.size(); ++index) { finish(index); }
     } catch (...) {
         (void)cudaStreamSynchronize(stream);
         throw;

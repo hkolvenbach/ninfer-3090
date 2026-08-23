@@ -21,6 +21,10 @@ struct DeviceContext;
 
 namespace ninfer::targets::qwen3_8 {
 
+// Owned host payload of a decoded continuation image. Opaque here: the engine only moves it from
+// the thread that decoded it to the executor thread that imports it, and never inspects it.
+struct DecodedContinuation;
+
 enum class TextPhase {
     Prefill,
     Verify,
@@ -178,6 +182,10 @@ public:
     decode_batch(std::span<const std::uint32_t> lanes,
                  std::span<const runtime::RoundBudget> budgets);
     void resolve_prefill_lane(std::uint32_t lane, bool terminal);
+    // Complete a generating lane between rounds, retaining its session. Used when the KV pool
+    // cannot be grown to execute one more round, so the request ends at its current length
+    // instead of failing mid-stream.
+    void retire_lane(std::uint32_t lane);
     void resolve_pending_batch(std::span<const std::uint32_t> lanes,
                                std::span<const std::uint32_t> accepted_tokens,
                                std::span<const std::uint8_t> terminal,
@@ -203,10 +211,33 @@ public:
     [[nodiscard]] std::uint32_t
     preflight_continuation(const cache::ContinuationImage& image,
                            const PreparedPrompt& prompt) const noexcept;
-    [[nodiscard]] bool import_continuation_lane(std::uint32_t lane,
-                                                const cache::ContinuationImage& image,
-                                                const PreparedPrompt& prompt,
-                                                std::int32_t adapter) noexcept;
+    // Materialises the image as an owned host payload. This is the largest CPU term in a restore
+    // and needs no lane, no device and no CUDA call, so the engine may run it on a preparation
+    // thread concurrently with GPU execution. Throws on a malformed or incompatible image.
+    [[nodiscard]] std::shared_ptr<DecodedContinuation>
+    decode_continuation(const cache::ContinuationImage& image) const;
+    // Imports an already-decoded image into an empty lane. `decoded` must be the payload produced
+    // by decode_continuation() for this exact image; the caller binds the two by content identity.
+    // `entitlement` is the caller's planned KV allocation: the restored lane is reserved for it
+    // rather than for the bare frontier, so it does not have to grow on its first decode round.
+    // Returns ContinuationRestoreFailure::None on success; any other value names the step that
+    // refused and leaves the lane empty and the shared KV pool untouched.
+    [[nodiscard]] ContinuationRestoreFailure
+    import_continuation_lane(std::uint32_t lane, const cache::ContinuationImage& image,
+                             const DecodedContinuation& decoded, const PreparedPrompt& prompt,
+                             std::int32_t adapter, runtime::KvPageFootprint entitlement) noexcept;
+    // Whether the shared paged-KV pools can currently satisfy a reservation of this size. The
+    // engine uses this to choose a restore target before it disturbs any retained lane.
+    [[nodiscard]] bool kv_reservation_fits(std::uint32_t text_pages,
+                                           std::uint32_t backend_pages) const noexcept;
+    // Extend a running lane's KV entitlement so it can execute one more decode round, bounded by
+    // the ceiling its request was planned with. A request reserves a decode window at admission
+    // and acquires the rest of `max_tokens` through this call as it generates. False means the
+    // pool is full or the request has reached its ceiling; the lane is left untouched.
+    [[nodiscard]] bool try_grow_decode_headroom(std::uint32_t lane);
+    // Pages the pools would release if this retained lane were evicted.
+    [[nodiscard]] runtime::KvPageFootprint
+    retained_lane_kv_footprint(std::uint32_t lane) const noexcept;
     [[nodiscard]] std::uint32_t retained_lane_depth(std::uint32_t lane) const noexcept;
     // Stable identifier (FNV-1a 64 hex) of the lane's resident token ledger; empty unless the
     // lane holds a retained session.

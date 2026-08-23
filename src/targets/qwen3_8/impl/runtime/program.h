@@ -24,6 +24,7 @@
 #include <memory>
 #include <optional>
 #include <span>
+#include <set>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -50,12 +51,31 @@ enum class MtpBridgeMode : std::uint8_t {
 
 namespace ninfer::targets::qwen3_8::detail {
 
+// Output tokens reserved when a request is admitted. The rest of `max_tokens` is acquired per
+// round as it is actually generated.
+//
+// 4096 is chosen from the measured workload: agent turns generate a mean of 263 and a p90 of 331
+// tokens, so this covers all but the rarest turn outright, and it is the largest window at which
+// four p90-sized sessions still fit the 262144-token pool together
+// (4 x (58938 + 4096) = 252136). A larger window buys a stronger guarantee only by giving up a
+// concurrent lane at the sizes this engine actually sees.
+inline constexpr std::uint32_t kDecodeReservationWindow = 4096;
+
+// Tokens acquired per growth step once a lane passes its reserved window. Raising the entitlement
+// one round at a time would ask the pool for a new page every 64 tokens; 512 amortizes that
+// without holding a window a short turn would never reach.
+inline constexpr std::uint32_t kDecodeGrowthChunkTokens = 512;
+
 template <>
 struct RequestBasePlanImpl<NINFER_QWEN38_VARIANT> {
     runtime::RequestPlanSummary summary;
     ops::SamplingConfig sampling;
     std::uint32_t text_kv_page_entitlement    = 0;
     std::uint32_t backend_kv_page_entitlement = 0;
+    // The pages the lane may grow to, which is the prompt plus the whole effective output. The
+    // entitlement above is the bounded window actually reserved at admission.
+    std::uint32_t text_kv_page_ceiling        = 0;
+    std::uint32_t backend_kv_page_ceiling     = 0;
     std::shared_ptr<const qwen3_8::VisionControl> vision_control;
     std::size_t vision_transient_bytes = 0;
     std::optional<std::uint32_t> turn_rewrite_boundary;
@@ -86,6 +106,8 @@ struct RequestPlanImpl<NINFER_QWEN38_VARIANT> {
     std::int32_t adapter                      = -1;
     std::uint32_t text_kv_page_entitlement    = 0;
     std::uint32_t backend_kv_page_entitlement = 0;
+    std::uint32_t text_kv_page_ceiling        = 0;
+    std::uint32_t backend_kv_page_ceiling     = 0;
 };
 
 } // namespace ninfer::targets::qwen3_8::detail
@@ -231,6 +253,10 @@ struct RequestControl {
     ops::SamplingConfig sampling_host;
     GenerationTimings timings;
     SpeculativeStats speculative_stats;
+    // Upper bound for on-demand KV growth: the pages this request would have reserved outright
+    // before the decode window was bounded. Growth never goes past it.
+    std::uint32_t text_kv_page_ceiling    = 0;
+    std::uint32_t backend_kv_page_ceiling = 0;
 
     struct Prefill {
         PreparedPromptData prompt;
@@ -281,6 +307,9 @@ public:
     decode_batch(std::span<const std::uint32_t> lanes,
                  std::span<const runtime::RoundBudget> budgets);
     void resolve_prefill_lane(std::uint32_t lane, bool terminal);
+    // Complete a generating lane between rounds, retaining its session. Used when the KV pool
+    // cannot be grown to execute one more round.
+    void retire_lane(std::uint32_t lane);
     void resolve_pending_batch(std::span<const std::uint32_t> lanes,
                                std::span<const std::uint32_t> accepted_tokens,
                                std::span<const std::uint8_t> terminal,
@@ -302,10 +331,22 @@ public:
     [[nodiscard]] std::uint32_t
     preflight_continuation(const cache::ContinuationImage& image,
                            const PreparedPromptData& prompt) const noexcept;
-    [[nodiscard]] bool import_continuation_lane(std::uint32_t lane,
-                                                const cache::ContinuationImage& image,
-                                                const PreparedPromptData& prompt,
-                                                std::int32_t adapter) noexcept;
+    [[nodiscard]] std::set<std::string> continuation_segment_inventory(
+        bool boundary_valid, bool mtp_backend, bool dflash_backend) const;
+    [[nodiscard]] std::shared_ptr<DecodedContinuation>
+    decode_continuation(const cache::ContinuationImage& image) const;
+    [[nodiscard]] ContinuationRestoreFailure
+    import_continuation_lane(std::uint32_t lane, const cache::ContinuationImage& image,
+                             const DecodedContinuation& decoded, const PreparedPromptData& prompt,
+                             std::int32_t adapter, runtime::KvPageFootprint entitlement) noexcept;
+    [[nodiscard]] bool kv_reservation_fits(std::uint32_t text_pages,
+                                           std::uint32_t backend_pages) const noexcept;
+    // Raise the running lane's KV entitlement so it can execute one more decode round, up to
+    // the ceiling its request was planned with. Returns false, changing nothing, when the pool has
+    // no room or the request has reached its ceiling. Growth is idempotent and never shrinks.
+    [[nodiscard]] bool try_grow_decode_headroom(std::uint32_t lane);
+    [[nodiscard]] runtime::KvPageFootprint
+    retained_lane_kv_footprint(std::uint32_t lane) const noexcept;
     [[nodiscard]] std::uint32_t retained_lane_depth(std::uint32_t lane) const noexcept;
     [[nodiscard]] std::string retained_lane_digest(std::uint32_t lane) const;
     [[nodiscard]] std::vector<SlotCheckpoint>

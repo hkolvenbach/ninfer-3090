@@ -33,6 +33,22 @@ std::uint64_t unix_time_ms() {
         std::chrono::duration_cast<std::chrono::milliseconds>(now).count());
 }
 
+// Stable identity of a client routing key without reproducing the key itself, which is
+// client-authored text. FNV-1a 64 as 16 hex characters, the same encoding as a session digest.
+std::string routing_hint_digest(std::string_view value) {
+    std::uint64_t hash = 1469598103934665603ULL;
+    for (const char byte : value) {
+        hash ^= static_cast<std::uint8_t>(byte);
+        hash *= 1099511628211ULL;
+    }
+    std::string out(16, '0');
+    for (int index = 15; index >= 0; --index) {
+        out[static_cast<std::size_t>(index)] = "0123456789abcdef"[hash & 0xFULL];
+        hash >>= 4;
+    }
+    return out;
+}
+
 std::string new_server_instance_id() {
     const auto now    = std::chrono::system_clock::now().time_since_epoch();
     const auto micros = std::chrono::duration_cast<std::chrono::microseconds>(now).count();
@@ -215,6 +231,8 @@ Json request_json(const RequestLogContext& context) {
                 {"enable_thinking", context.enable_thinking},
                 {"preserve_thinking", context.preserve_thinking},
                 {"preserve_thinking_semantic_change", context.preserve_thinking_semantic_change},
+                {"adapter", context.adapter},
+                {"prompt_cache_key_digest", context.prompt_cache_key_digest},
                 {"sampling", sampler_json(context.sampling)}};
 }
 
@@ -239,6 +257,7 @@ Json continuation_json(const GenerationMetrics& metrics) {
     return Json{{"source", continuation_source_name(value.source)},
                 {"alias_kind", continuation_alias_kind_name(value.alias_kind)},
                 {"final_miss_reason", continuation_miss_reason_name(value.final_miss_reason)},
+                {"restore_failure", continuation_restore_failure_name(value.restore_failure)},
                 {"lookup_microseconds", value.lookup_microseconds},
                 {"preflight_microseconds", value.preflight_microseconds},
                 {"restore_microseconds", value.restore_microseconds},
@@ -319,6 +338,10 @@ RequestLogContext make_request_log_context(std::uint64_t id, std::string x_reque
     context.enable_thinking                    = prepared.enable_thinking;
     context.preserve_thinking                  = prepared.preserve_thinking;
     context.preserve_thinking_semantic_change  = prepared.preserve_thinking_semantic_change;
+    context.adapter                            = request.adapter;
+    context.prompt_cache_key_digest =
+        request.prompt_cache_routing_hint ? routing_hint_digest(*request.prompt_cache_routing_hint)
+                                          : std::string{};
     context.sampling                           = prepared.sampling;
     return context;
 }
@@ -357,6 +380,9 @@ std::string format_request_done(const RequestLogContext& context,
         << " cache=" << metrics.prefix_cache_hit_tokens
         << " reuse=" << prefix_reuse_path_name(metrics.prefix_reuse_path) << " ttft=" << std::fixed
         << std::setprecision(0) << ttft_ms << "ms"
+        << " queue=" << (metrics.queue_seconds * 1000.0) << "ms"
+        << " restore=" << (metrics.restore_seconds * 1000.0) << "ms"
+        << " publish=" << (metrics.publish_seconds * 1000.0) << "ms"
         << " prefill=" << rate(computed_prefill_tokens, metrics.prefill_seconds)
         << " decode=" << rate(decode_tokens, metrics.decode_seconds)
         << " wall=" << seconds_str(metrics.total_seconds)
@@ -364,6 +390,8 @@ std::string format_request_done(const RequestLogContext& context,
         << " cache_source=" << continuation_source_name(metrics.continuation.source)
         << " cache_alias=" << continuation_alias_kind_name(metrics.continuation.alias_kind)
         << " cache_miss=" << continuation_miss_reason_name(metrics.continuation.final_miss_reason)
+        << " cache_restore_failure="
+        << continuation_restore_failure_name(metrics.continuation.restore_failure)
         << " cache_lookup=" << std::setprecision(3)
         << static_cast<double>(metrics.continuation.lookup_microseconds) / 1000.0 << "ms"
         << " cache_preflight="
@@ -571,10 +599,17 @@ std::string format_request_done_json(const std::string& server_instance_id, std:
              {"prefix_cache_hit_tokens", outcome.metrics.prefix_cache_hit_tokens},
              {"prefix_reuse_path", prefix_reuse_path_name(outcome.metrics.prefix_reuse_path)},
              {"tool_call_count", outcome.tool_calls.size()}};
-    record["timings_seconds"] = Json{
-        {"prepare", outcome.metrics.prepare_seconds}, {"ttft", outcome.metrics.ttft_seconds},
-        {"vision", outcome.metrics.vision_seconds},   {"prefill", outcome.metrics.prefill_seconds},
-        {"decode", outcome.metrics.decode_seconds},   {"total", outcome.metrics.total_seconds}};
+    // queue + restore + prefill decompose the engine-side part of ttft. prepare and vision are
+    // frontend work that precedes submission.
+    record["timings_seconds"] = Json{{"prepare", outcome.metrics.prepare_seconds},
+                                     {"ttft", outcome.metrics.ttft_seconds},
+                                     {"vision", outcome.metrics.vision_seconds},
+                                     {"queue", outcome.metrics.queue_seconds},
+                                     {"restore", outcome.metrics.restore_seconds},
+                                     {"publish", outcome.metrics.publish_seconds},
+                                     {"prefill", outcome.metrics.prefill_seconds},
+                                     {"decode", outcome.metrics.decode_seconds},
+                                     {"total", outcome.metrics.total_seconds}};
     record["speculative"] = speculative_json(outcome.metrics);
     record["continuation_cache"] = continuation_json(outcome.metrics);
     return record.dump();
@@ -610,10 +645,17 @@ std::string format_throughput_json(const std::string& server_instance_id, std::u
                                       {"committed_decode", report.committed_decode_tokens}};
     record["throughput_tokens_per_second"] =
         Json{{"prefill", prefill_rate}, {"decode", decode_rate}};
-    record["scheduler"] = Json{{"running", report.scheduler.running_requests},
-                               {"prefilling", report.scheduler.prefilling_requests},
-                               {"decode_ready", report.scheduler.decode_ready_requests},
-                               {"waiting", report.scheduler.waiting_requests}};
+    record["scheduler"] = Json{
+        {"running", report.scheduler.running_requests},
+        {"prefilling", report.scheduler.prefilling_requests},
+        {"decode_ready", report.scheduler.decode_ready_requests},
+        {"waiting", report.scheduler.waiting_requests},
+        {"admitted_requests", report.scheduler.admitted_requests},
+        {"queue_seconds_total", report.scheduler.queue_seconds_total},
+        {"delta_admitted_requests", report.continuation_delta.admitted_requests},
+        {"delta_queue_seconds", report.continuation_delta.queue_seconds_total},
+        {"rejected_overloaded", report.scheduler.admission_rejected_overloaded},
+        {"rejected_queue_timeout", report.scheduler.admission_rejected_queue_timeout}};
     record["continuation_cache"] =
         Json{{"lookup_hits", report.scheduler.continuation_lookup_hits},
               {"lookup_misses", report.scheduler.continuation_lookup_misses},
@@ -754,6 +796,9 @@ std::string format_throughput_json(const std::string& server_instance_id, std::u
               {"l3_bytes", report.scheduler.continuation_l3_bytes},
               {"l1_evictions", report.scheduler.l1_evictions},
               {"l1_demotions", report.scheduler.l1_demotions},
+              {"kv_growth_attempts", report.scheduler.kv_growth_attempts},
+              {"kv_growth_forced_spills", report.scheduler.kv_growth_forced_spills},
+              {"kv_growth_curtailed", report.scheduler.kv_growth_curtailed},
               {"delta_l1_evictions", report.continuation_delta.l1_evictions},
               {"delta_l1_demotions", report.continuation_delta.l1_demotions}};
     record["continuation_cache"]["persistence_delta"] =

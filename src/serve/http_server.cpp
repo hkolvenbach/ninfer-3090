@@ -145,6 +145,7 @@ ThroughputReport make_throughput_report_impl(const ninfer::RuntimeStats& previou
     NINFER_DELTA(continuation_stable_prefix_restores);
     NINFER_DELTA(continuation_miss_disabled);
     NINFER_DELTA(continuation_miss_no_alias);
+    NINFER_DELTA(continuation_miss_not_attempted);
     NINFER_DELTA(continuation_miss_entry_unavailable_or_corrupt);
     NINFER_DELTA(continuation_miss_not_deeper);
     NINFER_DELTA(continuation_miss_preflight_rejected);
@@ -168,13 +169,32 @@ ThroughputReport make_throughput_report_impl(const ninfer::RuntimeStats& previou
     NINFER_DELTA(continuation_publication_successes);
     NINFER_DELTA(continuation_publication_failures);
     NINFER_DELTA(continuation_publication_superseded);
+    NINFER_DELTA(continuation_publication_coalesced);
+    NINFER_DELTA(continuation_publication_failed_capacity);
+    NINFER_DELTA(continuation_publication_failed_evicted);
+    NINFER_DELTA(continuation_publication_failed_alias_moved);
     NINFER_DELTA(continuation_persistence_queued);
     NINFER_DELTA(continuation_persistence_coalesced);
     NINFER_DELTA(continuation_persistence_successes);
     NINFER_DELTA(continuation_persistence_failures);
     NINFER_DELTA(l1_evictions);
     NINFER_DELTA(l1_demotions);
+    NINFER_DELTA(kv_growth_attempts);
+    NINFER_DELTA(kv_growth_forced_spills);
+    NINFER_DELTA(kv_growth_curtailed);
+    NINFER_DELTA(continuation_restore_failed_kv_reservation);
+    NINFER_DELTA(continuation_restore_failed_verify_depth);
+    NINFER_DELTA(continuation_restore_failed_inventory);
+    NINFER_DELTA(continuation_restore_failed_metadata);
+    NINFER_DELTA(continuation_restore_failed_decode);
+    NINFER_DELTA(continuation_restore_failed_lane);
+    NINFER_DELTA(admission_rejected_overloaded);
+    NINFER_DELTA(admission_rejected_queue_timeout);
+    NINFER_DELTA(admitted_requests);
 #undef NINFER_DELTA
+    delta.queue_seconds_total = current.queue_seconds_total >= previous.queue_seconds_total
+                                    ? current.queue_seconds_total - previous.queue_seconds_total
+                                    : current.queue_seconds_total;
     delta.continuation_restore_successes = delta.continuation_l1_restore_successes +
                                              delta.continuation_l2_restore_successes +
                                              delta.continuation_l3_restore_successes;
@@ -210,6 +230,9 @@ bool report_has_activity_impl(const ThroughputReport& report) noexcept {
             delta.continuation_preflight_rejections != 0 ||
             delta.continuation_restore_failures != 0 ||
             delta.continuation_miss_disabled != 0 || delta.continuation_miss_no_alias != 0 ||
+            delta.continuation_miss_not_attempted != 0 || delta.admitted_requests != 0 ||
+            delta.admission_rejected_overloaded != 0 ||
+            delta.admission_rejected_queue_timeout != 0 ||
             delta.continuation_miss_entry_unavailable_or_corrupt != 0 ||
             delta.continuation_miss_not_deeper != 0 ||
             delta.continuation_miss_preflight_rejected != 0 ||
@@ -230,7 +253,8 @@ bool report_has_activity_impl(const ThroughputReport& report) noexcept {
             delta.continuation_persistence_coalesced != 0 ||
             delta.continuation_persistence_successes != 0 ||
             delta.continuation_persistence_failures != 0 || delta.l1_evictions != 0 ||
-            delta.l1_demotions != 0;
+            delta.l1_demotions != 0 || delta.kv_growth_forced_spills != 0 ||
+            delta.kv_growth_curtailed != 0;
 }
 
 std::string_view unstreamed_content(const GenerationOutcome& outcome) {

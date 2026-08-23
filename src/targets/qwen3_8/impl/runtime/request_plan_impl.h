@@ -99,17 +99,30 @@ ProgramImplCore::plan_request_base(const PreparedPromptData& prompt,
     base->sampling                       = translate_sampling(options.sampling);
     base->adapter                        = options.adapter;
     base->allow_prefix_reuse             = options.allow_prefix_reuse;
+    // A lane reserves its prompt plus a bounded decode window, not the client's whole output
+    // request. `max_tokens` is a limit; reserving it was a promise to hold pages for tokens that
+    // do not exist yet, and a client asking for 32k on a 59k prompt made four lanes need 364k
+    // pages against a 262k pool. Tokens beyond the window are acquired per round by
+    // try_grow_decode_headroom, whose ceiling is this same full extent, so the entitlement can
+    // never exceed what the unconditional reservation would have taken.
+    const std::uint32_t full_output_tokens = base->summary.effective_output_tokens == 0
+                                                 ? 0U
+                                                 : base->summary.effective_output_tokens - 1U;
     const std::uint32_t reserved_context_tokens =
-        base->summary.prompt_tokens + (base->summary.effective_output_tokens == 0
-                                           ? 0U
-                                           : base->summary.effective_output_tokens - 1U);
+        base->summary.prompt_tokens + std::min(full_output_tokens, kDecodeReservationWindow);
+    const std::uint32_t ceiling_context_tokens = base->summary.prompt_tokens + full_output_tokens;
     base->text_kv_page_entitlement = pages_for_tokens(reserved_context_tokens);
+    base->text_kv_page_ceiling     = pages_for_tokens(ceiling_context_tokens);
+    const auto mtp_extent          = [&](std::uint32_t context_tokens) {
+        return static_cast<std::uint32_t>(std::min<std::uint64_t>(
+            capacity, static_cast<std::uint64_t>(context_tokens) + draft_window - 1ULL));
+    };
     if (speculative_backend == SpeculativeBackend::Mtp) {
-        const std::uint32_t mtp_tokens    = static_cast<std::uint32_t>(std::min<std::uint64_t>(
-            capacity, static_cast<std::uint64_t>(reserved_context_tokens) + draft_window - 1ULL));
-        base->backend_kv_page_entitlement = pages_for_tokens(mtp_tokens);
+        base->backend_kv_page_entitlement = pages_for_tokens(mtp_extent(reserved_context_tokens));
+        base->backend_kv_page_ceiling     = pages_for_tokens(mtp_extent(ceiling_context_tokens));
     } else if (speculative_backend == SpeculativeBackend::DFlash) {
         base->backend_kv_page_entitlement = pages_for_tokens(reserved_context_tokens);
+        base->backend_kv_page_ceiling     = pages_for_tokens(ceiling_context_tokens);
     }
     base->summary.admission = runtime::AdmissionResources{
         .active_lanes     = 1,
@@ -213,6 +226,8 @@ RequestPlan ProgramImplCore::plan_request_for_lane(std::uint32_t lane,
     plan->sampling                    = base.sampling;
     plan->text_kv_page_entitlement    = base.text_kv_page_entitlement;
     plan->backend_kv_page_entitlement = base.backend_kv_page_entitlement;
+    plan->text_kv_page_ceiling        = base.text_kv_page_ceiling;
+    plan->backend_kv_page_ceiling     = base.backend_kv_page_ceiling;
     plan->adapter                     = base.adapter;
 
     // A resident prefix produced under a different adapter is not reusable: its KV and GDN

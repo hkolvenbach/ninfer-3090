@@ -26,6 +26,11 @@ struct GenerationMetrics {
     double prepare_seconds = 0.0;
     double ttft_seconds    = 0.0;
     double vision_seconds  = 0.0;
+    // Engine-side wait between submission and admission, and the continuation import that
+    // followed it. Together with prefill they decompose TTFT into queueing, restore, and compute.
+    double queue_seconds   = 0.0;
+    double restore_seconds = 0.0;
+    double publish_seconds = 0.0;
     double prefill_seconds = 0.0;
     double decode_seconds  = 0.0;
     double total_seconds   = 0.0;

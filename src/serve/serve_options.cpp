@@ -109,7 +109,8 @@ std::string serve_usage_text(const char* argv0) {
            " <model.ninfer> [--host H] [--port N] [--api-key KEY] "
            "[--model-id ID] [--max-context N] [--kv-capacity N|auto] [--max-concurrency N] "
            "[--max-pending-requests N] [--pending-timeout-ms N] "
-           "[--prefill-chunk N] [--turn-checkpoints N] [--log-stats-interval-ms N] [--device N] "
+           "[--prefill-chunk N] [--prefill-decode-balance F] [--turn-checkpoints N] "
+           "[--log-stats-interval-ms N] [--device N] "
            "[--max-request-mib N] [--request-log-jsonl FILE] [--slot-save-path DIR] "
            "[--auto-save-evicted] "
            "[--response-store-max-records N] [--response-store-max-mib N] "
@@ -233,6 +234,9 @@ ServeOptions parse_serve_options(int argc, char** argv) {
         } else if (arg == "--prefill-chunk") {
             options.prefill_chunk = static_cast<std::uint32_t>(
                 parse_nonnegative_int(require_value("--prefill-chunk"), "prefill-chunk"));
+        } else if (arg == "--prefill-decode-balance") {
+            options.prefill_decode_balance = parse_float_in(
+                require_value("--prefill-decode-balance"), "prefill-decode-balance", 0.0f, 8.0f);
         } else if (arg == "--turn-checkpoints") {
             options.turn_checkpoint_ring = static_cast<std::uint32_t>(
                 parse_nonnegative_int(require_value("--turn-checkpoints"), "turn-checkpoints"));

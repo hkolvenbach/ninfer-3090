@@ -91,6 +91,12 @@ std::string ServeMetrics::render(std::uint32_t max_concurrency,
                    live.continuation_lookup_misses);
     append_counter(out, "ninfer:continuation_preflight_rejections_total",
                    live.continuation_preflight_rejections);
+    append_counter(out, "ninfer:continuation_preparation_hits_total",
+                   live.continuation_preparation_hits);
+    append_counter(out, "ninfer:continuation_preparation_decoded_total",
+                   live.continuation_preparation_decoded);
+    append_counter(out, "ninfer:continuation_preparation_inline_total",
+                   live.continuation_preparation_inline);
     append_counter(out, "ninfer:continuation_restore_successes_total",
                    live.continuation_restore_successes);
     append_counter(out, "ninfer:continuation_restore_failures_total",
@@ -101,6 +107,14 @@ std::string ServeMetrics::render(std::uint32_t max_concurrency,
                    live.continuation_publication_failures);
     append_counter(out, "ninfer:continuation_publication_superseded_total",
                    live.continuation_publication_superseded);
+    append_counter(out, "ninfer:continuation_publication_coalesced_total",
+                   live.continuation_publication_coalesced);
+    append_counter(out, "ninfer:continuation_publication_failed_capacity_total",
+                   live.continuation_publication_failed_capacity);
+    append_counter(out, "ninfer:continuation_publication_failed_evicted_total",
+                   live.continuation_publication_failed_evicted);
+    append_counter(out, "ninfer:continuation_publication_failed_alias_moved_total",
+                   live.continuation_publication_failed_alias_moved);
     append_counter(out, "ninfer:continuation_restored_tokens_total",
                    live.continuation_restored_tokens);
     append_counter(out, "ninfer:continuation_restored_bytes_total",
@@ -131,6 +145,8 @@ std::string ServeMetrics::render(std::uint32_t max_concurrency,
                    live.continuation_miss_disabled);
     append_counter(out, "ninfer:continuation_miss_no_alias_total",
                    live.continuation_miss_no_alias);
+    append_counter(out, "ninfer:continuation_miss_not_attempted_total",
+                   live.continuation_miss_not_attempted);
     append_counter(out, "ninfer:continuation_miss_entry_unavailable_or_corrupt_total",
                    live.continuation_miss_entry_unavailable_or_corrupt);
     append_counter(out, "ninfer:continuation_miss_not_deeper_total",
@@ -143,6 +159,42 @@ std::string ServeMetrics::render(std::uint32_t max_concurrency,
                    live.continuation_miss_no_lane);
     append_counter(out, "ninfer:continuation_miss_restore_failed_total",
                    live.continuation_miss_restore_failed);
+    // Restore-failure attribution: these sum to continuation_restore_failures_total.
+    append_counter(out, "ninfer:continuation_restore_failed_kv_reservation_total",
+                   live.continuation_restore_failed_kv_reservation);
+    append_counter(out, "ninfer:continuation_restore_failed_verify_depth_total",
+                   live.continuation_restore_failed_verify_depth);
+    append_counter(out, "ninfer:continuation_restore_failed_inventory_total",
+                   live.continuation_restore_failed_inventory);
+    append_counter(out, "ninfer:continuation_restore_failed_metadata_total",
+                   live.continuation_restore_failed_metadata);
+    append_counter(out, "ninfer:continuation_restore_failed_decode_total",
+                   live.continuation_restore_failed_decode);
+    append_counter(out, "ninfer:continuation_restore_failed_lane_total",
+                   live.continuation_restore_failed_lane);
+    // Ingress refusals and the admission delay that dominates TTFT under concurrency.
+    append_counter(out, "ninfer:admission_rejected_overloaded_total",
+                   live.admission_rejected_overloaded);
+    append_counter(out, "ninfer:admission_rejected_queue_timeout_total",
+                   live.admission_rejected_queue_timeout);
+    append_counter(out, "ninfer:admitted_requests_total", live.admitted_requests);
+    append_counter(out, "ninfer:queue_seconds_total", live.queue_seconds_total);
+    // Execution-thread wall clock. These units are mutually exclusive: their ratio decides how
+    // much of a decoding lane's time is spent waiting on another lane's prompt.
+    append_counter(out, "ninfer:worker_decode_seconds_total", live.worker_decode_seconds);
+    append_counter(out, "ninfer:worker_prefill_seconds_total", live.worker_prefill_seconds);
+    append_counter(out, "ninfer:worker_admission_seconds_total", live.worker_admission_seconds);
+    append_counter(out, "ninfer:worker_admission_calls_total", live.worker_admission_calls);
+    append_counter(out, "ninfer:worker_admission_plan_seconds_total",
+                   live.worker_admission_plan_seconds);
+    append_counter(out, "ninfer:worker_admission_restore_seconds_total",
+                   live.worker_admission_restore_seconds);
+    append_counter(out, "ninfer:worker_admission_commit_seconds_total",
+                   live.worker_admission_commit_seconds);
+    append_counter(out, "ninfer:worker_publish_seconds_total", live.worker_publish_seconds);
+    append_counter(out, "ninfer:worker_upkeep_seconds_total", live.worker_upkeep_seconds);
+    append_counter(out, "ninfer:worker_decode_rounds_total", live.worker_decode_rounds);
+    append_counter(out, "ninfer:worker_prefill_steps_total", live.worker_prefill_steps);
     append_counter(out, "ninfer:continuation_l2_lookup_microseconds_total",
                    live.continuation_l2_lookup_microseconds);
     append_counter(out, "ninfer:continuation_l2_lookup_operations_total",
@@ -187,6 +239,9 @@ std::string ServeMetrics::render(std::uint32_t max_concurrency,
     append_counter(out, "ninfer:continuation_l3_bytes", live.continuation_l3_bytes);
     append_counter(out, "ninfer:l1_evictions_total", live.l1_evictions);
     append_counter(out, "ninfer:l1_demotions_total", live.l1_demotions);
+    append_counter(out, "ninfer:kv_growth_attempts_total", live.kv_growth_attempts);
+    append_counter(out, "ninfer:kv_growth_forced_spills_total", live.kv_growth_forced_spills);
+    append_counter(out, "ninfer:kv_growth_curtailed_total", live.kv_growth_curtailed);
     append_counter(out, "ninfer:l1_resident_entries",
                    static_cast<std::uint64_t>(live.l1_resident_entries));
     append_counter(out, "ninfer:l1_resident_bytes", live.l1_resident_bytes);

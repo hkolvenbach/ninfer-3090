@@ -42,17 +42,20 @@ inline LaneContinuationProvenance completion_publication_provenance(
     return current;
 }
 
+// Higher wins. NotAttempted and NoAlias sit at the bottom because they are the two starting
+// states: any concrete observation about a candidate is more informative than either.
 inline int continuation_miss_reason_priority(ContinuationMissReason reason) noexcept {
     switch (reason) {
     case ContinuationMissReason::None: return 0;
     case ContinuationMissReason::NoAlias: return 1;
-    case ContinuationMissReason::NotDeeper: return 2;
-    case ContinuationMissReason::EntryUnavailableOrCorrupt: return 3;
-    case ContinuationMissReason::PreflightRejected: return 4;
-    case ContinuationMissReason::RollbackConflict: return 5;
-    case ContinuationMissReason::RestoreFailed: return 6;
-    case ContinuationMissReason::NoLane: return 7;
-    case ContinuationMissReason::Disabled: return 8;
+    case ContinuationMissReason::NotAttempted: return 2;
+    case ContinuationMissReason::NotDeeper: return 3;
+    case ContinuationMissReason::EntryUnavailableOrCorrupt: return 4;
+    case ContinuationMissReason::PreflightRejected: return 5;
+    case ContinuationMissReason::RollbackConflict: return 6;
+    case ContinuationMissReason::RestoreFailed: return 7;
+    case ContinuationMissReason::NoLane: return 8;
+    case ContinuationMissReason::Disabled: return 9;
     }
     return 0;
 }
