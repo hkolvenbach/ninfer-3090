@@ -1,0 +1,115 @@
+.chart {
+  margin: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+}
+
+.chart figcaption {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 10px;
+}
+
+.chart__caption {
+  color: var(--dim);
+  font-size: 9px;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+
+.legend {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 9px;
+  color: var(--muted);
+  font-size: 9px;
+}
+
+.legend__item {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+}
+
+.legend i {
+  width: 7px;
+  height: 3px;
+  border-radius: 2px;
+}
+
+.stacked-bar {
+  display: flex;
+  width: 100%;
+  overflow: hidden;
+  border-radius: 2px;
+  background: var(--line-soft);
+}
+
+/* The tooltip trigger is the flex child, so it carries the segment's width as an inline style. */
+.stacked-bar__segment {
+  display: flex;
+  flex: 0 0 auto;
+  height: 100%;
+  min-width: 0;
+}
+
+.stacked-bar__segment > span {
+  width: 100%;
+  height: 100%;
+  transition: filter 120ms ease-out;
+}
+
+.stacked-bar__segment:hover > span,
+.stacked-bar__segment:focus-visible > span {
+  filter: brightness(1.35);
+}
+
+/* Rows inside ECharts tooltips, which are raw HTML strings rather than React. */
+.tiphead {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 10px;
+  margin-bottom: 5px;
+  color: var(--text);
+  font-variant-numeric: tabular-nums;
+}
+
+.tiphead em {
+  color: var(--dim);
+  font-style: normal;
+}
+
+.tipline {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  line-height: 1.7;
+}
+
+.tipline i {
+  width: 7px;
+  height: 3px;
+  border-radius: 2px;
+}
+
+.tipline span {
+  color: var(--muted);
+}
+
+.tipline b {
+  margin-left: auto;
+  padding-left: 12px;
+  color: var(--text);
+  font-weight: 500;
+  font-variant-numeric: tabular-nums;
+}
+
+.tipnote {
+  margin-top: 5px;
+  color: var(--dim);
+  font-size: 9px;
+  line-height: 1.45;
+}

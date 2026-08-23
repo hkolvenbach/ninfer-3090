@@ -28,6 +28,7 @@ struct ServeOptions {
     std::optional<std::string> model_id_override; // unset => artifact identity.model_id
     std::string request_log_jsonl;                // empty => structured request logging disabled
     std::string slot_save_path;                   // empty => /slots save/restore/erase disabled
+    std::string web_dir; // empty => the built dashboard is not served from this process
     std::uint32_t max_context              = 8192;
     KvCapacityPolicy kv_capacity           = KvCapacityPolicy::explicit_capacity(8192);
     std::uint32_t max_concurrency          = 1;

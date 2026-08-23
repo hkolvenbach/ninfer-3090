@@ -1,0 +1,303 @@
+.panel {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  padding: 10px 12px 12px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  background: var(--panel);
+}
+
+.panel__header {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 10px;
+  margin-bottom: 10px;
+}
+
+.panel__header h2 {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  color: var(--text);
+  text-transform: uppercase;
+}
+
+.panel__note {
+  color: var(--dim);
+  font-size: 10px;
+  text-align: right;
+}
+
+.eyebrow {
+  color: var(--dim);
+  font-size: 9px;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+
+/* Metric readout: a large value with a unit and caption underneath. */
+.stat {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+}
+
+.stat__value {
+  color: var(--text);
+  font-size: 19px;
+  font-variant-numeric: tabular-nums;
+  line-height: 1.05;
+  white-space: nowrap;
+}
+
+.stat__value span {
+  margin-left: 3px;
+  color: var(--dim);
+  font-size: 10px;
+}
+
+.stat__label {
+  color: var(--muted);
+  font-size: 9px;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+}
+
+.stat--accent .stat__value {
+  color: var(--accent);
+}
+.stat--warning .stat__value {
+  color: var(--warning);
+}
+.stat--danger .stat__value {
+  color: var(--danger);
+}
+
+.stat-row {
+  display: grid;
+  gap: 10px;
+  grid-template-columns: repeat(auto-fit, minmax(84px, 1fr));
+}
+
+.pill {
+  display: inline-flex;
+  align-items: center;
+  height: 17px;
+  padding: 0 6px;
+  border: 1px solid var(--line);
+  border-radius: 9px;
+  color: var(--muted);
+  font-size: 9px;
+  letter-spacing: 0.05em;
+  text-transform: uppercase;
+  white-space: nowrap;
+}
+
+.pill--ok {
+  border-color: #2f6a55;
+  color: var(--accent);
+}
+.pill--warn {
+  border-color: #6b5a2c;
+  color: var(--warning);
+}
+.pill--error {
+  border-color: #6c353a;
+  color: var(--danger);
+}
+
+.status-dot {
+  display: inline-block;
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--dim);
+}
+
+.status-dot--ok {
+  background: var(--accent);
+  box-shadow: 0 0 0 2px rgba(97, 219, 172, 0.12);
+}
+.status-dot--warn {
+  background: var(--warning);
+  box-shadow: 0 0 0 2px rgba(233, 189, 91, 0.12);
+}
+.status-dot--error {
+  background: var(--danger);
+  box-shadow: 0 0 0 2px rgba(243, 91, 100, 0.12);
+}
+
+/* Horizontal fill bar used for every capacity/occupancy reading. */
+.meter {
+  display: block;
+  width: 100%;
+  height: 5px;
+  overflow: hidden;
+  border-radius: 3px;
+  background: var(--line-soft);
+}
+
+.meter > span {
+  display: block;
+  height: 100%;
+  border-radius: 3px;
+  transition: width 240ms ease-out;
+}
+
+.button {
+  height: 24px;
+  padding: 0 9px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  background: transparent;
+  color: var(--muted);
+  font: inherit;
+  font-size: 10px;
+  cursor: pointer;
+}
+
+.button:hover:not(:disabled) {
+  border-color: var(--muted);
+  color: var(--text);
+}
+
+.button:disabled {
+  cursor: default;
+  opacity: 0.4;
+}
+
+.table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 10px;
+  font-variant-numeric: tabular-nums;
+}
+
+.table th {
+  padding: 0 6px 5px 0;
+  color: var(--dim);
+  font-weight: 500;
+  letter-spacing: 0.05em;
+  text-align: left;
+  text-transform: uppercase;
+}
+
+.table td {
+  padding: 3px 6px 3px 0;
+  border-top: 1px solid var(--line-soft);
+  color: var(--muted);
+  white-space: nowrap;
+}
+
+.table td.numeric,
+.table th.numeric {
+  text-align: right;
+}
+
+.table td.emphasis {
+  color: var(--text);
+}
+
+.empty {
+  padding: 14px 0;
+  color: var(--dim);
+  font-size: 10px;
+  text-align: center;
+}
+
+/* Explanatory tooltips. The trigger stays inline so it can wrap with surrounding text. */
+.tip {
+  cursor: help;
+  outline: none;
+}
+
+.tip:focus-visible {
+  border-radius: 2px;
+  outline: 1px solid var(--accent);
+  outline-offset: 2px;
+}
+
+/* Terms are marked with a dotted rule rather than colour, which is reserved for severity. */
+.tip--term {
+  border-bottom: 1px dotted var(--line);
+  text-decoration: none;
+}
+
+.tip--term:hover {
+  border-bottom-color: var(--muted);
+  color: var(--text);
+}
+
+.tip--info > span {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 11px;
+  height: 11px;
+  border: 1px solid var(--line);
+  border-radius: 50%;
+  color: var(--dim);
+  font-size: 8px;
+  line-height: 1;
+}
+
+.tip--info:hover > span {
+  border-color: var(--muted);
+  color: var(--muted);
+}
+
+.tip__bubble {
+  position: fixed;
+  z-index: 60;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  max-width: 320px;
+  padding: 8px 10px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  background: rgba(8, 10, 11, 0.97);
+  box-shadow: 0 8px 26px rgba(0, 0, 0, 0.6);
+  color: var(--muted);
+  font-size: 10px;
+  line-height: 1.5;
+  text-transform: none;
+  letter-spacing: 0;
+  pointer-events: none;
+}
+
+.tip__bubble strong {
+  color: var(--text);
+  font-weight: 500;
+}
+
+/* First paint happens off-screen so the bubble can be measured before it is placed. */
+.tip__bubble--measuring {
+  left: -9999px;
+  top: -9999px;
+  opacity: 0;
+}
+
+.tip__bubble--top,
+.tip__bubble--bottom {
+  animation: tip-in 90ms ease-out;
+}
+
+@keyframes tip-in {
+  from {
+    opacity: 0;
+  }
+  to {
+    opacity: 1;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .tip__bubble--top,
+  .tip__bubble--bottom {
+    animation: none;
+  }
+}

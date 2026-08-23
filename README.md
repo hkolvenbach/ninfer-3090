@@ -38,6 +38,15 @@ The work specific to this branch, each with the measurement that established it:
   disk save/restore, `GET /metrics` under llama.cpp-compatible names, and a llama.cpp-compatible
   `timings` block so proxies read per-request prefill, decode, and draft-acceptance rates.
   [Details](#what-this-fork-changes)
+- **Built-in web dashboard.** The Docker image builds it and serves it from the same port as the
+  API, so `http://127.0.0.1:8080/` is a live view of the engine with nothing else to run. Two
+  endpoints added for it — `GET /telemetry` for levels and `GET /events` for the record stream —
+  drive aggregate and per-sequence throughput, decode batch size, lane occupancy and queue depth,
+  the execution thread's wall-clock split, TTFT decomposition, continuation-cache fill against
+  configured capacity, per-adapter usage, NVML board telemetry, and the VRAM budget. Every reading
+  carries a tooltip explaining what it measures and what it means when it moves. The same page
+  replays a `--request-log-jsonl` file offline, and says so where a panel is live-only rather than
+  drawing zeros. [Guide](docs/dashboard.md)
 - **Runtime LoRA adapters.** Up to eight externally trained QLoRA adapters are banked beside the
   base artifact and selected per request by model id, so one process serves the base weights and
   every adapter at once and mixes them inside a single decode batch. A resident but unselected bank
@@ -195,7 +204,9 @@ is embedded in the resulting image.
 docker build --tag ninfer-4090:sm89 .
 ```
 
-Then start one of the three profiles. The API is available at `http://127.0.0.1:8080/v1`.
+Then start one of the three profiles. The API is available at `http://127.0.0.1:8080/v1`, and the
+[web dashboard](docs/dashboard.md) at `http://127.0.0.1:8080/` — the image builds it and every
+profile below serves it, so no separate process or port is involved.
 
 The profiles as written run one generation slot. `--max-concurrency 2` is measured
 and worthwhile on the 4090: the second lane costs about 390 MiB (state pools plus a
@@ -506,6 +517,15 @@ The default build registers only Qwen3.8-27B. Enable the optional Qwen3.6-35B-A3
   slots report their request's prompt and reused-prefix sizes, idle retained slots report the
   resident session's depth and its identifying `session_digest`. Truthful per-slot attribution
   holds at any `--max-concurrency`.
+- **`GET /telemetry` and `GET /events`.** One live JSON snapshot carrying what `/metrics` cannot
+  express — NVML board sensors and decoded clock-throttle reasons, the scheduler's own
+  running/prefilling/decode-ready/waiting occupancy, the execution thread's wall-clock split with
+  its admission decomposition, the `MemorySummary` VRAM budget including the resident LoRA bank,
+  cache occupancy paired with the configured tier capacities, and the registered adapter
+  inventory — plus an SSE stream of the same schema-15 records
+  `--request-log-jsonl` appends. Records are formatted once and fanned out to both sinks, so a
+  live reader and a file reader see identical lines. These back the
+  [web dashboard](docs/dashboard.md).
 - **Configurable vision scratchpad (ported).** `--vision-max-tokens` comes from the
   [UDPSendToFailed fork](https://github.com/UDPSendToFailed/ninfer-4090) and sizes the vision
   encode workspace (default 8192 tokens, formerly hardcoded 32768). This fork additionally wires

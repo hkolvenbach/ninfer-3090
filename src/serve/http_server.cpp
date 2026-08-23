@@ -14,21 +14,98 @@
 #include <chrono>
 #include <cstdio>
 #include <exception>
+#include <filesystem>
+#include <fstream>
 #include <memory>
 #include <mutex>
 #include <optional>
+#include <sstream>
 #include <stdexcept>
 #include <string>
 #include <string_view>
 #include <utility>
+#include <vector>
 
 namespace ninfer::serve {
 namespace {
+
+// Records retained for replay to a newly connected /events reader. At the default 5s reporting
+// interval this is roughly the last forty minutes of throughput samples interleaved with the
+// request records from the same window - enough for a dashboard opened mid-run to draw a
+// populated chart immediately rather than starting blank.
+constexpr std::size_t kEventReplayCapacity = 512;
+
+// SSE keepalive period. Also bounds how long a writer blocks before re-testing that its socket is
+// still writable, which is how a closed browser tab is noticed on an idle server.
+constexpr std::chrono::milliseconds kEventKeepalive{15000};
 
 std::string format_seconds(double seconds) {
     char text[32];
     std::snprintf(text, sizeof(text), "%.2f", seconds);
     return text;
+}
+
+nlohmann::json arena_json(const ninfer::ArenaMemorySummary& arena) {
+    return {{"capacity_bytes", arena.capacity_bytes},
+            {"used_bytes", arena.used_bytes},
+            {"peak_used_bytes", arena.peak_used_bytes}};
+}
+
+nlohmann::json gpu_json(const GpuTelemetry& gpu) {
+    if (!gpu.available) { return {{"available", false}, {"error", gpu.error}}; }
+    return {{"available", true},
+            {"name", gpu.name},
+            {"uuid", gpu.uuid},
+            {"driver_version", gpu.driver_version},
+            {"temperature_c", gpu.temperature_c},
+            {"fan_percent", gpu.fan_percent},
+            {"power_watts", gpu.power_watts},
+            {"power_limit_watts", gpu.power_limit_watts},
+            {"utilization_gpu_percent", gpu.utilization_gpu_percent},
+            {"utilization_memory_percent", gpu.utilization_memory_percent},
+            {"sm_clock_mhz", gpu.sm_clock_mhz},
+            {"sm_clock_max_mhz", gpu.sm_clock_max_mhz},
+            {"memory_clock_mhz", gpu.memory_clock_mhz},
+            {"memory_used_bytes", gpu.memory_used_bytes},
+            {"memory_total_bytes", gpu.memory_total_bytes},
+            {"pcie_rx_bytes_per_second", gpu.pcie_rx_bytes_per_second},
+            {"pcie_tx_bytes_per_second", gpu.pcie_tx_bytes_per_second},
+            {"throttle_reasons", gpu.throttle_reasons}};
+}
+
+// One SSE frame carrying a complete schema-14 record. The record's own `event` field names the
+// frame so a browser can attach one listener per record type.
+std::string event_frame(std::string_view event, std::string_view payload) {
+    std::string frame;
+    frame.reserve(payload.size() + event.size() + 16);
+    frame += "event: ";
+    frame += event;
+    frame += "\ndata: ";
+    frame += payload;
+    frame += "\n\n";
+    return frame;
+}
+
+// Paths owned by the API. Everything else, under --web-dir, belongs to the dashboard's own
+// client-side router and resolves to the application shell.
+bool is_api_path(const std::string& path) {
+    static constexpr std::string_view kPrefixes[] = {"/v1/",     "/slots",     "/metrics",
+                                                     "/health",  "/telemetry", "/events"};
+    for (const std::string_view prefix : kPrefixes) {
+        if (path.rfind(prefix, 0) == 0) { return true; }
+    }
+    return false;
+}
+
+std::string_view record_event_name(const std::string& record) {
+    // The formatters emit sorted keys, so `"event":"<name>"` is a stable substring. Parsing the
+    // whole record again only to recover its type would double the cost of every frame.
+    const std::size_t key = record.find("\"event\":\"");
+    if (key == std::string::npos) { return "message"; }
+    const std::size_t begin = key + 9;
+    const std::size_t end   = record.find('"', begin);
+    if (end == std::string::npos) { return "message"; }
+    return std::string_view(record).substr(begin, end - begin);
 }
 
 struct StreamingRequest {
@@ -279,7 +356,8 @@ bool throughput_report_has_activity(const ThroughputReport& report) noexcept {
 HttpServer::HttpServer(ServeOptions options)
     : options_(std::move(options)),
       response_store_(options_.response_store_max_records, options_.response_store_max_bytes),
-      request_jsonl_(options_.request_log_jsonl, options_.artifact_path) {
+      events_(options_.request_log_jsonl, options_.artifact_path, kEventReplayCapacity),
+      gpu_(options_.device) {
     const std::size_t queued_requests =
         static_cast<std::size_t>(options_.max_concurrency) + options_.max_pending_requests;
     const std::size_t worker_count = queued_requests + 1;
@@ -296,27 +374,27 @@ void HttpServer::log_line(const std::string& line) {
 
 void HttpServer::log_request_start(const RequestLogContext& context) {
     log_line(format_request_start(context));
-    request_jsonl_.write_request_start(context);
+    events_.emit_request_start(context);
     metrics_.begin_request(context.id, context.prompt_tokens);
 }
 
 void HttpServer::log_request_done(const RequestLogContext& context,
                                   const GenerationOutcome& outcome) {
     log_line(format_request_done(context, outcome));
-    request_jsonl_.write_request_done(context, outcome);
+    events_.emit_request_done(context, outcome);
     metrics_.end_request(context.id);
     metrics_.record(outcome);
 }
 
 void HttpServer::log_request_error(const RequestLogContext& context, const std::string& message) {
     log_line(format_request_error(context, message));
-    request_jsonl_.write_request_error(context, message);
+    events_.emit_request_error(context, message);
     metrics_.end_request(context.id);
 }
 
 void HttpServer::log_throughput(const ThroughputReport& report) {
     log_line(format_throughput(report));
-    request_jsonl_.write_throughput(report);
+    events_.emit_throughput(report);
 }
 
 void HttpServer::run_stats_reporter() {
@@ -360,8 +438,23 @@ void HttpServer::stop_stats_reporter() {
 }
 
 void HttpServer::register_routes() {
-    server_.set_error_handler([](const httplib::Request& req, httplib::Response& res) {
+    server_.set_error_handler([this](const httplib::Request& req, httplib::Response& res) {
         ensure_request_id(res);
+        // Single-page dashboard fallback. Registered API routes are matched before mount points,
+        // so a 404 on a GET that is not an API path is a client-side route: serve the shell and
+        // let the app resolve it. Reached only when --web-dir is configured.
+        if (res.status == 404 && req.method == "GET" && !options_.web_dir.empty() &&
+            !is_api_path(req.path)) {
+            std::ifstream shell(std::filesystem::path(options_.web_dir) / "index.html",
+                                std::ios::binary);
+            if (shell) {
+                std::ostringstream body;
+                body << shell.rdbuf();
+                res.status = 200;
+                res.set_content(body.str(), "text/html");
+                return;
+            }
+        }
         // httplib invokes this for EVERY status >= 400, including 413s that
         // route handlers already answered with a specific error body (e.g.
         // media_budget_exceeded). Only synthesize the generic payload-limit
@@ -449,6 +542,19 @@ void HttpServer::register_routes() {
     server_.Get("/health", [](const httplib::Request&, httplib::Response& res) {
         res.set_content(nlohmann::json{{"status", "ok"}}.dump(), "application/json");
     });
+    // One complete live snapshot for the dashboard: board telemetry, the scheduler's own
+    // occupancy view, the VRAM budget, and continuation-cache occupancy against its configured
+    // capacity. Every field here is either absent from /metrics or only derivable there by
+    // differencing counters; the capacity denominators exist nowhere else on the wire.
+    server_.Get("/telemetry", [this](const httplib::Request& req, httplib::Response& res) {
+        handle_telemetry(req, res);
+    });
+    // The schema-14 record stream, identical to what --request-log-jsonl appends, as named SSE
+    // events. A new reader is replayed the retained server_start record and the recent ring
+    // before live delivery begins.
+    server_.Get("/events", [this](const httplib::Request& req, httplib::Response& res) {
+        handle_events(req, res);
+    });
     server_.Get("/metrics", [this](const httplib::Request&, httplib::Response& res) {
         res.set_content(metrics_.render(options_.max_concurrency,
                                         service_ != nullptr ? service_->runtime_stats()
@@ -535,6 +641,18 @@ void HttpServer::register_routes() {
     server_.Post("/v1/messages", [this](const httplib::Request& req, httplib::Response& res) {
         handle_messages(req, res);
     });
+
+    // Mount points are consulted only after every route above misses, so serving the dashboard
+    // cannot shadow an API path. Hashed asset filenames are immutable; the shell is not.
+    if (!options_.web_dir.empty()) {
+        server_.set_file_extension_and_mimetype_mapping("webmanifest", "application/manifest+json");
+        server_.set_mount_point("/", options_.web_dir);
+        server_.set_file_request_handler([](const httplib::Request& req, httplib::Response& res) {
+            res.set_header("Cache-Control", req.path.rfind("/assets/", 0) == 0
+                                                ? "public, max-age=31536000, immutable"
+                                                : "no-cache");
+        });
+    }
 }
 
 std::optional<std::string> HttpServer::resolve_model(const std::string& model) const {
@@ -554,6 +672,174 @@ std::string HttpServer::require_model(const std::string& model) const {
     error.code    = "model_not_found";
     error.message = "model '" + model + "' not found";
     throw ApiException(std::move(error));
+}
+
+void HttpServer::handle_telemetry(const httplib::Request&, httplib::Response& res) const {
+    const ninfer::RuntimeStats stats =
+        service_ != nullptr ? service_->runtime_stats() : ninfer::RuntimeStats{};
+    const ninfer::MemorySummary memory =
+        service_ != nullptr ? service_->memory_summary() : ninfer::MemorySummary{};
+
+    nlohmann::json scheduler = {
+        {"running", stats.running_requests},
+        {"prefilling", stats.prefilling_requests},
+        {"decode_ready", stats.decode_ready_requests},
+        {"waiting", stats.waiting_requests},
+        {"max_concurrency", options_.max_concurrency},
+        {"max_pending_requests", options_.max_pending_requests},
+        {"admitted_requests", stats.admitted_requests},
+        {"queue_seconds_total", stats.queue_seconds_total},
+        {"rejected_overloaded", stats.admission_rejected_overloaded},
+        {"rejected_queue_timeout", stats.admission_rejected_queue_timeout},
+        {"decode_rounds", stats.decode_rounds},
+        {"decode_row_rounds", stats.decode_row_rounds},
+        {"worker_seconds",
+         {{"decode", stats.worker_decode_seconds},
+          {"prefill", stats.worker_prefill_seconds},
+          {"admission", stats.worker_admission_seconds},
+          {"publish", stats.worker_publish_seconds},
+          {"upkeep", stats.worker_upkeep_seconds}}},
+        // Admission is the one unit whose cost is not self-explanatory: it can be planning,
+        // continuation import, or commit. Most scheduler iterations that enter admission admit
+        // nothing, so `calls` is what turns these seconds into a per-call cost.
+        {"worker_admission",
+         {{"calls", stats.worker_admission_calls},
+          {"plan_seconds", stats.worker_admission_plan_seconds},
+          {"restore_seconds", stats.worker_admission_restore_seconds},
+          {"commit_seconds", stats.worker_admission_commit_seconds}}},
+        {"worker_decode_rounds", stats.worker_decode_rounds},
+        {"worker_prefill_steps", stats.worker_prefill_steps}};
+
+    // Occupancy paired with the capacity it is measured against. A tier's byte count alone cannot
+    // say whether the cache is healthy or saturated, and the configured budget reaches the wire
+    // nowhere else.
+    const std::size_t mib = 1024ULL * 1024ULL;
+    nlohmann::json cache  = {
+        {"l1",
+          {{"entries", stats.l1_resident_entries},
+           {"bytes", stats.l1_resident_bytes},
+           {"capacity_bytes", options_.continuation_cache.l1_capacity_mib * mib},
+           {"evictions", stats.l1_evictions},
+           {"demotions", stats.l1_demotions}}},
+        {"l2",
+          {{"entries", stats.continuation_l2_entries},
+           {"bytes", stats.continuation_l2_bytes},
+           {"capacity_bytes", options_.continuation_cache.l2_capacity_mib * mib}}},
+        {"l3",
+          {{"entries", stats.continuation_l3_entries},
+           {"bytes", stats.continuation_l3_bytes},
+           {"capacity_bytes", options_.continuation_cache.l3_capacity_mib * mib}}},
+        {"kv_growth",
+          {{"attempts", stats.kv_growth_attempts},
+           {"forced_spills", stats.kv_growth_forced_spills},
+           {"curtailed", stats.kv_growth_curtailed}}},
+        {"restore_successes", stats.continuation_restore_successes},
+        {"restore_failures", stats.continuation_restore_failures},
+        {"lookup_hits", stats.continuation_lookup_hits},
+        {"lookup_misses", stats.continuation_lookup_misses},
+        {"publication_successes", stats.continuation_publication_successes},
+        {"publication_failures", stats.continuation_publication_failures},
+        {"persistence_successes", stats.continuation_persistence_successes},
+        {"persistence_failures", stats.continuation_persistence_failures}};
+
+    nlohmann::json slots = nlohmann::json::array();
+    if (service_ != nullptr) {
+        for (const ninfer::SlotState& state : service_->slot_states()) {
+            slots.push_back({{"processing", state.processing},
+                             {"retained", state.retained},
+                             {"prompt_tokens", state.prompt_tokens},
+                             {"cached_tokens", state.cached_tokens},
+                             {"session_digest", state.session_digest},
+                             {"checkpoints", state.checkpoints.size()}});
+        }
+    }
+
+    // Adapter inventory. Names come from the load summary rather than from the served model ids,
+    // so an adapter that has taken no traffic is still reported.
+    nlohmann::json adapters = nlohmann::json::object();
+    {
+        nlohmann::json names = nlohmann::json::array();
+        for (const std::string& name : adapter_names_) { names.push_back(name); }
+        nlohmann::json ids = nlohmann::json::array();
+        for (const std::string& id : adapter_model_ids_) { ids.push_back(id); }
+        const ninfer::LoadSummary load =
+            service_ != nullptr ? service_->load_summary() : ninfer::LoadSummary{};
+        adapters = {{"count", adapter_names_.size()},
+                    {"names", std::move(names)},
+                    {"model_ids", std::move(ids)},
+                    {"rank", load.lora_rank},
+                    {"device_bytes", load.lora_device_bytes},
+                    {"file_bytes", load.lora_file_bytes}};
+    }
+
+    const nlohmann::json payload = {
+        {"timestamp_unix_ms", unix_time_ms()},
+        {"server_instance_id", events_.server_instance_id()},
+        {"uptime_seconds",
+         std::chrono::duration<double>(std::chrono::steady_clock::now() - started_at_).count()},
+        {"attached", service_ != nullptr},
+        {"model_id", public_model_id_},
+        {"gpu", gpu_json(gpu_.read())},
+        {"scheduler", std::move(scheduler)},
+        {"cache", std::move(cache)},
+        {"slots", std::move(slots)},
+        {"adapters", std::move(adapters)},
+        {"memory",
+         {{"device", memory.device},
+          {"max_context", memory.max_context},
+          {"kv_capacity", memory.kv_capacity},
+          {"kv_capacity_page_groups", memory.kv_capacity_page_groups},
+          {"kv_capacity_max_page_groups", memory.kv_capacity_max_page_groups},
+          {"weights", arena_json(memory.weights)},
+          {"sequence", arena_json(memory.sequence)},
+          {"workspace", arena_json(memory.workspace)},
+          {"request_transient", arena_json(memory.request_transient)},
+          {"kv_payload_bytes", memory.kv_payload_bytes},
+          {"text_kv_bytes", memory.text_kv_bytes},
+          {"mtp_kv_bytes", memory.mtp_kv_bytes},
+          {"gdn_state_bytes", memory.gdn_state_bytes},
+          {"dflash_kv_bytes", memory.dflash_kv_bytes},
+          {"replay_records_bytes", memory.replay_records_bytes},
+          {"cuda_graph_observed_bytes", memory.cuda_graph_observed_bytes},
+          {"cuda_graph_allowance_bytes", memory.cuda_graph_allowance_bytes},
+          {"available_after_startup_bytes", memory.available_after_startup_bytes},
+          {"available_after_weights_bytes", memory.available_after_weights_bytes},
+          {"lora_bank_bytes", memory.lora_bank_bytes}}},
+        {"events", {{"jsonl_enabled", events_.jsonl_enabled()},
+                    {"subscribers", events_.subscriber_count()}}}};
+    res.set_content(payload.dump(), "application/json");
+}
+
+void HttpServer::handle_events(const httplib::Request&, httplib::Response& res) {
+    res.set_header("Cache-Control", "no-cache");
+    res.set_header("X-Accel-Buffering", "no");
+
+    std::vector<std::string> backlog;
+    std::shared_ptr<EventSubscriber> subscriber = events_.subscribe(backlog);
+
+    res.set_chunked_content_provider(
+        "text/event-stream",
+        [this, subscriber, backlog = std::move(backlog)](std::size_t offset,
+                                                         httplib::DataSink& sink) mutable {
+            if (offset == 0) {
+                // SSE retry hint plus the retained opening state, so a reconnecting dashboard is
+                // immediately consistent without a separate bootstrap request.
+                std::string opening = "retry: 2000\n\n";
+                for (const std::string& record : backlog) {
+                    opening += event_frame(record_event_name(record), record);
+                }
+                backlog.clear();
+                if (!sink.write(opening.data(), opening.size())) { return false; }
+            }
+            std::string record;
+            if (subscriber->next(record, kEventKeepalive)) {
+                const std::string frame = event_frame(record_event_name(record), record);
+                return sink.write(frame.data(), frame.size());
+            }
+            static constexpr std::string_view kKeepalive = ": keepalive\n\n";
+            return sink.write(kKeepalive.data(), kKeepalive.size());
+        },
+        [this, subscriber](bool) { events_.unsubscribe(subscriber); });
 }
 
 void HttpServer::handle_models(const httplib::Request&, httplib::Response& res) const {
@@ -1081,8 +1367,8 @@ void HttpServer::attach(GenerationService& service) {
         adapter_model_ids_.push_back(public_model_id_ + "-" + name);
     }
     service_                       = &service;
-    request_jsonl_.write_server_start(options_, service.sampling_defaults(), public_model_id_, load,
-                                      service.memory_summary());
+    events_.emit_server_start(options_, service.sampling_defaults(), public_model_id_, load,
+                              service.memory_summary());
 }
 
 bool HttpServer::listen() {
@@ -1104,6 +1390,9 @@ bool HttpServer::listen() {
     }
 }
 
-void HttpServer::stop() { server_.stop(); }
+void HttpServer::stop() {
+    events_.close_all();
+    server_.stop();
+}
 
 } // namespace ninfer::serve

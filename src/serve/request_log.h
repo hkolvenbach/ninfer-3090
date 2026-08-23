@@ -17,7 +17,7 @@
 
 namespace ninfer::serve {
 
-inline constexpr int kRequestLogSchemaVersion        = 14;
+inline constexpr int kRequestLogSchemaVersion        = 15;
 inline constexpr const char* kRequestLogArtifactType = "ninfer_serve_request_log";
 
 struct RequestLogContext {
@@ -108,8 +108,14 @@ std::string format_throughput_json(const std::string& server_instance_id,
 
 ServerLogEnvironment query_server_log_environment(int device);
 
-// Opens in append mode so one campaign file can contain multiple independently started MTP/model
-// blocks. Every line carries server_instance_id because request ids restart at one per process.
+// Record timestamps and the per-process identity every record carries. Exposed because EventStream
+// owns the funnel that stamps a record once and fans it out to its sinks.
+std::uint64_t unix_time_ms();
+std::string new_server_instance_id();
+
+// Append-only file sink for already-formatted records. Opens in append mode so one campaign file
+// can contain multiple independently started MTP/model blocks. It does not format or stamp
+// anything: EventStream owns the schema instance and hands this class complete lines.
 class JsonlRequestLog {
 public:
     explicit JsonlRequestLog(const std::string& path,
@@ -120,24 +126,10 @@ public:
 
     [[nodiscard]] bool enabled() const noexcept { return output_.is_open(); }
 
-    [[nodiscard]] const std::string& server_instance_id() const noexcept {
-        return server_instance_id_;
-    }
-
-    void write_server_start(const ServeOptions& options,
-                            const ninfer::ModelSamplingDefaults& sampling_defaults,
-                            const std::string& public_model_id, const ninfer::LoadSummary& load,
-                            const ninfer::MemorySummary& memory);
-    void write_request_start(const RequestLogContext& context);
-    void write_request_done(const RequestLogContext& context, const GenerationOutcome& outcome);
-    void write_request_error(const RequestLogContext& context, const std::string& message);
-    void write_throughput(const ThroughputReport& report);
+    void write_record(const std::string& record);
 
 private:
-    void append(std::string record);
-
     std::string path_;
-    std::string server_instance_id_;
     std::ofstream output_;
     std::mutex mutex_;
     bool failed_ = false;

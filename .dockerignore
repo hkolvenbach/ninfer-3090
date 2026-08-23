@@ -20,6 +20,10 @@ models
 **/.venv
 **/venv
 
+# The dashboard is installed and built inside its own stage, so a local tree must not leak in.
+**/node_modules
+apps/web/dist
+
 *.bin
 *.gguf
 *.log

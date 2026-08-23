@@ -1,4 +1,5 @@
 #include "serve/console_log.h"
+#include "serve/event_stream.h"
 #include "serve/request_log.h"
 
 #include <nlohmann/json.hpp>
@@ -36,7 +37,7 @@ int main() {
 
     bool protected_artifact_rejected = false;
     try {
-        JsonlRequestLog unsafe("same-path.ninfer", "same-path.ninfer");
+        EventStream unsafe("same-path.ninfer", "same-path.ninfer", 8);
     } catch (const std::invalid_argument&) { protected_artifact_rejected = true; }
     failures += check(protected_artifact_rejected,
                       "request log accepted the model artifact as its output path");
@@ -83,6 +84,10 @@ int main() {
     load.peak_staging_bytes   = 128;
     load.tensor_count         = 42;
     load.resource_count       = 6;
+    load.lora_adapter_names   = {"caveman", "sudoku"};
+    load.lora_rank            = 16;
+    load.lora_device_bytes    = 176947200;
+    load.lora_file_bytes      = 88473600;
 
     ninfer::MemorySummary memory;
     memory.max_context                       = 262144;
@@ -104,6 +109,7 @@ int main() {
     memory.cuda_graph_allowance_bytes        = 600;
     memory.cuda_graph_observed_bytes         = 550;
     memory.kv_payload_bytes                  = 400;
+    memory.lora_bank_bytes                   = 176947200;
 
     ServerLogEnvironment environment;
     environment.device                    = 0;
@@ -130,6 +136,14 @@ int main() {
     failures += check(server.at("artifact").at("weights_id") == "groupwise-int",
                       "server weights id missing");
     failures += check(server.at("artifact").at("size_bytes") == 123456, "artifact size missing");
+    failures += check(server.at("adapters").at("count") == 2, "adapter count missing");
+    failures += check(server.at("adapters").at("names").at(1) == "sudoku",
+                      "adapter names missing or out of bank order");
+    failures += check(server.at("adapters").at("rank") == 16, "adapter rank missing");
+    failures += check(server.at("adapters").at("device_bytes") == 176947200,
+                      "adapter bank device bytes missing");
+    failures += check(server.at("memory").at("lora_bank_bytes") == 176947200,
+                      "lora bank bytes missing from the memory division");
     failures += check(server.at("engine").at("max_context") == 262144, "max context missing");
     failures += check(server.at("engine").at("kv_capacity") == 524288, "KV capacity missing");
     failures += check(server.at("engine").at("kv_capacity_mode") == "explicit" &&
@@ -300,7 +314,7 @@ int main() {
     failures +=
         check(done.at("speculative").at("accepted_per_position") == Json::array({290, 240, 190}),
                "speculative position counts missing");
-    failures += check(done.at("schema_version") == 14 &&
+    failures += check(done.at("schema_version") == kRequestLogSchemaVersion &&
                           done.at("continuation_cache").at("source") == "l3" &&
                            done.at("continuation_cache").at("alias_kind") == "routed_session" &&
                           done.at("continuation_cache").at("final_miss_reason") == "none" &&
@@ -478,13 +492,37 @@ int main() {
 #endif
                                             ".jsonl");
     std::filesystem::remove(log_path);
+    // One formatted record must reach both sinks. A live /events reader and a post-hoc reader of
+    // the JSONL file are required to see byte-identical lines, which is what lets the dashboard
+    // replay a file through the same code path it uses for the stream.
+    std::string streamed_start;
+    std::string streamed_error;
     {
-        JsonlRequestLog writer(log_path.string());
-        writer.write_request_start(context);
+        EventStream stream(log_path.string(), {}, 8);
+        std::vector<std::string> backlog;
+        std::shared_ptr<EventSubscriber> reader = stream.subscribe(backlog);
+        failures += check(backlog.empty(), "a fresh stream replayed records that were never sent");
+        stream.emit_request_start(context);
+        failures += check(reader->next(streamed_start, std::chrono::milliseconds(1000)),
+                          "subscriber did not receive the emitted request_start");
+
+        // A second reader must be replayed what it missed, so a dashboard opened mid-run renders
+        // without waiting for the next record.
+        std::vector<std::string> late_backlog;
+        std::shared_ptr<EventSubscriber> late = stream.subscribe(late_backlog);
+        failures += check(late_backlog.size() == 1 && late_backlog.front() == streamed_start,
+                          "late subscriber was not replayed the retained record");
+        stream.unsubscribe(late);
+        stream.unsubscribe(reader);
     }
     {
-        JsonlRequestLog writer(log_path.string());
-        writer.write_request_error(context, "generation failed");
+        EventStream stream(log_path.string(), {}, 8);
+        std::vector<std::string> backlog;
+        std::shared_ptr<EventSubscriber> reader = stream.subscribe(backlog);
+        stream.emit_request_error(context, "generation failed");
+        failures += check(reader->next(streamed_error, std::chrono::milliseconds(1000)),
+                          "subscriber did not receive the emitted request_error");
+        stream.unsubscribe(reader);
     }
     std::ifstream input(log_path);
     std::string first_line;
@@ -500,6 +538,8 @@ int main() {
                           "first appended event mismatch");
         failures += check(Json::parse(second_line).at("event") == "request_error",
                           "second appended event mismatch");
+        failures += check(first_line == streamed_start && second_line == streamed_error,
+                          "streamed records differ from the appended JSONL lines");
     }
     input.close();
     std::filesystem::remove(log_path);

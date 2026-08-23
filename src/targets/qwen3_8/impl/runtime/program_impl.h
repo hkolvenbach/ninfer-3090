@@ -3467,6 +3467,11 @@ MemorySummary ProgramImplCore::memory_summary() const noexcept {
     out.gdn_state_bytes              = gdn_state_bytes;
     out.dflash_kv_bytes              = dflash_kv_bytes;
     out.replay_records_bytes         = replay_records_bytes;
+    // The adapter bank lives in a package-owned arena outside `weights`, so it is reported from
+    // the model view rather than from an arena this Program owns. Zero when no adapter is
+    // registered.
+    out.lora_bank_bytes =
+        model.lora ? static_cast<std::size_t>(model.lora->device_bytes) : std::size_t{0};
     return out;
 }
 

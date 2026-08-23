@@ -23,15 +23,28 @@
 #endif
 
 namespace ninfer::serve {
-namespace {
-
-using Json = nlohmann::json;
 
 std::uint64_t unix_time_ms() {
     const auto now = std::chrono::system_clock::now().time_since_epoch();
     return static_cast<std::uint64_t>(
         std::chrono::duration_cast<std::chrono::milliseconds>(now).count());
 }
+
+std::string new_server_instance_id() {
+    const auto now    = std::chrono::system_clock::now().time_since_epoch();
+    const auto micros = std::chrono::duration_cast<std::chrono::microseconds>(now).count();
+#ifdef _WIN32
+    const auto process_id = ::_getpid();
+#else
+    const auto process_id = ::getpid();
+#endif
+    return "serve-" + std::to_string(static_cast<long long>(process_id)) + '-' +
+           std::to_string(micros);
+}
+
+namespace {
+
+using Json = nlohmann::json;
 
 // Stable identity of a client routing key without reproducing the key itself, which is
 // client-authored text. FNV-1a 64 as 16 hex characters, the same encoding as a session digest.
@@ -47,18 +60,6 @@ std::string routing_hint_digest(std::string_view value) {
         hash >>= 4;
     }
     return out;
-}
-
-std::string new_server_instance_id() {
-    const auto now    = std::chrono::system_clock::now().time_since_epoch();
-    const auto micros = std::chrono::duration_cast<std::chrono::microseconds>(now).count();
-#ifdef _WIN32
-    const auto process_id = ::_getpid();
-#else
-    const auto process_id = ::getpid();
-#endif
-    return "serve-" + std::to_string(static_cast<long long>(process_id)) + '-' +
-           std::to_string(micros);
 }
 
 std::filesystem::path normalized_absolute_path(const std::string& value) {
@@ -505,6 +506,14 @@ std::string format_server_start_json(
                               {"resource_count", load.resource_count},
                               {"load_seconds", load.load_seconds},
                               {"upload_seconds", load.upload_seconds}};
+    // Registered adapters, so a replayed log can name them even when no request used one.
+    Json adapter_names = Json::array();
+    for (const std::string& name : load.lora_adapter_names) { adapter_names.push_back(name); }
+    record["adapters"] = Json{{"count", load.lora_adapter_names.size()},
+                              {"names", std::move(adapter_names)},
+                              {"rank", load.lora_rank},
+                              {"device_bytes", load.lora_device_bytes},
+                              {"file_bytes", load.lora_file_bytes}};
     record["engine"]   = Json{
           {"device", options.device},
           {"max_context", options.max_context},
@@ -562,7 +571,8 @@ std::string format_server_start_json(
              {"planned_slack_bytes", memory.planned_slack_bytes},
              {"cuda_graph_allowance_bytes", memory.cuda_graph_allowance_bytes},
              {"cuda_graph_observed_bytes", memory.cuda_graph_observed_bytes},
-             {"kv_payload_bytes", memory.kv_payload_bytes}};
+             {"kv_payload_bytes", memory.kv_payload_bytes},
+             {"lora_bank_bytes", memory.lora_bank_bytes}};
     record["environment"] =
         Json{{"device", environment.device},
              {"gpu_name", environment.gpu_name},
@@ -849,51 +859,14 @@ JsonlRequestLog::JsonlRequestLog(const std::string& path,
         normalized_absolute_path(path_) == normalized_absolute_path(protected_artifact_path)) {
         throw std::invalid_argument("request JSONL log must not overwrite the model artifact");
     }
-    server_instance_id_ = new_server_instance_id();
     output_.open(path_, std::ios::out | std::ios::app);
     if (!output_) {
         throw std::runtime_error("failed to open request JSONL log for append: " + path_);
     }
 }
 
-void JsonlRequestLog::write_server_start(const ServeOptions& options,
-                                         const ninfer::ModelSamplingDefaults& sampling_defaults,
-                                         const std::string& public_model_id,
-                                         const ninfer::LoadSummary& load,
-                                         const ninfer::MemorySummary& memory) {
+void JsonlRequestLog::write_record(const std::string& record) {
     if (!enabled()) { return; }
-    std::error_code error;
-    const std::uintmax_t size = std::filesystem::file_size(options.artifact_path, error);
-    const std::optional<std::uint64_t> artifact_size =
-        error ? std::nullopt : std::optional<std::uint64_t>(size);
-    append(format_server_start_json(server_instance_id_, unix_time_ms(), options, sampling_defaults,
-                                    public_model_id, load, memory,
-                                    query_server_log_environment(options.device), artifact_size));
-}
-
-void JsonlRequestLog::write_request_start(const RequestLogContext& context) {
-    if (!enabled()) { return; }
-    append(format_request_start_json(server_instance_id_, unix_time_ms(), context));
-}
-
-void JsonlRequestLog::write_request_done(const RequestLogContext& context,
-                                         const GenerationOutcome& outcome) {
-    if (!enabled()) { return; }
-    append(format_request_done_json(server_instance_id_, unix_time_ms(), context, outcome));
-}
-
-void JsonlRequestLog::write_request_error(const RequestLogContext& context,
-                                          const std::string& message) {
-    if (!enabled()) { return; }
-    append(format_request_error_json(server_instance_id_, unix_time_ms(), context, message));
-}
-
-void JsonlRequestLog::write_throughput(const ThroughputReport& report) {
-    if (!enabled()) { return; }
-    append(format_throughput_json(server_instance_id_, unix_time_ms(), report));
-}
-
-void JsonlRequestLog::append(std::string record) {
     std::lock_guard<std::mutex> lock(mutex_);
     if (failed_) { return; }
     output_ << record << '\n';

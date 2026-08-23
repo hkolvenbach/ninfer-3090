@@ -1,0 +1,119 @@
+import { useMemo, useRef } from 'react'
+
+import { Pill, StatusDot, type Tone } from './components/ui'
+import { summarizeRequests } from './lib/derive'
+import { duration } from './lib/format'
+import { latest } from './lib/series'
+import { cacheFromRecords } from './lib/telemetry'
+import { useEngine } from './lib/use-engine'
+import { AdaptersPanel } from './panels/AdaptersPanel'
+import { CachePanel } from './panels/CachePanel'
+import { GpuPanel } from './panels/GpuPanel'
+import { Headline } from './panels/Headline'
+import { LatencyPanel } from './panels/LatencyPanel'
+import { MemoryPanel } from './panels/MemoryPanel'
+import { RequestsPanel } from './panels/RequestsPanel'
+import { SchedulerPanel } from './panels/SchedulerPanel'
+import { SlotsPanel } from './panels/SlotsPanel'
+import { ThroughputPanel } from './panels/ThroughputPanel'
+
+const CONNECTION_TONE: Record<string, Tone> = {
+  live: 'accent',
+  replay: 'warning',
+  connecting: 'warning',
+  offline: 'danger',
+}
+
+export function App() {
+  const { state, loadFile, resumeLive } = useEngine()
+  const filePicker = useRef<HTMLInputElement>(null)
+
+  // Summaries are pure over the retained record window; recomputing them on every 1 Hz telemetry
+  // poll would be wasted work on a list that only changes when a request completes.
+  const summary = useMemo(() => summarizeRequests(state.requests), [state.requests])
+
+  const engine = state.serverStart?.engine
+  const server = state.serverStart?.server
+  const replay = state.source === 'file'
+
+  // Live inventory wins; a replayed log carries the same block on its own server_start, so a
+  // registered-but-unused adapter is still named offline.
+  const adapters = state.telemetry?.adapters ?? state.serverStart?.adapters
+  const lanes = state.telemetry?.scheduler.max_concurrency ?? engine?.max_concurrency
+
+  // Live telemetry wins; a replayed log reconstructs the same cache view from its own records.
+  const cache = useMemo(
+    () => state.telemetry?.cache ?? cacheFromRecords(latest(state.throughput), state.serverStart),
+    [state.telemetry, state.throughput, state.serverStart],
+  )
+
+  return (
+    <div className="console">
+      <header className="topbar">
+        <div className="topbar__identity">
+          <StatusDot tone={CONNECTION_TONE[state.connection]} />
+          <strong>{state.telemetry?.model_id ?? server?.public_model_id ?? 'ninfer'}</strong>
+          {engine ? (
+            <span className="topbar__config">
+              {engine.kv_cache} · {engine.max_concurrency} lanes ·{' '}
+              {engine.max_context.toLocaleString('en-US')} ctx
+              {engine.speculative_backend !== 'none' ? ` · ${engine.speculative_backend}` : ''}
+              {engine.cuda_graph ? ' · graphs' : ''}
+            </span>
+          ) : null}
+        </div>
+
+        <div className="topbar__actions">
+          {replay ? (
+            <Pill tone="warning">replay · {state.fileName}</Pill>
+          ) : state.telemetry ? (
+            <span className="topbar__config">up {duration(state.telemetry.uptime_seconds)}</span>
+          ) : null}
+          {state.error && !replay ? <Pill tone="danger">{state.error}</Pill> : null}
+          <input
+            ref={filePicker}
+            type="file"
+            accept=".jsonl,.json,application/jsonl,text/plain"
+            className="sr-only"
+            onChange={(event) => {
+              const file = event.target.files?.[0]
+              if (file) void loadFile(file)
+              event.target.value = ''
+            }}
+          />
+          <button className="button" type="button" onClick={() => filePicker.current?.click()}>
+            load jsonl
+          </button>
+          {replay ? (
+            <button className="button" type="button" onClick={resumeLive}>
+              go live
+            </button>
+          ) : null}
+        </div>
+      </header>
+
+      <Headline
+        telemetry={state.telemetry}
+        records={state.throughput}
+        summary={summary}
+        engine={engine}
+      />
+
+      <main className="grid">
+        <ThroughputPanel records={state.throughput} lanes={lanes} />
+        <SchedulerPanel telemetry={state.telemetry} records={state.throughput} engine={engine} />
+        <GpuPanel gpu={state.telemetry?.gpu} history={state.gpu} replay={replay} />
+        <MemoryPanel memory={state.telemetry?.memory} gpu={state.telemetry?.gpu} replay={replay} />
+        <CachePanel cache={cache} summary={summary} replay={replay} />
+        <LatencyPanel summary={summary} />
+        <SlotsPanel
+          slots={state.telemetry?.slots}
+          maxContext={state.telemetry?.memory.max_context ?? 0}
+          replay={replay}
+        />
+        <RequestsPanel requests={state.requests} active={state.active} />
+        <AdaptersPanel inventory={adapters} requests={state.requests} />
+      </main>
+    </div>
+  )
+}

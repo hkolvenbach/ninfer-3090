@@ -386,7 +386,9 @@ if(NINFER_BUILD_SERVE)
     serve/tool_call_parser.cpp
     serve/translate.cpp
     serve/console_log.cpp
+    serve/event_stream.cpp
     serve/generation_service.cpp
+    serve/gpu_telemetry.cpp
     serve/request_log.cpp
     serve/http_server.cpp
     serve/responses_http.cpp
@@ -395,7 +397,9 @@ if(NINFER_BUILD_SERVE)
   ninfer_internal_includes(ninfer_serve)
   target_include_directories(ninfer_serve PRIVATE
     ${PROJECT_SOURCE_DIR}/third_party/cpp-httplib)
+  # NVML is part of the driver this engine already requires; GET /telemetry reads board
+  # utilization, temperature, power and clocks from it.
   target_link_libraries(ninfer_serve
     PUBLIC ninfer_engine Threads::Threads
-    PRIVATE ninfer_media_acquire ${NINFER_CUDART_TARGET})
+    PRIVATE ninfer_media_acquire ${NINFER_CUDART_TARGET} CUDA::nvml)
 endif()

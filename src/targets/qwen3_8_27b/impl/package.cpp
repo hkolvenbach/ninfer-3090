@@ -92,21 +92,29 @@ Package::construct_loaded_model(LoadPlan&& plan, artifact::MaterializedArtifact&
     return std::unique_ptr<LoadedModel>(new LoadedModel(std::move(impl)));
 }
 
-std::vector<std::string> Package::attach_lora(LoadedModel& model, const EngineOptions& options,
-                                              DeviceContext& device) {
+LoraAttachment Package::attach_lora(LoadedModel& model, const EngineOptions& options,
+                                    DeviceContext& device) {
     if (model.impl_ == nullptr) { throw std::invalid_argument("loaded model is empty"); }
     if (options.lora_adapters.empty()) { return {}; }
 
     detail::LoadedLoraBank bank = detail::load_lora_bank(options.lora_adapters, device);
-    detail::LoadedModelData& data = model.impl_->data;
-    data.runtime.lora             = std::move(bank.view);
-    data.lora_arena               = std::move(bank.arena);
-    data.lora_adapter_names       = std::move(bank.names);
+    const std::uint64_t device_bytes = bank.device_bytes;
+    const std::uint64_t file_bytes   = bank.file_bytes;
+    detail::LoadedModelData& data    = model.impl_->data;
+    data.runtime.lora                = std::move(bank.view);
+    data.lora_arena                  = std::move(bank.arena);
+    data.lora_adapter_names          = std::move(bank.names);
     // `lora_sizing_rank` already froze the workspace layout and must not be rewritten here; the
     // bank's executed rank lives on the model view.
     data.runtime.features.lora_adapters =
         static_cast<std::uint32_t>(data.lora_adapter_names.size());
-    return data.lora_adapter_names;
+    // The bank is its own arena, so the family memory summary can only account for it through
+    // the view the package populates here.
+    data.runtime.lora->device_bytes = device_bytes;
+    return LoraAttachment{.names        = data.lora_adapter_names,
+                          .rank         = data.runtime.lora->rank,
+                          .device_bytes = device_bytes,
+                          .file_bytes   = file_bytes};
 }
 
 Package::Frontend Package::make_frontend(const LoadedModel& model,

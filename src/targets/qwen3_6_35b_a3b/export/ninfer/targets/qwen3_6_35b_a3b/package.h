@@ -100,8 +100,8 @@ struct Package {
     [[nodiscard]] static std::unique_ptr<LoadedModel>
     construct_loaded_model(LoadPlan&& plan, artifact::MaterializedArtifact&& materialized);
     // This identity registers no LoRA site table, so any registered adapter is rejected.
-    [[nodiscard]] static std::vector<std::string>
-    attach_lora(LoadedModel& model, const EngineOptions& options, DeviceContext& device);
+    [[nodiscard]] static LoraAttachment attach_lora(LoadedModel& model, const EngineOptions& options,
+                                                    DeviceContext& device);
     [[nodiscard]] static Frontend make_frontend(
         const LoadedModel& model,
         PrefixCheckpointPolicy prefix_checkpoint_policy = PrefixCheckpointPolicy::RollingTool);

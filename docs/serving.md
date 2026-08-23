@@ -56,6 +56,38 @@ cannot be combined with `--vision`. A later request cannot enable a capability o
 | `POST /v1/messages/count_tokens` | checkpoint-native expanded input-token count |
 | `GET /slots` | per-slot occupancy from the Engine lane table: processing/retained, depths, `session_digest` |
 | `POST /slots/{id}?action=save\|restore\|erase` | session persistence; requires `--slot-save-path` |
+| `GET /metrics` | Prometheus text exposition; see [Metrics](#metrics) |
+| `GET /telemetry` | one live JSON snapshot: board sensors, scheduler occupancy, VRAM, cache fill, adapter inventory |
+| `GET /events` | SSE stream of the schema-15 records `--request-log-jsonl` writes |
+
+`/metrics`, `/telemetry`, and `/events` are always registered and cannot be disabled. Like every
+path except `/health`, they require the API key when `--api-key` is set.
+
+### Telemetry and events
+
+`GET /telemetry` returns a complete instantaneous snapshot rather than a delta, so a reader
+resynchronizes by fetching it again rather than by replaying anything. It carries what `/metrics`
+cannot express: NVML board readings (utilization, temperature, power, clocks, and decoded
+clock-throttle reasons), the scheduler's own `running`/`prefilling`/`decode_ready`/`waiting`
+occupancy, the execution thread's wall-clock split with its admission decomposition, the
+`MemorySummary` VRAM budget, continuation-cache occupancy paired with the configured tier
+capacities it is measured against, and the resident LoRA bank (`adapters`: names, served model
+ids, shared rank, and device/file bytes). NVML failure is reported as `gpu.available = false`
+with an `error` string rather than failing the request.
+
+The adapter bank is one device arena committed at startup, outside the weights arena and before
+KV capacity is resolved. `memory.lora_bank_bytes` reports it so the division of the board
+accounts for it; without that field the bank is visible only as reduced free memory. Adapter
+names come from the load summary rather than from served model ids, so an adapter that has taken
+no traffic is still reported.
+
+`GET /events` streams the same schema-15 records `--request-log-jsonl` appends, as named SSE
+frames whose event name is the record's own `event` field. The records are formatted once and
+fanned out to both sinks, so a live reader and a post-hoc reader of the file see identical lines.
+A connecting reader is replayed the retained `server_start` record followed by a bounded ring of
+recent records, then receives live ones. Subscribers are bounded and lossy by construction: a
+reader that stops consuming has its oldest records dropped rather than applying backpressure to
+the execution thread. `--request-log-jsonl` is not required for `/events`.
 
 ### Session persistence
 
@@ -516,7 +548,8 @@ are errors. Delete and cancel routes accept no query parameters.
 | `--log-stats-interval-ms N` | aggregate throughput report interval; `0` disables it | `5000` |
 | `--device N` | CUDA device index | `0` |
 | `--max-request-mib N` | body-size limit before JSON parsing | `384` |
-| `--request-log-jsonl FILE` | append full-precision server/request records | disabled |
+| `--request-log-jsonl FILE` | append full-precision server/request records; `/events` streams the same records regardless | disabled |
+| `--web-dir DIR` | serve the built dashboard (`apps/web/dist`) from `/` on this port | disabled |
 | `--slot-save-path DIR` | enable `/slots/{id}?action=save\|restore\|erase` session persistence into DIR | disabled |
 | `--turn-checkpoints N` | retained turn checkpoints per slot for mid-history prompt reuse; see [turn-checkpoint-ring.md](turn-checkpoint-ring.md) | `0` |
 | `--auto-save-evicted` | spill an involuntarily evicted session back to its bound slot file; requires `--slot-save-path` | off |

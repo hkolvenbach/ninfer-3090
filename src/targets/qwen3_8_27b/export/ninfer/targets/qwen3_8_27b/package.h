@@ -103,11 +103,11 @@ struct Package {
     [[nodiscard]] static std::unique_ptr<LoadedModel>
     construct_loaded_model(LoadPlan&& plan, artifact::MaterializedArtifact&& materialized);
     // Materializes the startup-registered LoRA adapters into a bank owned by the loaded model
-    // and publishes their names in bank-index order. Called after the base artifact is resident
+    // and publishes the resident bank's inventory. Called after the base artifact is resident
     // and before KV capacity is resolved, so the bank's bytes are already committed when the
     // resolver reads free device memory.
-    [[nodiscard]] static std::vector<std::string>
-    attach_lora(LoadedModel& model, const EngineOptions& options, DeviceContext& device);
+    [[nodiscard]] static LoraAttachment attach_lora(LoadedModel& model, const EngineOptions& options,
+                                                    DeviceContext& device);
     [[nodiscard]] static Frontend make_frontend(
         const LoadedModel& model,
         PrefixCheckpointPolicy prefix_checkpoint_policy = PrefixCheckpointPolicy::RollingTool);

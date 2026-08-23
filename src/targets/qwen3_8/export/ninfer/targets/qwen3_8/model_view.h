@@ -109,6 +109,10 @@ template <std::size_t FullAttentionLayers, std::size_t GdnLayers>
 struct LoraWeights {
     std::uint32_t adapters = 0;
     std::int32_t rank      = 0;
+    // Device bytes the package committed for the whole bank. The bank is its own arena outside
+    // the weights arena, so this is the only route by which the family's memory summary can
+    // account for it instead of leaving it as unexplained missing free memory.
+    std::uint64_t device_bytes = 0;
     std::array<LoraFullLayerWeights, FullAttentionLayers> full_layers;
     std::array<LoraGdnLayerWeights, GdnLayers> gdn_layers;
 };

@@ -87,8 +87,8 @@ Package::construct_loaded_model(LoadPlan&& plan, artifact::MaterializedArtifact&
     return std::unique_ptr<LoadedModel>(new LoadedModel(std::move(impl)));
 }
 
-std::vector<std::string> Package::attach_lora(LoadedModel& model, const EngineOptions& options,
-                                              DeviceContext& device) {
+LoraAttachment Package::attach_lora(LoadedModel& model, const EngineOptions& options,
+                                    DeviceContext& device) {
     (void)model;
     (void)device;
     if (!options.lora_adapters.empty()) {

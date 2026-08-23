@@ -113,6 +113,19 @@ struct LoraAdapterSpec {
     std::filesystem::path path;
 };
 
+// What a target package committed when it attached the registered adapters. Returned by
+// `Package::attach_lora` so the loader publishes the resident bank's cost once, at the point
+// that knows it, instead of discarding it and leaving the bytes unattributable later.
+struct LoraAttachment {
+    // Adapter names in bank-index order; empty when no adapter was registered.
+    std::vector<std::string> names;
+    // Shared rank of every adapter in the bank.
+    std::int32_t rank = 0;
+    // Device bytes committed for the bank, and artifact bytes read to fill it.
+    std::uint64_t device_bytes = 0;
+    std::uint64_t file_bytes   = 0;
+};
+
 // Outcome of one background auto-save of an involuntarily evicted session. Delivered on the
 // Engine's writer thread; the listener must be thread-safe.
 struct SlotAutoSaveEvent {
@@ -611,6 +624,10 @@ struct MemorySummary {
     std::size_t gdn_state_bytes                   = 0;
     std::size_t dflash_kv_bytes                   = 0;
     std::size_t replay_records_bytes              = 0;
+    // Resident LoRA bank. Held in its own arena outside `weights`, so without this field the
+    // bank appears only as a reduction in `available_after_startup_bytes` and the reported
+    // division of the board does not account for it.
+    std::size_t lora_bank_bytes                   = 0;
 };
 
 // Monotonic execution counters plus one boundary-consistent scheduler snapshot. Consumers derive
@@ -801,6 +818,11 @@ struct LoadSummary {
     std::size_t resource_count         = 0;
     // Registered adapter names in bank-index order; empty when no adapter was registered.
     std::vector<std::string> lora_adapter_names;
+    // Shared rank of the resident bank, and the device and file bytes it cost. Every registered
+    // adapter carries the same rank by construction, so one value describes the bank.
+    std::int32_t lora_rank             = 0;
+    std::uint64_t lora_device_bytes    = 0;
+    std::uint64_t lora_file_bytes      = 0;
 };
 
 } // namespace ninfer
