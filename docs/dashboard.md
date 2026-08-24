@@ -123,6 +123,40 @@ TTFT is decomposed into queue, restore, and prefill. A queue-dominated TTFT mean
 waiting for a lane rather than being computed, which more lanes or shorter generations address
 before any kernel work does.
 
+## Cache churn
+
+The occupancy panel answers what the cache is holding. The churn panel answers whether holding it
+is still paying, which is a different question and is not answered by the hit rate: a working set
+that has outgrown L1 keeps hitting and simply starts paying a host or disk import on every turn.
+
+Eviction on its own is a cache working normally, so no single count here is pathological. The
+readings that carry meaning are:
+
+- **imported reuse** — share of restores served from L2 or L3 rather than a resident L1 lane.
+  Drift down the tiers is the churn signal, and the restore chart shows it directly as the tier
+  mix per interval.
+- **lost sessions** — retained lanes evicted with no publication ticket (`l1_evictions` minus
+  `l1_demotions`). Unlike a demotion, the session survives in no tier, so the next turn of that
+  conversation has no state to import and prefills from zero.
+- **recomputed coverage** — prefill spent on prefix the cache demonstrably held. Preflight reports
+  how deep a candidate agreed with the prompt; when a request prefilled from zero anyway,
+  everything beyond what the lane already reused was recomputed for nothing. Requests where
+  nothing was preflighted are excluded rather than counted as clean, because they are not evidence
+  either way, and agreement the resident frontier already covered is not counted either.
+- **deferrals** — restores refused for shared-KV capacity with the candidate left live for a
+  retry. Reported apart from restore failures because a deferral is recoverable and a failure is
+  not.
+- **superseded** — publications that completed and were then discarded because the session alias
+  had already advanced. The export work was paid for and nothing can ever restore from it.
+
+Host and disk evictions are counted only when a tier exceeded its byte budget. A TTL expiry is
+deliberately not counted as one: reclaiming state that went cold is the cache working, while a
+capacity eviction means the tier is too small for what is actually in use. A promotion that cannot
+find room is refused rather than admitted and then evicted, and a refusal is not churn either.
+
+Both charts are interval counts, so they are drawn as bands over the window each sample covers,
+and the tier series are stacked because they partition one total.
+
 ## Replay
 
 `load jsonl` reads a `--request-log-jsonl` file and renders it through the same components. When a
@@ -142,3 +176,8 @@ restore-failure partitioning, TTFT decomposition, and restore statistics — fol
 in the maintainer script `cache_health.py`, including its truncating nearest-rank percentile rule.
 `src/lib/derive.test.ts` pins the agreement on a fixture whose expected values were produced by
 that script, so the dashboard and the script cannot report different numbers for the same log.
+
+Churn and recomputed coverage are summed from the interval deltas the throughput record already
+carries, rather than by differencing the cumulative endpoints of the window, so a server restart
+inside the window cannot turn a counter reset into a negative or absurd reading. A counter that a
+replayed log predates reads as zero rather than as `NaN` in a total.

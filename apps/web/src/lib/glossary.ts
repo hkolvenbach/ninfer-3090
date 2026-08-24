@@ -157,6 +157,34 @@ export const GLOSSARY = {
     title: 'L1 evictions and demotions',
     body: 'Retained lanes destroyed outright, versus demoted into L2 or L3 so their session survives. Demotions preserve reuse; evictions do not.',
   },
+  churn: {
+    title: 'Cache churn',
+    body: 'Sessions losing residency and reuse being re-imported, per reporting interval. Eviction alone is a cache working normally, so read these against the restore mix rather than on their own.',
+  },
+  lostSessions: {
+    title: 'Lost sessions',
+    body: 'Retained lanes evicted with no publication ticket, so the session survives in no tier. Unlike a demotion, the next turn of that conversation has no state to import and must prefill from zero.',
+  },
+  importShare: {
+    title: 'Imported reuse',
+    body: 'Share of restores served from L2 host memory or L3 disk instead of a resident L1 lane. A working set that has outgrown L1 keeps its hit rate but starts paying an import on every turn, and this is the reading where that shows up.',
+  },
+  tierEvictions: {
+    title: 'Host and disk evictions',
+    body: 'Entries pushed out of L2 or L3 because the live working set exceeded that tier’s byte budget. A TTL expiry is deliberately not counted: reclaiming state that went cold is the cache working, while a capacity eviction means the tier is too small for what is actually in use.',
+  },
+  coverageWaste: {
+    title: 'Recomputed coverage',
+    body: 'Prefill spent on prefix the cache demonstrably held. Preflight reported how deep a candidate agreed with the prompt; if the request still prefilled from zero, everything beyond what the lane already reused was recomputed for nothing. Requests where nothing was preflighted are excluded, because there is no evidence either way.',
+  },
+  deferrals: {
+    title: 'Restore deferrals',
+    body: 'Restores refused for shared-KV capacity with the candidate left live, so the request can retry once pages could exist. Counted apart from restore failures because a deferral is recoverable and a failure is not.',
+  },
+  superseded: {
+    title: 'Superseded publications',
+    body: 'Publications that completed and were then discarded because the session alias had already advanced past them. The export work was done and paid for, and nothing can ever restore from it.',
+  },
   reusePath: {
     title: 'Prefix reuse path',
     body: 'restore_turn_checkpoint means the prompt diverged mid-history and resumed from the nearest retained turn checkpoint. full_reset means the lane started from zero.',

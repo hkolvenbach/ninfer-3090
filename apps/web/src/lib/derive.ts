@@ -6,7 +6,7 @@
 // script cannot drift into reporting different numbers for the same log.
 
 import { CHART } from './palette'
-import type { ContinuationSource, RequestDoneRecord } from './records'
+import type { ContinuationSource, RequestDoneRecord, ThroughputRecord } from './records'
 
 /**
  * Nearest-rank percentile with truncating index selection. Deliberately identical to the
@@ -27,6 +27,11 @@ export function mean(values: readonly number[]): number {
 
 export function sum(values: readonly number[]): number {
   return values.reduce((total, value) => total + value, 0)
+}
+
+/** A counter a replayed log predates reads as zero, never as `NaN` in someone's total. */
+function counter(value: number | undefined): number {
+  return value ?? 0
 }
 
 function tally<T extends string>(values: readonly T[]): Record<string, number> {
@@ -51,6 +56,29 @@ function spread(values: readonly number[]): Spread {
     max: values.length === 0 ? 0 : Math.max(...values),
     mean: mean(values),
   }
+}
+
+/**
+ * Prefill spent on state the cache demonstrably held.
+ *
+ * `deepest_candidate_agreement` is the deepest prefix any preflighted candidate agreed with, so a
+ * request that still recomputed from zero proves the engine had that much of the prompt in hand
+ * and prefilled anyway. Waste is measured beyond what the lane already reused
+ * (`prefix_cache_hit_tokens`), which is what makes `not_deeper` - where the resident frontier
+ * already covered the agreement - correctly score as no waste at all.
+ *
+ * `null` agreement means nothing was preflighted, so there is no evidence either way and the
+ * request is excluded rather than counted as clean.
+ */
+export interface CoverageWaste {
+  /** Requests that recomputed a prefix the cache had agreed with. */
+  requests: number
+  /** Tokens recomputed despite that agreement. */
+  tokens: number
+  /** Share of completed requests affected. */
+  requestShare: number
+  /** Share of all computed prefill that this waste accounts for. */
+  prefillShare: number
 }
 
 export interface RestoreSummary {
@@ -92,6 +120,7 @@ export interface RequestSummary {
   ttft: Spread
   /** Share of summed TTFT attributable to each phase. These are the actionable latency terms. */
   ttftShare: { queue: number; restore: number; prefill: number }
+  coverageWaste: CoverageWaste
   restores: RestoreSummary
   speculative: SpeculativeSummary
   decodeTokensPerSecond: Spread
@@ -127,6 +156,21 @@ export function summarizeRequests(records: readonly RequestDoneRecord[]): Reques
     })
   }
 
+  // Tokens the cache agreed with and the engine recomputed anyway, counted only beyond what the
+  // lane had already reused. A restore that happened is not waste, and an agreement the resident
+  // frontier already covered is not waste either.
+  let wasteTokens = 0
+  let wasteRequests = 0
+  for (const record of records) {
+    if (record.continuation_cache.source !== 'none') continue
+    const agreement = record.continuation_cache.deepest_candidate_agreement
+    if (agreement === null || agreement === undefined) continue
+    const recomputed = agreement - record.result.prefix_cache_hit_tokens
+    if (recomputed <= 0) continue
+    wasteTokens += recomputed
+    wasteRequests += 1
+  }
+
   // Only requests that actually decoded contribute a rate; a fully restored prompt that emitted
   // one token in near-zero time would otherwise dominate the spread with a meaningless value.
   const decodeRates = records
@@ -160,6 +204,12 @@ export function summarizeRequests(records: readonly RequestDoneRecord[]): Reques
       queue: totalTtft === 0 ? 0 : sum(records.map((r) => r.timings_seconds.queue)) / totalTtft,
       restore: totalTtft === 0 ? 0 : sum(records.map((r) => r.timings_seconds.restore)) / totalTtft,
       prefill: totalTtft === 0 ? 0 : sum(records.map((r) => r.timings_seconds.prefill)) / totalTtft,
+    },
+    coverageWaste: {
+      requests: wasteRequests,
+      tokens: wasteTokens,
+      requestShare: records.length === 0 ? 0 : wasteRequests / records.length,
+      prefillShare: totalComputed === 0 ? 0 : wasteTokens / totalComputed,
     },
     restores: {
       count: restored.length,
@@ -220,6 +270,82 @@ export function summarizeByAdapter(records: readonly RequestDoneRecord[]): Adapt
       // read against, so it does not compete for position on request count.
       .sort((a, b) => (a.name === '' ? -1 : b.name === '' ? 1 : b.summary.count - a.summary.count))
   )
+}
+
+/**
+ * Cache churn over the retained throughput window.
+ *
+ * Eviction on its own is a cache doing its job, so none of these are pathological in isolation.
+ * The two readings that matter are `lost`, which is state discarded with no handoff and therefore
+ * guaranteed to be recomputed if it is wanted again, and `importShare`, which is the fraction of
+ * reuse that had to come from host or disk instead of resident VRAM. A working set that outgrows
+ * L1 keeps its hit rate and quietly starts paying an import on every turn; that shift shows up
+ * here and nowhere else.
+ *
+ * Summed from interval deltas rather than differenced endpoints, so a server restart inside the
+ * window cannot turn a counter reset into a negative or absurd reading. A counter a replayed log
+ * predates reads as zero rather than poisoning the whole summary with `NaN`.
+ */
+export interface ChurnSummary {
+  evictions: number
+  demotions: number
+  /** Evicted with no publication ticket, so the session did not survive anywhere. */
+  lost: number
+  l2Evictions: number
+  l3Evictions: number
+  l2EvictedBytes: number
+  l3EvictedBytes: number
+  restores: { l1: number; l2: number; l3: number }
+  /** Share of restores served from L2 or L3 rather than resident L1. */
+  importShare: number
+  /** Restores refused for shared-KV capacity with the candidate left live for a retry. */
+  deferrals: number
+  /** Publications that completed and were discarded because the alias had already moved on. */
+  superseded: number
+}
+
+export function summarizeChurn(records: readonly ThroughputRecord[]): ChurnSummary {
+  let evictions = 0
+  let demotions = 0
+  let l2Evictions = 0
+  let l3Evictions = 0
+  let l2EvictedBytes = 0
+  let l3EvictedBytes = 0
+  let l1 = 0
+  let l2 = 0
+  let l3 = 0
+  let deferrals = 0
+  let superseded = 0
+  for (const record of records) {
+    const cache = record.continuation_cache
+    const occupancy = cache.occupancy
+    evictions += occupancy.delta_l1_evictions
+    demotions += occupancy.delta_l1_demotions
+    l2Evictions += counter(occupancy.delta_l2_evictions)
+    l3Evictions += counter(occupancy.delta_l3_evictions)
+    l2EvictedBytes += counter(occupancy.delta_l2_evicted_bytes)
+    l3EvictedBytes += counter(occupancy.delta_l3_evicted_bytes)
+    l1 += cache.tiers.delta_l1_restore_successes
+    l2 += cache.tiers.delta_l2_restore_successes
+    l3 += cache.tiers.delta_l3_restore_successes
+    deferrals += counter(cache.delta_restore_deferrals)
+    superseded += counter(cache.delta_publication_superseded)
+  }
+  const restores = l1 + l2 + l3
+  return {
+    evictions,
+    demotions,
+    // A demotion is one kind of eviction, never an extra one, so this cannot go negative.
+    lost: evictions - demotions,
+    l2Evictions,
+    l3Evictions,
+    l2EvictedBytes,
+    l3EvictedBytes,
+    restores: { l1, l2, l3 },
+    importShare: restores === 0 ? 0 : (l2 + l3) / restores,
+    deferrals,
+    superseded,
+  }
 }
 
 export const SOURCE_ORDER: readonly ContinuationSource[] = ['l1', 'l2', 'l3', 'none']

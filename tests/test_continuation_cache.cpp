@@ -191,6 +191,10 @@ void test_l2_eviction() {
     const auto second = cache.store(image(2));
     check(cache.stats().l2_bytes <= config.l2_byte_budget, "L2 obeys byte budget");
     check(cache.stats().l2_bytes != 0, "L2 budget admits exactly one test image");
+    // Making room is what the churn reading is derived from, so a silent eviction is a defect.
+    check(cache.stats().l2_evictions == 1, "an L2 eviction to make room is counted");
+    check(cache.stats().l2_evicted_bytes == continuation_image_bytes(image(1)),
+          "the evicted volume is the image that was actually discarded");
     overwrite_short(first_chunk);
     check(!cache.get(first), "evicted L2 entry observes corrupt L3 as a miss");
     check(cache.get(second).has_value(), "most-recent L2 entry survives eviction");
@@ -469,6 +473,12 @@ void test_pin_protects_from_l3_eviction() {
     check(cache.get(replacement).has_value() && !cache.get(pinned) &&
               cache.stats().l3_bytes <= config.l3_byte_budget,
           "promotion evicts an unpinned durable image to remain within the L3 budget");
+    // Exactly one: the pinned image, once unpinning made it a legal victim. `rejected` never
+    // displaced anything, because a promotion that cannot find room is refused rather than
+    // admitted and then evicted, and a refusal is not churn.
+    check(cache.stats().l3_evictions == 1, "L3 capacity evictions are counted");
+    check(cache.stats().l3_evicted_bytes == one_image,
+          "the evicted volume is the disk the eviction actually reclaimed");
 }
 
 void test_l3_expiry_defers_cleanup_until_restore_and_explicit_pins_release() {

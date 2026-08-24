@@ -246,6 +246,12 @@ std::string ServeMetrics::render(std::uint32_t max_concurrency,
     append_counter(out, "ninfer:continuation_l3_entries",
                    static_cast<std::uint64_t>(live.continuation_l3_entries));
     append_counter(out, "ninfer:continuation_l3_bytes", live.continuation_l3_bytes);
+    append_counter(out, "ninfer:continuation_l2_evictions_total", live.continuation_l2_evictions);
+    append_counter(out, "ninfer:continuation_l2_evicted_bytes_total",
+                   live.continuation_l2_evicted_bytes);
+    append_counter(out, "ninfer:continuation_l3_evictions_total", live.continuation_l3_evictions);
+    append_counter(out, "ninfer:continuation_l3_evicted_bytes_total",
+                   live.continuation_l3_evicted_bytes);
     append_counter(out, "ninfer:l1_evictions_total", live.l1_evictions);
     append_counter(out, "ninfer:l1_demotions_total", live.l1_demotions);
     append_counter(out, "ninfer:kv_restore_reclaimed_lanes_total", live.kv_restore_reclaimed_lanes);

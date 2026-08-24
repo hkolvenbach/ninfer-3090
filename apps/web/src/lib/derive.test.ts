@@ -1,9 +1,9 @@
 import { expect, test } from 'bun:test'
 
-import { percentile, summarizeByAdapter, summarizeRequests } from './derive'
-import { parseRecordLine, type RequestDoneRecord } from './records'
+import { percentile, summarizeByAdapter, summarizeChurn, summarizeRequests } from './derive'
+import { parseRecordLine, type RequestDoneRecord, type ThroughputRecord } from './records'
 
-// Fixture shaped like real schema-15 records: a mix of tier sources, one cold miss, one restore
+// Fixture shaped like real schema-17 records: a mix of tier sources, one cold miss, one restore
 // failure. Expected values below were produced by the reference implementation
 // (`cache_health.py`) over this same input, so a change here that drifts from the script fails.
 function done(
@@ -29,11 +29,12 @@ function done(
     accepted?: number
     perPosition?: number[]
     adapter?: string
+    agreement?: number | null
   },
 ): RequestDoneRecord {
   return {
     event: 'request_done',
-    schema_version: 15,
+    schema_version: 17,
     server_instance_id: 'serve-test-1',
     timestamp_unix_ms: 1_700_000_000_000 + id * 1000,
     artifact_type: 'ninfer_serve_request_log',
@@ -83,6 +84,7 @@ function done(
       restored_bytes: values.restoredBytes ?? 0,
       destructive_rollback: false,
       completion_publication_queued: true,
+      deepest_candidate_agreement: values.agreement ?? null,
     },
     speculative:
       values.drafted === undefined
@@ -96,6 +98,113 @@ function done(
             fallback_steps: 0,
             accepted_per_position: values.perPosition ?? [],
           },
+  }
+}
+
+// Only the churn inputs vary; everything else is a plausible constant, because `summarizeChurn`
+// reads nothing but the eviction, restore-tier and publication deltas.
+function throughput(
+  id: number,
+  values: {
+    evictions?: number
+    demotions?: number
+    l1?: number
+    l2?: number
+    l3?: number
+    l2Evictions?: number
+    l3Evictions?: number
+    deferrals?: number
+    superseded?: number
+  },
+): ThroughputRecord {
+  const zeroTier = {
+    l1_restore_successes: 0,
+    l2_restore_successes: 0,
+    l3_restore_successes: 0,
+    l1_restored_tokens: 0,
+    l2_restored_tokens: 0,
+    l3_restored_tokens: 0,
+    delta_l1_restored_tokens: 0,
+    delta_l2_restored_tokens: 0,
+    delta_l3_restored_tokens: 0,
+    l1_restored_bytes: 0,
+    l2_restored_bytes: 0,
+    l3_restored_bytes: 0,
+    delta_l1_restored_bytes: 0,
+    delta_l2_restored_bytes: 0,
+    delta_l3_restored_bytes: 0,
+  }
+  return {
+    event: 'throughput',
+    schema_version: 17,
+    server_instance_id: 'serve-test-1',
+    timestamp_unix_ms: 1_700_000_000_000 + id * 10_000,
+    artifact_type: 'ninfer_serve_request_log',
+    interval_seconds: 10,
+    throughput_tokens_per_second: { prefill: 0, decode: 0 },
+    tokens: { computed_prefill: 0, committed_decode: 0 },
+    decode_batch: { rounds: 0, row_rounds: 0, average_size: null },
+    scheduler: {
+      running: 0,
+      prefilling: 0,
+      decode_ready: 0,
+      waiting: 0,
+      admitted_requests: 0,
+      delta_admitted_requests: 0,
+      queue_seconds_total: 0,
+      delta_queue_seconds: 0,
+      rejected_overloaded: 0,
+      rejected_queue_timeout: 0,
+    },
+    continuation_cache: {
+      occupancy: {
+        l1_entries: 0,
+        l1_bytes: 0,
+        l2_entries: 0,
+        l2_bytes: 0,
+        l3_entries: 0,
+        l3_bytes: 0,
+        l1_evictions: 0,
+        l1_demotions: 0,
+        kv_growth_attempts: 0,
+        kv_growth_forced_spills: 0,
+        kv_growth_curtailed: 0,
+        delta_l1_evictions: values.evictions ?? 0,
+        delta_l1_demotions: values.demotions ?? 0,
+        l2_evictions: 0,
+        l2_evicted_bytes: 0,
+        l3_evictions: 0,
+        l3_evicted_bytes: 0,
+        delta_l2_evictions: values.l2Evictions ?? 0,
+        delta_l2_evicted_bytes: 0,
+        delta_l3_evictions: values.l3Evictions ?? 0,
+        delta_l3_evicted_bytes: 0,
+      },
+      delta_lookup_hits: 0,
+      delta_lookup_misses: 0,
+      delta_restore_successes: 0,
+      delta_restore_failures: 0,
+      delta_restored_tokens: 0,
+      delta_restored_bytes: 0,
+      restore_deferrals: 0,
+      delta_restore_deferrals: values.deferrals ?? 0,
+      lookup_hits: 0,
+      lookup_misses: 0,
+      restore_successes: 0,
+      restore_failures: 0,
+      publication_successes: 0,
+      publication_failures: 0,
+      publication_superseded: 0,
+      delta_publication_superseded: values.superseded ?? 0,
+      persistence_total: { queued: 0, coalesced: 0, successes: 0, failures: 0 },
+      tiers: {
+        ...zeroTier,
+        delta_l1_restore_successes: values.l1 ?? 0,
+        delta_l2_restore_successes: values.l2 ?? 0,
+        delta_l3_restore_successes: values.l3 ?? 0,
+      },
+      miss_reasons: {},
+    },
   }
 }
 
@@ -125,6 +234,9 @@ const FIXTURE: RequestDoneRecord[] = [
     source: 'none',
     missReason: 'no_lane',
     reusePath: 'full_reset',
+    // Preflight agreed with 1800 of the 2000 prompt tokens and the request still prefilled all
+    // 2000, so 1800 tokens of the cache's own state were recomputed.
+    agreement: 1800,
     queue: 4,
     restore: 0,
     prefill: 1,
@@ -177,6 +289,8 @@ const FIXTURE: RequestDoneRecord[] = [
     missReason: 'not_attempted',
     restoreFailure: 'kv_reservation',
     reusePath: 'full_reset',
+    // Nothing was preflighted, so there is no evidence the cache held this prefix at all.
+    agreement: null,
     queue: 3,
     restore: 0,
     prefill: 1.5,
@@ -245,6 +359,88 @@ test('an empty window summarizes without dividing by zero', () => {
   expect(summary.prefillAvoided).toBe(0)
   expect(summary.ttftShare).toEqual({ queue: 0, restore: 0, prefill: 0 })
   expect(summary.speculative.acceptRate).toBe(0)
+  expect(summary.coverageWaste).toEqual({
+    requests: 0,
+    tokens: 0,
+    requestShare: 0,
+    prefillShare: 0,
+  })
+})
+
+test('coverage waste counts prefill spent on state the cache had agreed with', () => {
+  const summary = summarizeRequests(FIXTURE)
+
+  // Only request 2 qualifies: it prefilled from zero with 1800 tokens of agreement and no lane
+  // reuse. Request 5 also prefilled from zero but preflighted nothing, so it is not evidence.
+  expect(summary.coverageWaste.requests).toBe(1)
+  expect(summary.coverageWaste.tokens).toBe(1800)
+  expect(summary.coverageWaste.requestShare).toBeCloseTo(1 / 5, 12)
+  expect(summary.coverageWaste.prefillShare).toBeCloseTo(1800 / 5500, 12)
+})
+
+test('coverage waste excludes agreement the lane had already reused', () => {
+  // `not_deeper`: preflight agreed with 800 tokens, but the resident frontier already covered
+  // those same 800, so nothing was recomputed and this is not waste.
+  const covered = done(10, {
+    prompt: 1000,
+    computed: 200,
+    generated: 10,
+    source: 'none',
+    missReason: 'not_deeper',
+    agreement: 800,
+    queue: 0,
+    restore: 0,
+    prefill: 0.1,
+    decode: 0.1,
+    ttft: 0.1,
+  })
+  // True zero agreement is a real measurement, and it is not waste either.
+  const noAgreement = { ...covered, continuation_cache: { ...covered.continuation_cache } }
+  noAgreement.continuation_cache.deepest_candidate_agreement = 0
+  // A restore that happened is never waste, whatever it agreed with.
+  const restored = { ...covered, continuation_cache: { ...covered.continuation_cache } }
+  restored.continuation_cache.source = 'l2'
+  restored.continuation_cache.deepest_candidate_agreement = 900
+
+  const summary = summarizeRequests([covered, noAgreement, restored])
+  expect(summary.coverageWaste.requests).toBe(0)
+  expect(summary.coverageWaste.tokens).toBe(0)
+})
+
+test('churn sums interval deltas and splits surviving from lost evictions', () => {
+  const window = [
+    throughput(1, { evictions: 4, demotions: 3, l1: 2, l2: 1, l3: 0, deferrals: 1 }),
+    throughput(2, {
+      evictions: 6,
+      demotions: 2,
+      l1: 0,
+      l2: 3,
+      l3: 2,
+      l2Evictions: 5,
+      l3Evictions: 1,
+      superseded: 2,
+    }),
+  ]
+  const churn = summarizeChurn(window)
+
+  expect(churn.evictions).toBe(10)
+  expect(churn.demotions).toBe(5)
+  // Five sessions were evicted with no publication ticket, so they survive nowhere.
+  expect(churn.lost).toBe(5)
+  expect(churn.restores).toEqual({ l1: 2, l2: 4, l3: 2 })
+  // Six of eight restores had to be imported rather than found resident.
+  expect(churn.importShare).toBeCloseTo(6 / 8, 12)
+  expect(churn.l2Evictions).toBe(5)
+  expect(churn.l3Evictions).toBe(1)
+  expect(churn.deferrals).toBe(1)
+  expect(churn.superseded).toBe(2)
+})
+
+test('an empty churn window reports no import pressure rather than NaN', () => {
+  const churn = summarizeChurn([])
+  expect(churn.evictions).toBe(0)
+  expect(churn.lost).toBe(0)
+  expect(churn.importShare).toBe(0)
 })
 
 test('a torn trailing line is skipped rather than throwing', () => {

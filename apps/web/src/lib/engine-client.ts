@@ -1,6 +1,6 @@
 // Transport to a running ninfer-serve, plus the equivalent offline path for a JSONL file.
 //
-// Two channels with different jobs. GET /events carries the schema-14 record stream, which is
+// Two channels with different jobs. GET /events carries the schema-17 record stream, which is
 // append-only history: throughput samples and completed requests. GET /telemetry is polled for
 // instantaneous state - board sensors, scheduler occupancy, VRAM, cache fill - because those are
 // levels rather than events and a snapshot cannot be reconstructed by replaying deltas.
@@ -248,10 +248,9 @@ export class EngineClient {
       throughput: scoped.filter((r): r is ThroughputRecord => r.event === 'throughput'),
       requests: scoped.filter((r): r is RequestDoneRecord => r.event === 'request_done'),
       droppedRecords: droppedInstances,
-      error:
-        scoped.length === 0
-          ? `${name} contains no schema-${records.length === 0 ? '14' : '14'} records`
-          : null,
+      // `lastInstance` is taken from a record that exists, so an empty scope means nothing parsed
+      // at all rather than a run that was filtered out.
+      error: scoped.length === 0 ? `${name} contains no engine records` : null,
     }
     this.notify(this.state)
   }

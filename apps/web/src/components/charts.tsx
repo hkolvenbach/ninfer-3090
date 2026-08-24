@@ -78,6 +78,8 @@ export function BandChart({
   domain,
   ceiling,
   unit,
+  stack,
+  integer,
   caption,
   legend,
   height,
@@ -93,6 +95,13 @@ export function BandChart({
   domain?: [number, number]
   ceiling?: number
   unit?: string
+  /**
+   * Sit each series on the sum of the ones before it. Correct only when the series partition one
+   * total, where overlaying them would let a later series hide an earlier one at the same instant.
+   */
+  stack?: boolean
+  /** Counts have no meaningful half, so their axis must not offer one. */
+  integer?: boolean
   caption?: ReactNode
   legend?: ReactNode
   height?: number
@@ -101,11 +110,22 @@ export function BandChart({
     const base = baseOption()
     const reported = report ?? series
     const windows = series[0]?.bands ?? []
+    // Baseline each series sits on. Zero throughout unless stacking, which keeps one render path.
+    const baselines = series.map(() => windows.map(() => 0))
+    if (stack) {
+      const running = windows.map(() => 0)
+      series.forEach((entry, order) => {
+        windows.forEach((_window, index) => {
+          baselines[order]![index] = running[index]!
+          running[index] = running[index]! + (entry.bands[index]?.value ?? 0)
+        })
+      })
+    }
     return {
       ...base,
       aria: { enabled: true, label: { description: label } },
       xAxis: { ...base.xAxis, min: domain?.[0], max: domain?.[1] },
-      yAxis: { ...base.yAxis, max: ceiling, min: 0 },
+      yAxis: { ...base.yAxis, max: ceiling, min: 0, minInterval: integer ? 1 : undefined },
       tooltip: {
         ...base.tooltip,
         formatter: (params: unknown) => {
@@ -124,25 +144,31 @@ export function BandChart({
               reported.map((entry) => ({
                 color: entry.color,
                 label: entry.name,
-                value: `${(entry.bands[index]?.value ?? 0).toFixed(1)}${unit ? ` ${unit}` : ''}`,
+                value: `${(entry.bands[index]?.value ?? 0).toFixed(integer ? 0 : 1)}${
+                  unit ? ` ${unit}` : ''
+                }`,
               })),
             )
           )
         },
       },
       series: [
-        ...series.map((entry) => ({
+        ...series.map((entry, order) => ({
           type: 'custom' as const,
           name: entry.name,
           silent: true,
-          // Each datum is [start, end, value]. Without an explicit encode ECharts assumes
-          // dimension 1 is the y value and scales the axis to an epoch timestamp.
-          dimensions: ['start', 'end', 'value'],
+          // Each datum is [start, end, top, base]. Without an explicit encode ECharts assumes
+          // dimension 1 is the y value and scales the axis to an epoch timestamp. `top` carries
+          // the stacked height so the axis extent covers the whole stack, not just one layer.
+          dimensions: ['start', 'end', 'top', 'base'],
           encode: { x: [0, 1], y: 2 },
-          data: entry.bands.map((band) => [band.start, band.end, band.value]),
+          data: entry.bands.map((band, index) => {
+            const floor = baselines[order]?.[index] ?? 0
+            return [band.start, band.end, floor + band.value, floor]
+          }),
           renderItem: (_params: CustomSeriesRenderItemParams, api: CustomSeriesRenderItemAPI) => {
             const left = api.coord([api.value(0) as number, api.value(2) as number])
-            const right = api.coord([api.value(1) as number, 0])
+            const right = api.coord([api.value(1) as number, api.value(3) as number])
             return {
               type: 'rect' as const,
               shape: {
@@ -162,14 +188,17 @@ export function BandChart({
           symbolSize: 0,
           lineStyle: { opacity: 0 },
           tooltip: { show: true },
-          data: windows.map((band, index) => [
-            (band.start + band.end) / 2,
-            Math.max(...series.map((entry) => entry.bands[index]?.value ?? 0)),
-          ]),
+          data: windows.map((band, index) => {
+            const values = series.map((entry) => entry.bands[index]?.value ?? 0)
+            return [
+              (band.start + band.end) / 2,
+              stack ? values.reduce((total, value) => total + value, 0) : Math.max(...values),
+            ]
+          }),
         },
       ],
     }
-  }, [series, report, domain, ceiling, unit, label])
+  }, [series, report, domain, ceiling, unit, stack, integer, label])
 
   return (
     <Frame caption={caption} legend={legend}>

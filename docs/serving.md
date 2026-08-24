@@ -58,7 +58,7 @@ cannot be combined with `--vision`. A later request cannot enable a capability o
 | `POST /slots/{id}?action=save\|restore\|erase` | session persistence; requires `--slot-save-path` |
 | `GET /metrics` | Prometheus text exposition; see [Metrics](#metrics) |
 | `GET /telemetry` | one live JSON snapshot: board sensors, scheduler occupancy, VRAM, cache fill, adapter inventory |
-| `GET /events` | SSE stream of the schema-15 records `--request-log-jsonl` writes |
+| `GET /events` | SSE stream of the schema-17 records `--request-log-jsonl` writes |
 
 `/metrics`, `/telemetry`, and `/events` are always registered and cannot be disabled. Like every
 path except `/health`, they require the API key when `--api-key` is set.
@@ -81,7 +81,15 @@ accounts for it; without that field the bank is visible only as reduced free mem
 names come from the load summary rather than from served model ids, so an adapter that has taken
 no traffic is still reported.
 
-`GET /events` streams the same schema-15 records `--request-log-jsonl` appends, as named SSE
+`cache.l2` and `cache.l3` additionally carry `evictions` and `evicted_bytes`, counting only
+entries pushed out because the live working set exceeded that tier's byte budget. A TTL expiry is
+deliberately not counted as one, and neither is a promotion that was refused for want of room,
+since neither is the tier being too small for what is in use. `cache.restore_deferrals` is
+reported apart from `restore_failures` because a deferral leaves the candidate live for a retry
+and a failure does not. The same counters appear on the throughput record as cumulative totals
+paired with interval deltas, so churn is readable from a replayed log as well as live.
+
+`GET /events` streams the same schema-17 records `--request-log-jsonl` appends, as named SSE
 frames whose event name is the record's own `event` field. The records are formatted once and
 fanned out to both sinks, so a live reader and a post-hoc reader of the file see identical lines.
 A connecting reader is replayed the retained `server_start` record followed by a bounded ring of

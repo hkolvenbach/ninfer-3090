@@ -8,6 +8,7 @@ import { cacheFromRecords } from './lib/telemetry'
 import { useEngine } from './lib/use-engine'
 import { AdaptersPanel } from './panels/AdaptersPanel'
 import { CachePanel } from './panels/CachePanel'
+import { ChurnPanel } from './panels/ChurnPanel'
 import { GpuPanel } from './panels/GpuPanel'
 import { Headline } from './panels/Headline'
 import { LatencyPanel } from './panels/LatencyPanel'
@@ -105,6 +106,7 @@ export function App() {
         <GpuPanel gpu={state.telemetry?.gpu} history={state.gpu} replay={replay} />
         <MemoryPanel memory={state.telemetry?.memory} gpu={state.telemetry?.gpu} replay={replay} />
         <CachePanel cache={cache} summary={summary} replay={replay} />
+        <ChurnPanel records={state.throughput} summary={summary} replay={replay} />
         <LatencyPanel summary={summary} />
         <SlotsPanel
           slots={state.telemetry?.slots}

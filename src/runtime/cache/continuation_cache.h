@@ -91,6 +91,13 @@ struct CacheStats {
     std::size_t l2_bytes                 = 0;
     std::size_t l3_entries               = 0;
     std::size_t l3_bytes                 = 0;
+    // Capacity-driven evictions only, never a TTL expiry. The two mean opposite things: an expiry
+    // reclaims state that went cold, while an eviction is a live working set failing to fit its
+    // budget and is therefore the tier-level churn signal.
+    std::uint64_t l2_evictions           = 0;
+    std::uint64_t l2_evicted_bytes       = 0;
+    std::uint64_t l3_evictions           = 0;
+    std::uint64_t l3_evicted_bytes       = 0;
     std::uint64_t persistence_queued     = 0;
     std::uint64_t persistence_coalesced = 0;
     std::uint64_t persistence_successes = 0;

@@ -725,6 +725,13 @@ struct RuntimeStats {
     std::uint64_t continuation_l3_bytes              = 0;
     std::uint32_t continuation_l2_entries            = 0;
     std::uint32_t continuation_l3_entries            = 0;
+    // Entries pushed out of a tier because the live working set exceeded its byte budget. A TTL
+    // expiry is not counted: reclaiming state that went cold is the cache working, while a
+    // capacity eviction is the tier being too small for what is actually in use.
+    std::uint64_t continuation_l2_evictions          = 0;
+    std::uint64_t continuation_l2_evicted_bytes      = 0;
+    std::uint64_t continuation_l3_evictions          = 0;
+    std::uint64_t continuation_l3_evicted_bytes      = 0;
     std::uint64_t l1_evictions                        = 0;
     std::uint64_t l1_demotions                        = 0;
     // On-demand KV growth. A request reserves a bounded decode window at admission and acquires

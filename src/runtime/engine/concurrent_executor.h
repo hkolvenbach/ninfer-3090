@@ -372,6 +372,10 @@ public:
             snapshot.continuation_l3_entries = static_cast<std::uint32_t>(std::min<std::size_t>(
                 cache.l3_entries, std::numeric_limits<std::uint32_t>::max()));
             snapshot.continuation_l3_bytes = cache.l3_bytes;
+            snapshot.continuation_l2_evictions = cache.l2_evictions;
+            snapshot.continuation_l2_evicted_bytes = cache.l2_evicted_bytes;
+            snapshot.continuation_l3_evictions = cache.l3_evictions;
+            snapshot.continuation_l3_evicted_bytes = cache.l3_evicted_bytes;
             snapshot.continuation_l2_admission_microseconds = cache.l2_admission_microseconds;
             snapshot.continuation_l2_admission_operations = cache.l2_admission_operations;
             snapshot.continuation_l3_persistence_microseconds = cache.l3_persistence_microseconds;

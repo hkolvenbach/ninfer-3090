@@ -318,8 +318,15 @@ deployed workload rather than treating these values as fixed costs.
   `decoded` count well above `hits` means preparation is choosing images admission does not use and
   is spending host memory and CPU for nothing;
 - `ninfer:continuation_l2_entries`, `...l2_bytes`, `...l3_entries`, and `...l3_bytes`;
+- `ninfer:continuation_l2_evictions_total`, `...l2_evicted_bytes_total`,
+  `...l3_evictions_total`, and `...l3_evicted_bytes_total`. These count only capacity-driven
+  eviction, never a TTL expiry: reclaiming state that went cold is the cache working, while a
+  capacity eviction means the tier is too small for the live working set. A promotion that cannot
+  find room is refused rather than admitted and then evicted, and a refusal is not counted here;
 - `ninfer:l1_evictions_total`, `...l1_demotions_total`, `...l1_resident_entries`, and
-  `...l1_resident_bytes`;
+  `...l1_resident_bytes`. `evictions` minus `demotions` is the number of retained sessions that
+  were dropped with no publication ticket, so they survive in no tier and the next turn of that
+  conversation prefills from zero;
 - `ninfer:kv_growth_attempts_total`, `...forced_spills_total`, and `...curtailed_total`. A
   generating lane holds pages for its prompt plus a fixed decode window and asks for the rest per
   round. `forced_spills` counts retained sessions demoted to L2/L3 to satisfy such a request, and

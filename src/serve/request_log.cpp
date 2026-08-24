@@ -678,6 +678,12 @@ std::string format_throughput_json(const std::string& server_instance_id, std::u
                report.scheduler.continuation_preflight_rejections},
               {"restore_successes", report.scheduler.continuation_restore_successes},
               {"restore_failures", report.scheduler.continuation_restore_failures},
+              // A deferral is a restore refused for shared-KV capacity with the candidate left
+              // live, so it is restore pressure rather than a lost restore. It is reported apart
+              // from failures because conflating them hides which of the two actually happened.
+              {"restore_deferrals", report.scheduler.continuation_restore_deferrals},
+              {"delta_restore_deferrals",
+               report.continuation_delta.continuation_restore_deferrals},
               {"delta_lookup_hits", report.continuation_delta.continuation_lookup_hits},
               {"delta_lookup_misses", report.continuation_delta.continuation_lookup_misses},
               {"delta_preflight_candidate_rejections",
@@ -817,7 +823,15 @@ std::string format_throughput_json(const std::string& server_instance_id, std::u
               {"kv_growth_forced_spills", report.scheduler.kv_growth_forced_spills},
               {"kv_growth_curtailed", report.scheduler.kv_growth_curtailed},
               {"delta_l1_evictions", report.continuation_delta.l1_evictions},
-              {"delta_l1_demotions", report.continuation_delta.l1_demotions}};
+              {"delta_l1_demotions", report.continuation_delta.l1_demotions},
+              {"l2_evictions", report.scheduler.continuation_l2_evictions},
+              {"l2_evicted_bytes", report.scheduler.continuation_l2_evicted_bytes},
+              {"l3_evictions", report.scheduler.continuation_l3_evictions},
+              {"l3_evicted_bytes", report.scheduler.continuation_l3_evicted_bytes},
+              {"delta_l2_evictions", report.continuation_delta.continuation_l2_evictions},
+              {"delta_l2_evicted_bytes", report.continuation_delta.continuation_l2_evicted_bytes},
+              {"delta_l3_evictions", report.continuation_delta.continuation_l3_evictions},
+              {"delta_l3_evicted_bytes", report.continuation_delta.continuation_l3_evicted_bytes}};
     record["continuation_cache"]["persistence_delta"] =
         Json{{"queued", report.continuation_delta.continuation_persistence_queued},
              {"coalesced", report.continuation_delta.continuation_persistence_coalesced},

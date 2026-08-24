@@ -75,13 +75,20 @@ export interface CacheTierTelemetry {
   capacity_bytes: number
 }
 
+/** Capacity-driven evictions from a tier. A TTL expiry is deliberately not counted as one. */
+export interface CacheTierEvictions {
+  evictions: number
+  evicted_bytes: number
+}
+
 export interface CacheTelemetry {
   l1: CacheTierTelemetry & { evictions: number; demotions: number }
-  l2: CacheTierTelemetry
-  l3: CacheTierTelemetry
+  l2: CacheTierTelemetry & CacheTierEvictions
+  l3: CacheTierTelemetry & CacheTierEvictions
   kv_growth: { attempts: number; forced_spills: number; curtailed: number }
   restore_successes: number
   restore_failures: number
+  restore_deferrals: number
   lookup_hits: number
   lookup_misses: number
   publication_successes: number
@@ -172,11 +179,15 @@ export function cacheFromRecords(
       entries: occupancy.l2_entries,
       bytes: occupancy.l2_bytes,
       capacity_bytes: configured.l2_capacity_mib * mib,
+      evictions: occupancy.l2_evictions ?? 0,
+      evicted_bytes: occupancy.l2_evicted_bytes ?? 0,
     },
     l3: {
       entries: occupancy.l3_entries,
       bytes: occupancy.l3_bytes,
       capacity_bytes: configured.l3_capacity_mib * mib,
+      evictions: occupancy.l3_evictions ?? 0,
+      evicted_bytes: occupancy.l3_evicted_bytes ?? 0,
     },
     kv_growth: {
       attempts: occupancy.kv_growth_attempts,
@@ -185,6 +196,7 @@ export function cacheFromRecords(
     },
     restore_successes: sample.continuation_cache.restore_successes,
     restore_failures: sample.continuation_cache.restore_failures,
+    restore_deferrals: sample.continuation_cache.restore_deferrals ?? 0,
     lookup_hits: sample.continuation_cache.lookup_hits,
     lookup_misses: sample.continuation_cache.lookup_misses,
     publication_successes: sample.continuation_cache.publication_successes,

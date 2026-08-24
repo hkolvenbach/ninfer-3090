@@ -43,7 +43,9 @@ The work specific to this branch, each with the measurement that established it:
   endpoints added for it — `GET /telemetry` for levels and `GET /events` for the record stream —
   drive aggregate and per-sequence throughput, decode batch size, lane occupancy and queue depth,
   the execution thread's wall-clock split, TTFT decomposition, continuation-cache fill against
-  configured capacity, per-adapter usage, NVML board telemetry, and the VRAM budget. Every reading
+  configured capacity, cache churn — whether reuse is drifting down the tiers and how much prefill
+  recomputed state the cache demonstrably held — per-adapter usage, NVML board telemetry, and the
+  VRAM budget. Every reading
   carries a tooltip explaining what it measures and what it means when it moves. The same page
   replays a `--request-log-jsonl` file offline, and says so where a panel is live-only rather than
   drawing zeros. [Guide](docs/dashboard.md)
@@ -521,8 +523,8 @@ The default build registers only Qwen3.8-27B. Enable the optional Qwen3.6-35B-A3
   express — NVML board sensors and decoded clock-throttle reasons, the scheduler's own
   running/prefilling/decode-ready/waiting occupancy, the execution thread's wall-clock split with
   its admission decomposition, the `MemorySummary` VRAM budget including the resident LoRA bank,
-  cache occupancy paired with the configured tier capacities, and the registered adapter
-  inventory — plus an SSE stream of the same schema-15 records
+  cache occupancy paired with the configured tier capacities and per-tier capacity evictions, and
+  the registered adapter inventory — plus an SSE stream of the same schema-17 records
   `--request-log-jsonl` appends. Records are formatted once and fanned out to both sinks, so a
   live reader and a file reader see identical lines. These back the
   [web dashboard](docs/dashboard.md).

@@ -1421,6 +1421,10 @@ public:
                 .l2_bytes = l2_bytes_,
                 .l3_entries = durable,
                 .l3_bytes = l3_bytes_,
+                .l2_evictions = l2_evictions_,
+                .l2_evicted_bytes = l2_evicted_bytes_,
+                .l3_evictions = l3_evictions_,
+                .l3_evicted_bytes = l3_evicted_bytes_,
                 .persistence_queued = persistence_queued_,
                 .persistence_coalesced = persistence_coalesced_,
                  .persistence_successes = persistence_successes_,
@@ -1866,6 +1870,8 @@ private:
             l2_inflation_ = std::max(l2_inflation_, victim->second.score);
             const auto id = victim->first;
             l2_bytes_ -= victim->second.bytes;
+            ++l2_evictions_;
+            l2_evicted_bytes_ += victim->second.bytes;
             l2_.erase(victim);
             if (auto entry = catalog_.find(id); entry != catalog_.end() && !entry->second.durable) {
                 remove_from_sessions(id);
@@ -1888,8 +1894,17 @@ private:
             }
             if (victim == catalog_.end()) break;
             inflation_ = std::max(inflation_, best);
-            drop_l3(victim);
+            note_l3_eviction(victim);
         }
+    }
+
+    // `drop_l3` releases the manifest plus whatever chunks this entry alone still held, so the
+    // volume an eviction actually reclaimed is only observable as the change in the tier total.
+    void note_l3_eviction(std::unordered_map<std::string, Manifest>::iterator victim) {
+        const std::size_t before = l3_bytes_;
+        drop_l3(victim);
+        ++l3_evictions_;
+        l3_evicted_bytes_ += before - l3_bytes_;
     }
 
     bool make_l3_room(std::size_t bytes) {
@@ -1909,7 +1924,7 @@ private:
             }
             if (victim == catalog_.end()) return false;
             inflation_ = std::max(inflation_, best);
-            drop_l3(victim);
+            note_l3_eviction(victim);
         }
         return true;
     }
@@ -2100,6 +2115,8 @@ private:
     std::uint64_t persistence_successes_ = 0, persistence_failures_ = 0;
     std::uint64_t l2_admission_microseconds_ = 0, l2_admission_operations_ = 0;
     std::uint64_t l3_persistence_microseconds_ = 0, l3_persistence_operations_ = 0;
+    std::uint64_t l2_evictions_ = 0, l2_evicted_bytes_ = 0;
+    std::uint64_t l3_evictions_ = 0, l3_evicted_bytes_ = 0;
     std::condition_variable persistence_cv_;
     bool persistence_stopping_ = false;
     std::thread persistence_worker_;

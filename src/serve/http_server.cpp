@@ -219,6 +219,10 @@ ThroughputReport make_throughput_report_impl(const ninfer::RuntimeStats& previou
     NINFER_DELTA(continuation_l1_restored_bytes);
     NINFER_DELTA(continuation_l2_restored_bytes);
     NINFER_DELTA(continuation_l3_restored_bytes);
+    NINFER_DELTA(continuation_l2_evictions);
+    NINFER_DELTA(continuation_l2_evicted_bytes);
+    NINFER_DELTA(continuation_l3_evictions);
+    NINFER_DELTA(continuation_l3_evicted_bytes);
     NINFER_DELTA(continuation_session_restores);
     NINFER_DELTA(continuation_stable_prefix_restores);
     NINFER_DELTA(continuation_miss_disabled);
@@ -728,11 +732,15 @@ void HttpServer::handle_telemetry(const httplib::Request&, httplib::Response& re
         {"l2",
           {{"entries", stats.continuation_l2_entries},
            {"bytes", stats.continuation_l2_bytes},
-           {"capacity_bytes", options_.continuation_cache.l2_capacity_mib * mib}}},
+           {"capacity_bytes", options_.continuation_cache.l2_capacity_mib * mib},
+           {"evictions", stats.continuation_l2_evictions},
+           {"evicted_bytes", stats.continuation_l2_evicted_bytes}}},
         {"l3",
           {{"entries", stats.continuation_l3_entries},
            {"bytes", stats.continuation_l3_bytes},
-           {"capacity_bytes", options_.continuation_cache.l3_capacity_mib * mib}}},
+           {"capacity_bytes", options_.continuation_cache.l3_capacity_mib * mib},
+           {"evictions", stats.continuation_l3_evictions},
+           {"evicted_bytes", stats.continuation_l3_evicted_bytes}}},
         {"kv_restore_reclaimed_lanes", stats.kv_restore_reclaimed_lanes},
         {"kv_growth",
           {{"attempts", stats.kv_growth_attempts},

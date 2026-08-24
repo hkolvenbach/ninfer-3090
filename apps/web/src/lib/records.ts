@@ -1,4 +1,4 @@
-// Record shapes, as emitted by src/serve/request_log.cpp (schema 15).
+// Record shapes, as emitted by src/serve/request_log.cpp (schema 17).
 //
 // GET /events streams these live and `--request-log-jsonl` appends the identical lines, so one
 // set of types serves both the live dashboard and file replay. Only the fields the dashboard
@@ -38,6 +38,36 @@ export interface ContinuationDiagnostics {
   restored_bytes: number
   destructive_rollback: boolean
   completion_publication_queued: boolean
+  // Deepest prefix any preflighted candidate agreed with. `null` when nothing was preflighted,
+  // and 0 only for genuine zero agreement. Against `prompt_tokens` on a request that still
+  // prefilled from zero, this is how much recomputed state the cache actually had in hand.
+  deepest_candidate_agreement?: number | null
+}
+
+/**
+ * Restores broken down by the tier that served them, as cumulative totals paired with the
+ * interval delta. The tier mix is the churn signal: a working set that no longer fits in L1
+ * keeps its hit rate but pays a host or disk import on every turn instead of nothing.
+ */
+export interface ContinuationTierTotals {
+  l1_restore_successes: number
+  l2_restore_successes: number
+  l3_restore_successes: number
+  delta_l1_restore_successes: number
+  delta_l2_restore_successes: number
+  delta_l3_restore_successes: number
+  l1_restored_tokens: number
+  l2_restored_tokens: number
+  l3_restored_tokens: number
+  delta_l1_restored_tokens: number
+  delta_l2_restored_tokens: number
+  delta_l3_restored_tokens: number
+  l1_restored_bytes: number
+  l2_restored_bytes: number
+  l3_restored_bytes: number
+  delta_l1_restored_bytes: number
+  delta_l2_restored_bytes: number
+  delta_l3_restored_bytes: number
 }
 
 /** Per-request phase durations. `ttft` is the quantity the queue/restore/prefill split explains. */
@@ -214,6 +244,17 @@ export interface ThroughputRecord extends RecordEnvelope {
       kv_growth_attempts: number
       kv_growth_forced_spills: number
       kv_growth_curtailed: number
+      delta_l1_evictions: number
+      delta_l1_demotions: number
+      // Capacity-driven evictions from the host and disk tiers. A TTL expiry is not counted here.
+      l2_evictions?: number
+      l2_evicted_bytes?: number
+      l3_evictions?: number
+      l3_evicted_bytes?: number
+      delta_l2_evictions?: number
+      delta_l2_evicted_bytes?: number
+      delta_l3_evictions?: number
+      delta_l3_evicted_bytes?: number
     }
     delta_lookup_hits: number
     delta_lookup_misses: number
@@ -221,6 +262,10 @@ export interface ThroughputRecord extends RecordEnvelope {
     delta_restore_failures: number
     delta_restored_tokens: number
     delta_restored_bytes: number
+    // A restore refused for shared-KV capacity with the candidate left live, so it is restore
+    // pressure rather than a lost restore. Reported apart from `restore_failures`.
+    restore_deferrals?: number
+    delta_restore_deferrals?: number
     // Cumulative totals alongside the deltas. These are what let a replayed log reconstruct the
     // same cache view the live /telemetry snapshot reports.
     lookup_hits: number
@@ -229,13 +274,16 @@ export interface ThroughputRecord extends RecordEnvelope {
     restore_failures: number
     publication_successes: number
     publication_failures: number
+    // Publication work that completed and was then discarded because the alias had moved on.
+    publication_superseded?: number
+    delta_publication_superseded?: number
     persistence_total: {
       queued: number
       coalesced: number
       successes: number
       failures: number
     }
-    tiers: Record<string, number>
+    tiers: ContinuationTierTotals
     miss_reasons: Record<string, number>
   }
 }
