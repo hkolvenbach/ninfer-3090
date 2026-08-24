@@ -62,3 +62,11 @@ dist/*
 
 # Claude Code personal/local settings (may contain API tokens)
 .claude/settings.local.json
+
+# Screen recordings, masters and transcodes alike. The README embeds them from GitHub's
+# user-attachments CDN, which is the only host whose URLs GitHub will render as an inline player,
+# so no video needs to be tracked here. Keep the local copies: re-cutting a clip means uploading
+# the new MP4 through a GitHub comment box and replacing the URL in README.md.
+media/*.mov
+media/*.mkv
+media/*.mp4

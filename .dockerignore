@@ -24,6 +24,10 @@ models
 **/node_modules
 apps/web/dist
 
+# README screenshots and recordings. No stage copies them and BuildKit transfers only what a COPY
+# matches, so this excludes them by intent rather than to reclaim anything measurable.
+media
+
 *.bin
 *.gguf
 *.log

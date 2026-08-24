@@ -11,6 +11,45 @@ reasoning-effort control, and ReplaySSM state transactions for the model's Gated
 This fork targets `sm_89` and Linux. Blackwell-only NVFP4/W4A4 execution is unavailable; the
 engine uses the same groupwise-int path as the 3090 base.
 
+The engine serves its own [dashboard](docs/dashboard.md) on the API port — no second process, no
+exporter, no time-series database.
+
+![NInfer dashboard under a light agent workload: three lanes with one running, reuse served from
+resident VRAM, and an empty disk cache tier.](media/dashboard-steady.png)
+
+**Steady state.** Three lanes, three requests queued at a 2.51 s mean wait. 60% of prompt tokens
+never reach prefill, and 96% of that reuse is found already resident in VRAM, so time to first
+token is dominated by prefill rather than by waiting. L3 is empty because nothing has had to spill
+that far.
+
+![The same dashboard oversubscribed: eight requests queued, the board pinned at its software power
+cap, and both the host and disk cache tiers flagged at capacity.](media/dashboard-saturated.png)
+
+**Saturated.** Four lanes, eight requests queued at a 19.1 s mean wait, the board pinned at
+`SW_POWER_CAP`, and L2 and L3 both flagged at capacity. Reuse still works — 71% of prompt tokens
+avoid prefill — but none of it is resident any more: all 41 restores were imported from host or
+disk, against 80 capacity evictions across the two tiers, and TTFT is now 87% queue. Nothing was
+lost to it, though. Every evicted session was handed down a tier rather than dropped, which is the
+distinction the churn panel exists to make.
+
+Two recordings of the engine driving a live [OpenCode](https://opencode.ai) session, dashboard
+beside it.
+
+https://github.com/user-attachments/assets/623a6aca-c3ff-4664-8ae4-073bf7db1a2a
+
+**[▶ Cold start](https://github.com/user-attachments/assets/623a6aca-c3ff-4664-8ae4-073bf7db1a2a)**
+(35 s). An idle engine takes its first request with nothing to reuse, then decodes at 102 tok/s
+behind a 5.12 s first token at 57% MTP acceptance. By the third request the cache panel already
+reports the prompt arriving from a resident L1 lane rather than being prefilled again.
+
+https://github.com/user-attachments/assets/916c7bda-7793-4474-ab4a-4eb90c3b02ff
+
+**[▶ Continuation reuse](https://github.com/user-attachments/assets/916c7bda-7793-4474-ab4a-4eb90c3b02ff)**
+(66 s). Successive turns of one session, each resuming the last instead of re-reading it. The
+share of prompt tokens kept out of prefill climbs from 31% to 54% as the turns land, MTP
+acceptance settles around 61%, and the queue never leaves zero — the engine is never the thing
+being waited on.
+
 ## Highlights
 
 The work specific to this branch, each with the measurement that established it:
