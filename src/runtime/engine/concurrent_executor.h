@@ -2183,7 +2183,10 @@ private:
             // Re-resolving a candidate costs a lookup and a preflight, so only pay it once the
             // reservation could actually be satisfied. The restore reserves exactly the pages a
             // cold admission would, which makes this probe independent of which candidate wins.
-            if (!request->base_plan || !restore_could_be_hosted(request)) { return; }
+            if (!request->base_plan) { return; }
+            ++request->continuation.restore_gate_checks;
+            if (!restore_could_be_hosted(request)) { return; }
+            ++request->continuation.restore_gate_passes;
             // Deliberately not cleared here. `continuation_restore_attempted` is already set, so
             // clearing on the way in would make any later non-restoring outcome terminal. Only a
             // restore or an exhausted candidate set ends the deferral.
@@ -2249,6 +2252,7 @@ private:
             }
 
             const std::uint32_t lane = *target_lane;
+            request->continuation.restore_target_lane = static_cast<std::int32_t>(lane);
             const auto preflight_depth = [&](const cache::ContinuationImage& image,
                                              ContinuationAliasKind alias_kind) {
                 const auto started = Clock::now();
@@ -2655,6 +2659,9 @@ private:
         if (!request->lane_plans[lane]) {
             throw std::logic_error("selected admission lane has no request plan");
         }
+        // Compared against restore_target_lane: a restore that refused the lane admission then
+        // used is a lane-selection divergence, not a genuine capacity shortfall.
+        request->continuation.admitted_lane = static_cast<std::int32_t>(lane);
         if (choice.evict_retained) {
             for (std::uint32_t retained_lane = 0;
                  retained_lane < max_concurrency_ &&

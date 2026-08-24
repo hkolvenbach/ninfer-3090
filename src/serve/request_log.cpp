@@ -269,6 +269,10 @@ Json continuation_json(const GenerationMetrics& metrics) {
                 {"restore_microseconds", value.restore_microseconds},
                 {"restored_tokens", value.restored_tokens},
                 {"restored_bytes", value.restored_bytes},
+                {"restore_gate_checks", value.restore_gate_checks},
+                {"restore_gate_passes", value.restore_gate_passes},
+                {"restore_target_lane", value.restore_target_lane},
+                {"admitted_lane", value.admitted_lane},
                 {"destructive_rollback", value.destructive_rollback},
                 {"completion_publication_queued", value.completion_publication_queued}};
 }

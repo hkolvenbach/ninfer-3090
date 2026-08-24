@@ -573,6 +573,16 @@ struct ContinuationDiagnostics {
     // ladder can recover, from an early rewrite, which no ladder can.
     std::uint64_t deepest_candidate_agreement = 0;
     bool candidate_agreement_observed         = false;
+    // Why a restore that was deferred for shared-KV capacity never came back. `gate_checks`
+    // counts how often the deferred retry was consulted at all, `gate_passes` how often it found
+    // a lane that could host the restore, and the two lane numbers record which lane the restore
+    // chose against the one admission actually used. A retry that never runs, one that runs but
+    // never sees capacity, and one that sees capacity yet still loses the lane are three
+    // different defects, and only these fields separate them.
+    std::uint32_t restore_gate_checks         = 0;
+    std::uint32_t restore_gate_passes         = 0;
+    std::int32_t restore_target_lane          = -1;
+    std::int32_t admitted_lane                = -1;
     bool destructive_rollback                 = false;
     bool completion_publication_queued        = false;
 };
