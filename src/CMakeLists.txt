@@ -18,9 +18,16 @@ endfunction()
 
 # Host-only continuation images and their RAM/disk content-addressed catalog. It intentionally has
 # no dependency on CUDA or a model target so future promotion/demotion workers can use it directly.
+# One SHA-256 primitive. Content addressing in the continuation cache and artifact identity are
+# the same computation, and the cache must stay free of the CUDA dependency ninfer_artifact carries.
+add_library(ninfer_sha256 STATIC
+  artifact/sha256.cpp)
+ninfer_internal_includes(ninfer_sha256)
+
 add_library(ninfer_continuation_cache STATIC
   runtime/cache/continuation_cache.cpp)
 ninfer_internal_includes(ninfer_continuation_cache)
+target_link_libraries(ninfer_continuation_cache PUBLIC ninfer_sha256)
 
 # Device/tensor/layout/graph primitives and the model-independent request runtime.
 add_library(ninfer_core STATIC
@@ -45,14 +52,13 @@ target_link_libraries(ninfer_core PUBLIC ${NINFER_CUDART_TARGET} CUDA::nvtx3)
 
 # Generic .ninfer framing, binding, and direct final materialization.
 add_library(ninfer_artifact STATIC
-  artifact/sha256.cpp
   artifact/reader.cpp
   artifact/storage_layouts.cpp
   artifact/binder.cpp
   artifact/materializer.cpp
   artifact/typed_binding.cpp)
 ninfer_internal_includes(ninfer_artifact)
-target_link_libraries(ninfer_artifact PUBLIC ninfer_core)
+target_link_libraries(ninfer_artifact PUBLIC ninfer_core ninfer_sha256)
 
 # The warp-specialized SM120 kernel uses setmaxnreg to transfer registers from its
 # producer warpgroup to its consumer warpgroups. Relocatable device code makes ptxas

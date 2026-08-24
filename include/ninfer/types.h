@@ -568,6 +568,11 @@ struct ContinuationDiagnostics {
     std::uint64_t restore_microseconds        = 0;
     std::uint64_t restored_tokens             = 0;
     std::uint64_t restored_bytes              = 0;
+    // Deepest prefix any preflighted candidate agreed with this prompt on, whether or not the
+    // candidate was usable. On a miss this separates a tail rewrite, which a deeper checkpoint
+    // ladder can recover, from an early rewrite, which no ladder can.
+    std::uint64_t deepest_candidate_agreement = 0;
+    bool candidate_agreement_observed         = false;
     bool destructive_rollback                 = false;
     bool completion_publication_queued        = false;
 };
@@ -655,15 +660,20 @@ struct RuntimeStats {
     // Aggregate useful restores. These equal the corresponding L1 + L2 + L3 tier totals.
     std::uint64_t continuation_restore_successes     = 0;
     std::uint64_t continuation_restore_failures      = 0;
+    // Restores refused only for shared-KV capacity and retried afterwards. A deferral is not a
+    // failure: counting it as one conflates a recovered restore with a lost one.
+    std::uint64_t continuation_restore_deferrals     = 0;
     std::uint64_t continuation_publication_successes = 0;
     std::uint64_t continuation_publication_failures  = 0;
     std::uint64_t continuation_publication_superseded = 0;
     // Publications dropped at enqueue because a newer snapshot for the same session replaced them.
     std::uint64_t continuation_publication_coalesced = 0;
-    // Attribution for continuation_publication_failures; these three sum to it.
+    // Attribution for continuation_publication_failures; these five sum to it.
     std::uint64_t continuation_publication_failed_capacity    = 0;
     std::uint64_t continuation_publication_failed_evicted     = 0;
     std::uint64_t continuation_publication_failed_alias_moved = 0;
+    std::uint64_t continuation_publication_failed_lineage     = 0;
+    std::uint64_t continuation_publication_failed_error       = 0;
     std::uint64_t continuation_restored_tokens       = 0;
     std::uint64_t continuation_restored_bytes        = 0;
     std::uint64_t continuation_l1_restore_successes   = 0;
@@ -721,6 +731,9 @@ struct RuntimeStats {
     // the rest of its output as it generates: `attempts` counts round boundaries that asked,
     // `forced_spills` counts retained sessions demoted to make room, and `curtailed` counts
     // requests that ended early at `length` because neither rung found pages.
+    // Retained sessions demoted to make room for a restore that would otherwise have been
+    // refused and cold-prefilled at full cost.
+    std::uint64_t kv_restore_reclaimed_lanes          = 0;
     std::uint64_t kv_growth_attempts                  = 0;
     std::uint64_t kv_growth_forced_spills             = 0;
     std::uint64_t kv_growth_curtailed                 = 0;

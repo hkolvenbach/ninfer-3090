@@ -255,7 +255,12 @@ Json speculative_json(const GenerationMetrics& metrics) {
 
 Json continuation_json(const GenerationMetrics& metrics) {
     const auto& value = metrics.continuation;
-    return Json{{"source", continuation_source_name(value.source)},
+    // Null rather than zero when no candidate was preflighted: "nothing to compare against" and
+    // "diverged at token 0" are different findings and must not read the same.
+    Json agreement = Json(nullptr);
+    if (value.candidate_agreement_observed) { agreement = value.deepest_candidate_agreement; }
+    return Json{{"deepest_candidate_agreement", std::move(agreement)},
+                {"source", continuation_source_name(value.source)},
                 {"alias_kind", continuation_alias_kind_name(value.alias_kind)},
                 {"final_miss_reason", continuation_miss_reason_name(value.final_miss_reason)},
                 {"restore_failure", continuation_restore_failure_name(value.restore_failure)},
@@ -669,12 +674,13 @@ std::string format_throughput_json(const std::string& server_instance_id, std::u
     record["continuation_cache"] =
         Json{{"lookup_hits", report.scheduler.continuation_lookup_hits},
               {"lookup_misses", report.scheduler.continuation_lookup_misses},
-              {"preflight_rejections", report.scheduler.continuation_preflight_rejections},
+              {"preflight_candidate_rejections",
+               report.scheduler.continuation_preflight_rejections},
               {"restore_successes", report.scheduler.continuation_restore_successes},
               {"restore_failures", report.scheduler.continuation_restore_failures},
               {"delta_lookup_hits", report.continuation_delta.continuation_lookup_hits},
               {"delta_lookup_misses", report.continuation_delta.continuation_lookup_misses},
-              {"delta_preflight_rejections",
+              {"delta_preflight_candidate_rejections",
                report.continuation_delta.continuation_preflight_rejections},
               {"delta_restore_failures",
                report.continuation_delta.continuation_restore_failures},
@@ -806,6 +812,7 @@ std::string format_throughput_json(const std::string& server_instance_id, std::u
               {"l3_bytes", report.scheduler.continuation_l3_bytes},
               {"l1_evictions", report.scheduler.l1_evictions},
               {"l1_demotions", report.scheduler.l1_demotions},
+              {"kv_restore_reclaimed_lanes", report.scheduler.kv_restore_reclaimed_lanes},
               {"kv_growth_attempts", report.scheduler.kv_growth_attempts},
               {"kv_growth_forced_spills", report.scheduler.kv_growth_forced_spills},
               {"kv_growth_curtailed", report.scheduler.kv_growth_curtailed},

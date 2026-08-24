@@ -1557,7 +1557,9 @@ std::set<std::string> ProgramImplCore::continuation_segment_inventory(bool bound
 
 std::uint32_t
 ProgramImplCore::preflight_continuation(const cache::ContinuationImage& candidate,
-                                        const PreparedPromptData& prompt) const noexcept {
+                                        const PreparedPromptData& prompt,
+                                        std::uint32_t* divergence_tokens) const noexcept {
+    if (divergence_tokens != nullptr) { *divergence_tokens = 0; }
     try {
         if (candidate.format_version != image::kTargetImageVersion ||
             candidate.compatibility_key != continuation_compatibility_key) {
@@ -1580,6 +1582,9 @@ ProgramImplCore::preflight_continuation(const cache::ContinuationImage& candidat
 
         image::PrefixData prefix =
             image::decode_prefix(candidate.prefix_identity, metadata.ledger_frontier);
+        if (divergence_tokens != nullptr) {
+            *divergence_tokens = qwen3_8::detail::prefix_divergence_tokens(prompt, prefix.ledger);
+        }
         if (prefix.ledger.size() != metadata.ledger_frontier ||
             image::prefix_filter_digest(prefix.ledger, prefix.identity, frontier) !=
                 candidate.frontier_prefix_digest ||

@@ -209,6 +209,7 @@ ThroughputReport make_throughput_report_impl(const ninfer::RuntimeStats& previou
     NINFER_DELTA(continuation_lookup_misses);
     NINFER_DELTA(continuation_preflight_rejections);
     NINFER_DELTA(continuation_restore_failures);
+    NINFER_DELTA(continuation_restore_deferrals);
     NINFER_DELTA(continuation_l1_restore_successes);
     NINFER_DELTA(continuation_l2_restore_successes);
     NINFER_DELTA(continuation_l3_restore_successes);
@@ -250,12 +251,15 @@ ThroughputReport make_throughput_report_impl(const ninfer::RuntimeStats& previou
     NINFER_DELTA(continuation_publication_failed_capacity);
     NINFER_DELTA(continuation_publication_failed_evicted);
     NINFER_DELTA(continuation_publication_failed_alias_moved);
+    NINFER_DELTA(continuation_publication_failed_lineage);
+    NINFER_DELTA(continuation_publication_failed_error);
     NINFER_DELTA(continuation_persistence_queued);
     NINFER_DELTA(continuation_persistence_coalesced);
     NINFER_DELTA(continuation_persistence_successes);
     NINFER_DELTA(continuation_persistence_failures);
     NINFER_DELTA(l1_evictions);
     NINFER_DELTA(l1_demotions);
+    NINFER_DELTA(kv_restore_reclaimed_lanes);
     NINFER_DELTA(kv_growth_attempts);
     NINFER_DELTA(kv_growth_forced_spills);
     NINFER_DELTA(kv_growth_curtailed);
@@ -729,12 +733,14 @@ void HttpServer::handle_telemetry(const httplib::Request&, httplib::Response& re
           {{"entries", stats.continuation_l3_entries},
            {"bytes", stats.continuation_l3_bytes},
            {"capacity_bytes", options_.continuation_cache.l3_capacity_mib * mib}}},
+        {"kv_restore_reclaimed_lanes", stats.kv_restore_reclaimed_lanes},
         {"kv_growth",
           {{"attempts", stats.kv_growth_attempts},
            {"forced_spills", stats.kv_growth_forced_spills},
            {"curtailed", stats.kv_growth_curtailed}}},
         {"restore_successes", stats.continuation_restore_successes},
         {"restore_failures", stats.continuation_restore_failures},
+        {"restore_deferrals", stats.continuation_restore_deferrals},
         {"lookup_hits", stats.continuation_lookup_hits},
         {"lookup_misses", stats.continuation_lookup_misses},
         {"publication_successes", stats.continuation_publication_successes},

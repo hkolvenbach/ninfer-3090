@@ -260,9 +260,11 @@ Program<Variant>::preflight_continuation_metadata(
 template <>
 std::uint32_t
 Program<Variant>::preflight_continuation(const cache::ContinuationImage& image,
-                                         const PreparedPrompt& prompt) const noexcept {
+                                         const PreparedPrompt& prompt,
+                                         std::uint32_t* divergence_tokens) const noexcept {
     try {
-        return impl_->preflight_continuation(image, PreparedPromptAccess::view(prompt));
+        return impl_->preflight_continuation(image, PreparedPromptAccess::view(prompt),
+                                             divergence_tokens);
     } catch (...) { return 0; }
 }
 

@@ -16,6 +16,7 @@ public:
 
 private:
     void process_block(const std::uint8_t* block);
+    void process_blocks(const std::uint8_t* data, std::size_t blocks);
 
     std::array<std::uint32_t, 8> state_{0x6a09e667U, 0xbb67ae85U, 0x3c6ef372U,
                                         0xa54ff53aU, 0x510e527fU, 0x9b05688cU,

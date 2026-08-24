@@ -316,6 +316,8 @@ public:
         reconcile_continuation_aggregate_totals(snapshot);
         snapshot.continuation_restore_failures =
             continuation_stats_.restore_failures.load(std::memory_order_relaxed);
+        snapshot.continuation_restore_deferrals =
+            continuation_stats_.restore_deferrals.load(std::memory_order_relaxed);
         snapshot.continuation_publication_successes =
             continuation_stats_.publication_successes.load(std::memory_order_relaxed);
         snapshot.continuation_publication_failures =
@@ -324,6 +326,10 @@ public:
             continuation_stats_.publication_coalesced.load(std::memory_order_relaxed);
         snapshot.continuation_publication_failed_capacity =
             continuation_stats_.publication_failed_capacity.load(std::memory_order_relaxed);
+        snapshot.continuation_publication_failed_lineage =
+            continuation_stats_.publication_failed_lineage.load(std::memory_order_relaxed);
+        snapshot.continuation_publication_failed_error =
+            continuation_stats_.publication_failed_error.load(std::memory_order_relaxed);
         snapshot.continuation_publication_failed_evicted =
             continuation_stats_.publication_failed_evicted.load(std::memory_order_relaxed);
         snapshot.continuation_publication_failed_alias_moved =
@@ -584,15 +590,23 @@ private:
         std::atomic<std::uint64_t> lookup_misses{0};
         std::atomic<std::uint64_t> preflight_rejections{0};
         std::atomic<std::uint64_t> restore_failures{0};
+        // Restores refused for shared-KV capacity alone. These are retried, so they are not
+        // failures and deliberately do not feed restore_failures or its attribution counters.
+        std::atomic<std::uint64_t> restore_deferrals{0};
         std::atomic<std::uint64_t> publication_successes{0};
         std::atomic<std::uint64_t> publication_failures{0};
         std::atomic<std::uint64_t> publication_superseded{0};
         // Older queued publications for a session that a newer snapshot replaced before they ran.
         std::atomic<std::uint64_t> publication_coalesced{0};
-        // Attribution for publication_failures: these three sum to it.
+        // Attribution for publication_failures: these five sum to it.
         std::atomic<std::uint64_t> publication_failed_capacity{0};
         std::atomic<std::uint64_t> publication_failed_evicted{0};
         std::atomic<std::uint64_t> publication_failed_alias_moved{0};
+        // The image was parented on a head the session had already advanced past.
+        std::atomic<std::uint64_t> publication_failed_lineage{0};
+        // A publication threw. Kept separate because an unclassified throw was previously
+        // indistinguishable from a capacity rejection, which made the counter unreadable.
+        std::atomic<std::uint64_t> publication_failed_error{0};
         std::atomic<std::uint64_t> l2_lookup_microseconds{0};
         std::atomic<std::uint64_t> l2_lookup_operations{0};
         std::atomic<std::uint64_t> l3_lookup_microseconds{0};
@@ -819,6 +833,7 @@ private:
             return ticket;
         } catch (...) {
             continuation_stats_.publication_failures.fetch_add(1, std::memory_order_relaxed);
+            continuation_stats_.publication_failed_error.fetch_add(1, std::memory_order_relaxed);
             return {};
         }
     }
@@ -838,8 +853,11 @@ private:
                 publications_.pop_front();
             }
             PublicationStatus status = PublicationStatus::Failed;
-            cache::SessionPublishOutcome publication_outcome =
-                cache::SessionPublishOutcome::RejectedTooLarge;
+            // No default outcome stands in for an unclassified failure: a throw is its own
+            // attribution. Defaulting this to a real outcome once reported every swallowed
+            // exception as a capacity rejection.
+            std::optional<cache::SessionPublishOutcome> publication_outcome;
+            bool publication_threw = false;
             try {
                 const cache::StoreOptions options{
                     .recompute_cost = static_cast<double>(item.image.frontier_tokens),
@@ -876,7 +894,11 @@ private:
                                                                     : PublicationStatus::Failed);
                     publication_outcome = result.outcome;
                 }
-            } catch (...) {}
+            } catch (...) {
+                // A publication must not take the worker down, but it must not disappear either.
+                publication_threw = true;
+                status            = PublicationStatus::Failed;
+            }
             if (status == PublicationStatus::Success) {
                 continuation_stats_.publication_successes.fetch_add(1, std::memory_order_relaxed);
             } else if (status == PublicationStatus::Superseded) {
@@ -884,21 +906,34 @@ private:
                                                                       std::memory_order_relaxed);
             } else {
                 continuation_stats_.publication_failures.fetch_add(1, std::memory_order_relaxed);
-                switch (publication_outcome) {
-                case cache::SessionPublishOutcome::EvictedOnAdmission:
-                    continuation_stats_.publication_failed_evicted.fetch_add(
+                if (publication_threw || !publication_outcome) {
+                    continuation_stats_.publication_failed_error.fetch_add(
                         1, std::memory_order_relaxed);
-                    break;
-                case cache::SessionPublishOutcome::HeadMoved:
-                case cache::SessionPublishOutcome::GenerationMoved:
-                    continuation_stats_.publication_failed_alias_moved.fetch_add(
-                        1, std::memory_order_relaxed);
-                    break;
-                case cache::SessionPublishOutcome::RejectedTooLarge:
-                case cache::SessionPublishOutcome::Advanced:
-                    continuation_stats_.publication_failed_capacity.fetch_add(
-                        1, std::memory_order_relaxed);
-                    break;
+                } else {
+                    switch (*publication_outcome) {
+                    case cache::SessionPublishOutcome::EvictedOnAdmission:
+                        continuation_stats_.publication_failed_evicted.fetch_add(
+                            1, std::memory_order_relaxed);
+                        break;
+                    case cache::SessionPublishOutcome::HeadMoved:
+                    case cache::SessionPublishOutcome::GenerationMoved:
+                    // Reaching the failure branch with this outcome would be a logic surprise:
+                    // the immutable path reports it as Superseded. Group it with the other lost
+                    // races rather than with a capacity limit it has nothing to do with.
+                    case cache::SessionPublishOutcome::AliasAlreadyOwned:
+                        continuation_stats_.publication_failed_alias_moved.fetch_add(
+                            1, std::memory_order_relaxed);
+                        break;
+                    case cache::SessionPublishOutcome::LineageMismatch:
+                        continuation_stats_.publication_failed_lineage.fetch_add(
+                            1, std::memory_order_relaxed);
+                        break;
+                    case cache::SessionPublishOutcome::RejectedTooLarge:
+                    case cache::SessionPublishOutcome::Advanced:
+                        continuation_stats_.publication_failed_capacity.fetch_add(
+                            1, std::memory_order_relaxed);
+                        break;
+                    }
                 }
             }
             item.ticket->store(status, std::memory_order_release);
@@ -1240,6 +1275,10 @@ private:
         std::optional<std::string> stable_alias;
         std::optional<std::uint32_t> stable_boundary;
         bool continuation_restore_attempted = false;
+        // Set when the only thing that stopped a restore was shared-KV capacity. That is a
+        // transient condition owned by whichever requests currently hold pages, so the candidate
+        // stays live and the restore is retried instead of decaying into a full cold prefill.
+        bool continuation_restore_deferred_kv = false;
         std::optional<PendingSessionPublication> pending_session_publication;
         bool session_lookup_deferred = false;
         std::uint64_t continuation_preflight_operations = 0;
@@ -1413,8 +1452,9 @@ private:
             if (candidate.candidates.empty()) { continue; }
 
             request->stable_continuation            = std::move(candidate);
-            request->continuation_restore_attempted = false;
-            request->stable_flight_resolved         = true;
+            request->continuation_restore_attempted   = false;
+            request->continuation_restore_deferred_kv = false;
+            request->stable_flight_resolved           = true;
             release_stable_builder(request);
         }
     }
@@ -1656,7 +1696,14 @@ private:
                         queue_publication(std::move(image), lane_sessions_[lane]->name,
                                           lane_sessions_[lane]->expected_head,
                                           lane_sessions_[lane]->expected_generation);
-                } catch (...) {}
+                } catch (...) {
+                    // Demotion is best effort, but a failed export is state loss and is counted
+                    // as such rather than being silently absorbed into the eviction.
+                    continuation_stats_.publication_failures.fetch_add(1,
+                                                                       std::memory_order_relaxed);
+                    continuation_stats_.publication_failed_error.fetch_add(
+                        1, std::memory_order_relaxed);
+                }
             }
             demoted = static_cast<bool>(lane_sessions_[lane]->publication);
         }
@@ -1709,6 +1756,69 @@ private:
             evict_retained_lane(*victim);
             return true;
         } catch (...) { return false; }
+    }
+
+    struct Reclaimable {
+        std::uint32_t lane = 0;
+        Clock::time_point last_used;
+    };
+
+    // Whether some idle lane could host a restore of this request right now. Asks the same
+    // predicates admission asks, so the answer cannot drift from what admission would decide.
+    // Side-effect free apart from lane planning, which admission performs anyway: it gates the
+    // deferred retry so a request waiting on capacity does not re-pay lookup and preflight on
+    // every admission pass.
+    [[nodiscard]] bool restore_could_be_hosted(const std::shared_ptr<Request>& request) {
+        for (std::uint32_t lane = 0; lane < max_concurrency_; ++lane) {
+            if (slots_[lane] != nullptr) { continue; }
+            ensure_lane_plan(request, lane);
+            const Plan& plan = *request->lane_plans[lane];
+            if (instance_.program->can_admit_lane(lane, plan) ||
+                instance_.program->can_admit_lane_after_retained_eviction(lane, plan)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    // Makes `target` able to host the restore, demoting idle retained sessions least-recently used
+    // first. Feasibility and sufficiency are both decided by the admission predicates rather than
+    // by a second capacity rule: a restore reserves exactly the entitlement a cold admission of the
+    // same request would, so anything admission can place, a restore can place. Nothing is evicted
+    // unless eviction would actually be enough, because a restore that is going to be refused
+    // anyway must not also destroy a healthy session.
+    [[nodiscard]] bool prepare_lane_for_restore(std::uint32_t target, const Plan& plan) noexcept {
+        const auto fits = [&] { return instance_.program->can_admit_lane(target, plan); };
+        if (!fits()) {
+            if (!instance_.program->can_admit_lane_after_retained_eviction(target, plan)) {
+                return false;
+            }
+            std::array<Reclaimable, kMaximumConcurrency> victims{};
+            std::size_t count = 0;
+            for (std::uint32_t lane = 0; lane < max_concurrency_; ++lane) {
+                if (lane == target || slots_[lane] != nullptr ||
+                    !instance_.program->has_retained_lane(lane)) {
+                    continue;
+                }
+                victims[count++] = Reclaimable{
+                    .lane      = lane,
+                    .last_used = retained_last_used_[lane].value_or(Clock::time_point{})};
+            }
+            // Coldest first: the session least likely to be resumed is the cheapest to demote.
+            std::sort(victims.begin(), victims.begin() + static_cast<std::ptrdiff_t>(count),
+                      [](const Reclaimable& left, const Reclaimable& right) {
+                          return left.last_used < right.last_used;
+                      });
+            for (std::size_t i = 0; i < count && !fits(); ++i) {
+                evict_retained_lane(victims[i].lane);
+                ++cumulative_stats_.kv_restore_reclaimed_lanes;
+            }
+            if (!fits()) { return false; }
+        }
+        // The target's own retained session is what this restore overwrites; release it only now
+        // that the lane is known to be usable.
+        if (instance_.program->has_retained_lane(target)) { evict_retained_lane(target); }
+        return true;
     }
 
     [[nodiscard]] bool enforce_l1_retention() noexcept {
@@ -2062,7 +2172,18 @@ private:
     }
 
     void try_restore_continuation(const std::shared_ptr<Request>& request) noexcept {
-        if (request->continuation_restore_attempted) { return; }
+        if (request->continuation_restore_attempted && !request->continuation_restore_deferred_kv) {
+            return;
+        }
+        if (request->continuation_restore_deferred_kv) {
+            // Re-resolving a candidate costs a lookup and a preflight, so only pay it once the
+            // reservation could actually be satisfied. The restore reserves exactly the pages a
+            // cold admission would, which makes this probe independent of which candidate wins.
+            if (!request->base_plan || !restore_could_be_hosted(request)) { return; }
+            // Deliberately not cleared here. `continuation_restore_attempted` is already set, so
+            // clearing on the way in would make any later non-restoring outcome terminal. Only a
+            // restore or an exhausted candidate set ends the deferral.
+        }
 
         try {
             std::optional<std::uint32_t> target_lane;
@@ -2118,7 +2239,8 @@ private:
                 request->routed_continuation.candidates.empty() &&
                 !request->stable_continuation.image &&
                 request->stable_continuation.candidates.empty()) {
-                request->continuation_restore_attempted = true;
+                request->continuation_restore_attempted   = true;
+                request->continuation_restore_deferred_kv = false;
                 return;
             }
 
@@ -2127,11 +2249,16 @@ private:
                                              ContinuationAliasKind alias_kind) {
                 const auto started = Clock::now();
                 ++request->continuation_preflight_operations;
+                std::uint32_t divergence = 0;
                 const std::uint32_t depth =
-                    instance_.program->preflight_continuation(image, request->prompt);
+                    instance_.program->preflight_continuation(image, request->prompt, &divergence);
                 request->continuation.preflight_microseconds += static_cast<std::uint64_t>(
                     std::chrono::duration_cast<std::chrono::microseconds>(Clock::now() - started)
                         .count());
+                request->continuation.candidate_agreement_observed = true;
+                request->continuation.deepest_candidate_agreement =
+                    std::max(request->continuation.deepest_candidate_agreement,
+                             static_cast<std::uint64_t>(divergence));
                 if (depth == 0) {
                     continuation_stats_.preflight_rejections.fetch_add(1,
                                                                         std::memory_order_relaxed);
@@ -2195,36 +2322,27 @@ private:
                     candidate.image.reset();
                     return false;
                 }
-                // The lane's retained session is not released until the import is known to have
-                // succeeded, and the import itself reserves shared KV pages before it materializes
-                // anything. Evicting first meant that a restore refused for KV pressure both
-                // cold-prefilled this request and destroyed an unrelated healthy session.
+                // The restore takes the lane plan's entitlement, which already covers the whole
+                // prompt plus its decode window and so dominates the restored frontier. That is
+                // exactly what a cold admission of this request would reserve, which is why the
+                // admission predicates are the right authority here: refusing a restore does not
+                // avoid the pages, it only trades a cheap import for a full cold prefill of the
+                // same size. The lane's retained session is released only once the lane is known
+                // to be usable, so a refused restore never also destroys a healthy session.
                 const runtime::KvPageFootprint required =
                     continuation_image_kv_footprint(*candidate.image, request);
-                const bool occupied = instance_.program->has_retained_lane(lane);
-                if (!instance_.program->kv_reservation_fits(required.text_pages,
-                                                            required.backend_pages)) {
-                    const runtime::KvPageFootprint reclaimable =
-                        occupied ? instance_.program->retained_lane_kv_footprint(lane)
-                                 : runtime::KvPageFootprint{};
-                    if (!occupied || reclaimable.text_pages + reclaimable.backend_pages == 0) {
-                        continuation_stats_.restore_failures.fetch_add(1,
-                                                                        std::memory_order_relaxed);
-                        record_restore_failure(
-                            ContinuationRestoreFailure::KvReservationExhausted);
-                        request->continuation.restore_failure =
-                            ContinuationRestoreFailure::KvReservationExhausted;
-                        observe_continuation_miss(request->continuation,
-                                                  ContinuationMissReason::RestoreFailed,
-                                                  candidate.alias_kind);
-                        candidate.image.reset();
-                        return false;
-                    }
-                    // Only the lane this restore would take is released, and only once its pages
-                    // are the difference between refusing and succeeding.
-                    evict_retained_lane(lane);
-                } else if (occupied) {
-                    evict_retained_lane(lane);
+                if (!prepare_lane_for_restore(lane, *request->lane_plans[lane])) {
+                    // Capacity, not content: this candidate still matches. Keeping it live for a
+                    // later retry costs nothing, because admission cannot place the request either
+                    // while the pool is this full.
+                    continuation_stats_.restore_deferrals.fetch_add(1, std::memory_order_relaxed);
+                    request->continuation.restore_failure =
+                        ContinuationRestoreFailure::KvReservationExhausted;
+                    request->continuation_restore_deferred_kv = true;
+                    observe_continuation_miss(request->continuation,
+                                              ContinuationMissReason::RestoreFailed,
+                                              candidate.alias_kind);
+                    return false;
                 }
                 const std::uint64_t restored_bytes =
                     cache::continuation_image_bytes(*candidate.image);
@@ -2267,6 +2385,7 @@ private:
                     request->continuation.restored_bytes = restored_bytes;
                     request->continuation.final_miss_reason = ContinuationMissReason::None;
                     request->continuation.restore_failure = ContinuationRestoreFailure::None;
+                    request->continuation_restore_deferred_kv = false;
                 } else {
                     continuation_stats_.restore_failures.fetch_add(1, std::memory_order_relaxed);
                     record_restore_failure(failure);

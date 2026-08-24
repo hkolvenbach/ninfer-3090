@@ -5,6 +5,11 @@
 #include <limits>
 #include <stdexcept>
 
+#if defined(__x86_64__) || defined(_M_X64)
+#    define NINFER_SHA256_X86 1
+#    include <immintrin.h>
+#endif
+
 namespace ninfer::artifact {
 namespace {
 
@@ -81,6 +86,130 @@ void Sha256::process_block(const std::uint8_t* block) {
     state_[7] += h;
 }
 
+#if NINFER_SHA256_X86
+namespace {
+
+// Intel SHA extensions. The compression function is unchanged; only its message schedule and
+// round arithmetic move into sha256rnds2/msg1/msg2, so the digest is bit-identical to the
+// portable path above. The qualification test asserts that directly, on NIST vectors and on
+// randomly split updates.
+#    define NINFER_SHA_TARGET __attribute__((target("sha,sse4.1")))
+
+// One quartet of rounds: sha256rnds2 over the low then the high half of the message.
+NINFER_SHA_TARGET inline void sha_quartet(__m128i& state0, __m128i& state1, __m128i message) {
+    state1  = _mm_sha256rnds2_epu32(state1, state0, message);
+    message = _mm_shuffle_epi32(message, 0x0E);
+    state0  = _mm_sha256rnds2_epu32(state0, state1, message);
+}
+
+// Rounds 12-59 share one shape: extend the schedule for the quartet after next, run this
+// quartet, and optionally advance the register that feeds the one after it.
+NINFER_SHA_TARGET inline void sha_scheduled_quartet(__m128i& state0, __m128i& state1,
+                                                    __m128i current, __m128i previous,
+                                                    __m128i& next, __m128i* ahead,
+                                                    long long high, long long low) {
+    __m128i message = _mm_add_epi32(current, _mm_set_epi64x(high, low));
+    state1          = _mm_sha256rnds2_epu32(state1, state0, message);
+    next            = _mm_add_epi32(next, _mm_alignr_epi8(current, previous, 4));
+    next            = _mm_sha256msg2_epu32(next, current);
+    message         = _mm_shuffle_epi32(message, 0x0E);
+    state0          = _mm_sha256rnds2_epu32(state0, state1, message);
+    if (ahead != nullptr) { *ahead = _mm_sha256msg1_epu32(*ahead, current); }
+}
+
+NINFER_SHA_TARGET void process_blocks_shani(std::array<std::uint32_t, 8>& state,
+                                            const std::uint8_t* data, std::size_t blocks) {
+    const __m128i mask = _mm_set_epi64x(0x0c0d0e0f08090a0bLL, 0x0405060700010203LL);
+    __m128i tmp        = _mm_loadu_si128(reinterpret_cast<const __m128i*>(state.data()));
+    __m128i state1     = _mm_loadu_si128(reinterpret_cast<const __m128i*>(state.data() + 4));
+    tmp                = _mm_shuffle_epi32(tmp, 0xB1);
+    state1             = _mm_shuffle_epi32(state1, 0x1B);
+    __m128i state0     = _mm_alignr_epi8(tmp, state1, 8);
+    state1             = _mm_blend_epi16(state1, tmp, 0xF0);
+
+    for (std::size_t block = 0; block < blocks; ++block, data += 64) {
+        const __m128i abef_save = state0;
+        const __m128i cdgh_save = state1;
+
+        __m128i msg0 =
+            _mm_shuffle_epi8(_mm_loadu_si128(reinterpret_cast<const __m128i*>(data)), mask);
+        __m128i msg1 =
+            _mm_shuffle_epi8(_mm_loadu_si128(reinterpret_cast<const __m128i*>(data + 16)), mask);
+        __m128i msg2 =
+            _mm_shuffle_epi8(_mm_loadu_si128(reinterpret_cast<const __m128i*>(data + 32)), mask);
+        __m128i msg3 =
+            _mm_shuffle_epi8(_mm_loadu_si128(reinterpret_cast<const __m128i*>(data + 48)), mask);
+
+        sha_quartet(state0, state1,
+                    _mm_add_epi32(msg0, _mm_set_epi64x(0xE9B5DBA5B5C0FBCFLL,
+                                                       0x71374491428A2F98LL)));
+        sha_quartet(state0, state1,
+                    _mm_add_epi32(msg1, _mm_set_epi64x(0xAB1C5ED5923F82A4LL,
+                                                       0x59F111F13956C25BLL)));
+        msg0 = _mm_sha256msg1_epu32(msg0, msg1);
+        sha_quartet(state0, state1,
+                    _mm_add_epi32(msg2, _mm_set_epi64x(0x550C7DC3243185BELL,
+                                                       0x12835B01D807AA98LL)));
+        msg1 = _mm_sha256msg1_epu32(msg1, msg2);
+
+        sha_scheduled_quartet(state0, state1, msg3, msg2, msg0, &msg2,
+                              0xC19BF1749BDC06A7LL, 0x80DEB1FE72BE5D74LL);
+        sha_scheduled_quartet(state0, state1, msg0, msg3, msg1, &msg3,
+                              0x240CA1CC0FC19DC6LL, 0xEFBE4786E49B69C1LL);
+        sha_scheduled_quartet(state0, state1, msg1, msg0, msg2, &msg0,
+                              0x76F988DA5CB0A9DCLL, 0x4A7484AA2DE92C6FLL);
+        sha_scheduled_quartet(state0, state1, msg2, msg1, msg3, &msg1,
+                              0xBF597FC7B00327C8LL, 0xA831C66D983E5152LL);
+        sha_scheduled_quartet(state0, state1, msg3, msg2, msg0, &msg2,
+                              0x1429296706CA6351LL, 0xD5A79147C6E00BF3LL);
+        sha_scheduled_quartet(state0, state1, msg0, msg3, msg1, &msg3,
+                              0x53380D134D2C6DFCLL, 0x2E1B213827B70A85LL);
+        sha_scheduled_quartet(state0, state1, msg1, msg0, msg2, &msg0,
+                              0x92722C8581C2C92ELL, 0x766A0ABB650A7354LL);
+        sha_scheduled_quartet(state0, state1, msg2, msg1, msg3, &msg1,
+                              0xC76C51A3C24B8B70LL, 0xA81A664BA2BFE8A1LL);
+        sha_scheduled_quartet(state0, state1, msg3, msg2, msg0, &msg2,
+                              0x106AA070F40E3585LL, 0xD6990624D192E819LL);
+        sha_scheduled_quartet(state0, state1, msg0, msg3, msg1, &msg3,
+                              0x34B0BCB52748774CLL, 0x1E376C0819A4C116LL);
+        sha_scheduled_quartet(state0, state1, msg1, msg0, msg2, nullptr,
+                              0x682E6FF35B9CCA4FLL, 0x4ED8AA4A391C0CB3LL);
+        sha_scheduled_quartet(state0, state1, msg2, msg1, msg3, nullptr,
+                              0x8CC7020884C87814LL, 0x78A5636F748F82EELL);
+        sha_quartet(state0, state1,
+                    _mm_add_epi32(msg3, _mm_set_epi64x(0xC67178F2BEF9A3F7LL,
+                                                       0xA4506CEB90BEFFFALL)));
+
+        state0 = _mm_add_epi32(state0, abef_save);
+        state1 = _mm_add_epi32(state1, cdgh_save);
+    }
+
+    tmp    = _mm_shuffle_epi32(state0, 0x1B);
+    state1 = _mm_shuffle_epi32(state1, 0xB1);
+    _mm_storeu_si128(reinterpret_cast<__m128i*>(state.data()), _mm_blend_epi16(tmp, state1, 0xF0));
+    _mm_storeu_si128(reinterpret_cast<__m128i*>(state.data() + 4), _mm_alignr_epi8(state1, tmp, 8));
+}
+
+bool have_sha_extensions() noexcept {
+    static const bool supported = __builtin_cpu_supports("sha") != 0;
+    return supported;
+}
+
+#    undef NINFER_SHA_TARGET
+
+} // namespace
+#endif
+
+void Sha256::process_blocks(const std::uint8_t* data, std::size_t blocks) {
+#if NINFER_SHA256_X86
+    if (have_sha_extensions()) {
+        process_blocks_shani(state_, data, blocks);
+        return;
+    }
+#endif
+    for (std::size_t i = 0; i < blocks; ++i) { process_block(data + i * 64); }
+}
+
 void Sha256::update(std::span<const std::byte> bytes) {
     if (finished_) { throw std::logic_error("SHA-256 digest is already finalized"); }
     if (bytes.size() > std::numeric_limits<std::uint64_t>::max() - total_bytes_ ||
@@ -102,9 +231,10 @@ void Sha256::update(std::span<const std::byte> bytes) {
             return;
         }
     }
-    while (bytes.size() - cursor >= pending_.size()) {
-        process_block(input + cursor);
-        cursor += pending_.size();
+    const std::size_t blocks = (bytes.size() - cursor) / pending_.size();
+    if (blocks != 0) {
+        process_blocks(input + cursor, blocks);
+        cursor += blocks * pending_.size();
     }
     pending_size_ = bytes.size() - cursor;
     std::copy_n(input + cursor, pending_size_, pending_.data());

@@ -131,6 +131,10 @@ enum class SessionPublishOutcome : std::uint8_t {
     // though the prefix text is identical. The loser's state is still admitted and usable; it
     // simply does not own the alias, so this is a lost race and not a failure.
     AliasAlreadyOwned,
+    // The caller's image was parented on a head that is no longer the one it expected. Under
+    // concurrent turns of one session this is an ordinary lost race, not a malformed call, so it
+    // is reported rather than thrown: the publication worker re-derives the head and retries.
+    LineageMismatch,
 };
 
 [[nodiscard]] constexpr const char* session_publish_outcome_name(SessionPublishOutcome outcome) {
@@ -141,6 +145,7 @@ enum class SessionPublishOutcome : std::uint8_t {
     case SessionPublishOutcome::HeadMoved: return "head_moved";
     case SessionPublishOutcome::GenerationMoved: return "generation_moved";
     case SessionPublishOutcome::AliasAlreadyOwned: return "alias_already_owned";
+    case SessionPublishOutcome::LineageMismatch: return "lineage_mismatch";
     }
     return "advanced";
 }

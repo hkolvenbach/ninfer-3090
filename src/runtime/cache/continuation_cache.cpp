@@ -1,5 +1,7 @@
 #include "runtime/cache/continuation_cache.h"
 
+#include "artifact/sha256.h"
+
 #include <algorithm>
 #include <array>
 #include <atomic>
@@ -11,6 +13,7 @@
 #include <fstream>
 #include <limits>
 #include <mutex>
+#include <span>
 #include <stdexcept>
 #include <thread>
 #include <unordered_map>
@@ -45,100 +48,17 @@ constexpr std::size_t kPrefixDigestBytes            = 32;
 // far below it.
 constexpr std::size_t kMaxImageSegments             = 4096;
 
-class Sha256 {
-public:
-    void update(const std::uint8_t* data, std::size_t size) {
-        total_ += size;
-        while (size != 0) {
-            const std::size_t take = std::min(size, block_.size() - used_);
-            std::memcpy(block_.data() + used_, data, take);
-            used_ += take;
-            data += take;
-            size -= take;
-            if (used_ == block_.size()) {
-                transform(block_.data());
-                used_ = 0;
-            }
-        }
-    }
+// Content addressing uses the one owned SHA-256 primitive; this file previously carried a
+// second, slower copy of the same algorithm.
+using Sha256 = artifact::Sha256;
 
-    [[nodiscard]] std::array<std::uint8_t, 32> finish() {
-        const std::uint64_t bits = static_cast<std::uint64_t>(total_) * 8;
-        block_[used_++]          = 0x80;
-        if (used_ > 56) {
-            std::fill(block_.begin() + static_cast<std::ptrdiff_t>(used_), block_.end(), 0);
-            transform(block_.data());
-            used_ = 0;
-        }
-        std::fill(block_.begin() + static_cast<std::ptrdiff_t>(used_), block_.begin() + 56, 0);
-        for (int i = 0; i != 8; ++i) block_[63 - i] = static_cast<std::uint8_t>(bits >> (i * 8));
-        transform(block_.data());
-        std::array<std::uint8_t, 32> out{};
-        for (std::size_t i = 0; i != state_.size(); ++i) {
-            for (int j = 0; j != 4; ++j)
-                out[i * 4 + j] = static_cast<std::uint8_t>(state_[i] >> (24 - j * 8));
-        }
-        return out;
-    }
-
-private:
-    static constexpr std::array<std::uint32_t, 64> k{
-        0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4,
-        0xab1c5ed5, 0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe,
-        0x9bdc06a7, 0xc19bf174, 0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc, 0x2de92c6f,
-        0x4a7484aa, 0x5cb0a9dc, 0x76f988da, 0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7,
-        0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967, 0x27b70a85, 0x2e1b2138, 0x4d2c6dfc,
-        0x53380d13, 0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85, 0xa2bfe8a1, 0xa81a664b,
-        0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070, 0x19a4c116,
-        0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3,
-        0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7,
-        0xc67178f2};
-
-    void transform(const std::uint8_t* p) {
-        std::array<std::uint32_t, 64> w{};
-        for (int i = 0; i != 16; ++i)
-            w[i] = (std::uint32_t(p[i * 4]) << 24) | (std::uint32_t(p[i * 4 + 1]) << 16) |
-                   (std::uint32_t(p[i * 4 + 2]) << 8) | p[i * 4 + 3];
-        for (int i = 16; i != 64; ++i) {
-            const auto s0 = std::rotr(w[i - 15], 7) ^ std::rotr(w[i - 15], 18) ^ (w[i - 15] >> 3);
-            const auto s1 = std::rotr(w[i - 2], 17) ^ std::rotr(w[i - 2], 19) ^ (w[i - 2] >> 10);
-            w[i]          = w[i - 16] + s0 + w[i - 7] + s1;
-        }
-        auto [a, b, c, d, e, f, g, h] = state_;
-        for (int i = 0; i != 64; ++i) {
-            const auto s1 = std::rotr(e, 6) ^ std::rotr(e, 11) ^ std::rotr(e, 25);
-            const auto t1 = h + s1 + ((e & f) ^ (~e & g)) + k[i] + w[i];
-            const auto s0 = std::rotr(a, 2) ^ std::rotr(a, 13) ^ std::rotr(a, 22);
-            const auto t2 = s0 + ((a & b) ^ (a & c) ^ (b & c));
-            h             = g;
-            g             = f;
-            f             = e;
-            e             = d + t1;
-            d             = c;
-            c             = b;
-            b             = a;
-            a             = t1 + t2;
-        }
-        state_[0] += a;
-        state_[1] += b;
-        state_[2] += c;
-        state_[3] += d;
-        state_[4] += e;
-        state_[5] += f;
-        state_[6] += g;
-        state_[7] += h;
-    }
-
-    std::array<std::uint32_t, 8> state_{0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a,
-                                        0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19};
-    std::array<std::uint8_t, 64> block_{};
-    std::size_t used_  = 0;
-    std::size_t total_ = 0;
-};
+void update_bytes(Sha256& hash, const std::uint8_t* data, std::size_t size) {
+    hash.update(std::as_bytes(std::span(data, size)));
+}
 
 std::string sha256(const std::uint8_t* data, std::size_t size) {
     Sha256 hash;
-    hash.update(data, size);
+    update_bytes(hash, data, size);
     const auto digest       = hash.finish();
     constexpr char digits[] = "0123456789abcdef";
     std::string out(64, '0');
@@ -307,7 +227,7 @@ SerializedImage serialize_with_regions(const ContinuationImage& image) {
 ContentId hash_serialized(const ContinuationImage& image) {
     Sha256 hash;
     emit_serialized(image, [&](const std::uint8_t* data, std::size_t size) {
-        hash.update(data, size);
+        update_bytes(hash, data, size);
     });
     const auto digest = hash.finish();
     constexpr char digits[] = "0123456789abcdef";
@@ -483,15 +403,19 @@ Bytes read_file(const std::filesystem::path& path, std::size_t expected = 0,
     return bytes;
 }
 
+// The caller hashes the assembled image and compares it against the entry's content address,
+// which already proves every chunk was read correctly. Re-hashing each chunk here would double
+// the bytes hashed per restore to establish nothing further, so this checks only the framing the
+// image digest cannot attribute: a chunk of the wrong length.
 void read_chunk(const std::filesystem::path& path, std::uint8_t* destination,
-                std::size_t expected, std::size_t maximum, std::string_view expected_hash) {
+                std::size_t expected, std::size_t maximum) {
     if (expected == 0 || expected > maximum) throw std::runtime_error("invalid chunk size");
     std::error_code ec;
     const auto size = std::filesystem::file_size(path, ec);
     if (ec || size != expected || size > maximum) throw std::runtime_error("invalid chunk size");
     std::ifstream in(path, std::ios::binary);
     if (!in.read(reinterpret_cast<char*>(destination), static_cast<std::streamsize>(expected)) ||
-        in.peek() != EOF || sha256(destination, expected) != expected_hash) {
+        in.peek() != EOF) {
         throw std::runtime_error("corrupt chunk");
     }
 }
@@ -932,7 +856,10 @@ public:
                                              const StoreOptions& options,
                                              std::optional<std::uint64_t> expected_generation) {
         if (image.parent_id != expected_head) {
-            throw std::invalid_argument("session publication parent does not match expected head");
+            return {.id             = {},
+                    .stored         = false,
+                    .alias_advanced = false,
+                    .outcome        = SessionPublishOutcome::LineageMismatch};
         }
         StoreOptions without_session = options;
         without_session.session.reset();
@@ -945,7 +872,10 @@ public:
         const std::optional<ContentId>& expected_head, const StoreOptions& options,
         std::optional<std::uint64_t> expected_generation) {
         if (image.parent_id != expected_head) {
-            throw std::invalid_argument("session publication parent does not match expected head");
+            return {.id             = {},
+                    .stored         = false,
+                    .alias_advanced = false,
+                    .outcome        = SessionPublishOutcome::LineageMismatch};
         }
         StoreOptions without_session = options;
         without_session.session.reset();
@@ -1008,8 +938,9 @@ public:
             Sha256 image_hash;
             for (const auto& chunk : snapshot.chunks) {
                 read_chunk(chunks_ / chunk.id, payload.data() + at,
-                           static_cast<std::size_t>(chunk.size), config_.chunk_bytes, chunk.id);
-                image_hash.update(payload.data() + at, static_cast<std::size_t>(chunk.size));
+                           static_cast<std::size_t>(chunk.size), config_.chunk_bytes);
+                update_bytes(image_hash, payload.data() + at,
+                             static_cast<std::size_t>(chunk.size));
                 at += static_cast<std::size_t>(chunk.size);
             }
             const auto digest = image_hash.finish();

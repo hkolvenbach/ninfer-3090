@@ -89,7 +89,10 @@ std::string ServeMetrics::render(std::uint32_t max_concurrency,
     append_counter(out, "ninfer:continuation_lookup_hits_total", live.continuation_lookup_hits);
     append_counter(out, "ninfer:continuation_lookup_misses_total",
                    live.continuation_lookup_misses);
-    append_counter(out, "ninfer:continuation_preflight_rejections_total",
+    // Per candidate, not per request: one request preflights every candidate its session alias
+    // offers, so this exceeds continuation_miss_preflight_rejected_total whenever a later
+    // candidate succeeded.
+    append_counter(out, "ninfer:continuation_preflight_candidate_rejections_total",
                    live.continuation_preflight_rejections);
     append_counter(out, "ninfer:continuation_preparation_hits_total",
                    live.continuation_preparation_hits);
@@ -101,6 +104,8 @@ std::string ServeMetrics::render(std::uint32_t max_concurrency,
                    live.continuation_restore_successes);
     append_counter(out, "ninfer:continuation_restore_failures_total",
                    live.continuation_restore_failures);
+    append_counter(out, "ninfer:continuation_restore_deferrals_total",
+                   live.continuation_restore_deferrals);
     append_counter(out, "ninfer:continuation_publication_successes_total",
                    live.continuation_publication_successes);
     append_counter(out, "ninfer:continuation_publication_failures_total",
@@ -115,6 +120,10 @@ std::string ServeMetrics::render(std::uint32_t max_concurrency,
                    live.continuation_publication_failed_evicted);
     append_counter(out, "ninfer:continuation_publication_failed_alias_moved_total",
                    live.continuation_publication_failed_alias_moved);
+    append_counter(out, "ninfer:continuation_publication_failed_lineage_total",
+                   live.continuation_publication_failed_lineage);
+    append_counter(out, "ninfer:continuation_publication_failed_error_total",
+                   live.continuation_publication_failed_error);
     append_counter(out, "ninfer:continuation_restored_tokens_total",
                    live.continuation_restored_tokens);
     append_counter(out, "ninfer:continuation_restored_bytes_total",
@@ -239,6 +248,7 @@ std::string ServeMetrics::render(std::uint32_t max_concurrency,
     append_counter(out, "ninfer:continuation_l3_bytes", live.continuation_l3_bytes);
     append_counter(out, "ninfer:l1_evictions_total", live.l1_evictions);
     append_counter(out, "ninfer:l1_demotions_total", live.l1_demotions);
+    append_counter(out, "ninfer:kv_restore_reclaimed_lanes_total", live.kv_restore_reclaimed_lanes);
     append_counter(out, "ninfer:kv_growth_attempts_total", live.kv_growth_attempts);
     append_counter(out, "ninfer:kv_growth_forced_spills_total", live.kv_growth_forced_spills);
     append_counter(out, "ninfer:kv_growth_curtailed_total", live.kv_growth_curtailed);

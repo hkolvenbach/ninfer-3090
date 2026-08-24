@@ -208,9 +208,12 @@ public:
         const PreparedPrompt& prompt) const noexcept;
     // Returns the deepest exactly matching reusable frontier: the execution frontier, a saved
     // turn-checkpoint boundary, or zero when the image cannot be reused safely.
+    // divergence_tokens, when given, receives the leading tokens the prompt and the image
+    // agree on. It is written whether or not the image is reusable, so a rejection reports where
+    // the streams parted instead of only that they did.
     [[nodiscard]] std::uint32_t
-    preflight_continuation(const cache::ContinuationImage& image,
-                           const PreparedPrompt& prompt) const noexcept;
+    preflight_continuation(const cache::ContinuationImage& image, const PreparedPrompt& prompt,
+                           std::uint32_t* divergence_tokens = nullptr) const noexcept;
     // Materialises the image as an owned host payload. This is the largest CPU term in a restore
     // and needs no lane, no device and no CUDA call, so the engine may run it on a preparation
     // thread concurrently with GPU execution. Throws on a malformed or incompatible image.

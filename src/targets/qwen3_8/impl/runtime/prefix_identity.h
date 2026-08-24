@@ -60,6 +60,13 @@ private:
                                    const ResidentPrefixIdentity& resident_identity,
                                    std::size_t count);
 
+// Leading tokens on which the prompt and a resident/decoded ledger agree. This is the point at
+// which the two token streams first differ, which is what distinguishes "the client rewrote its
+// tail" from "the client rewrote its system block": the reuse ladder can only ever recover the
+// former, so the offset is what decides where checkpoints are worth holding.
+[[nodiscard]] std::uint32_t prefix_divergence_tokens(const PreparedPromptData& prompt,
+                                                     const std::vector<TokenId>& resident_tokens);
+
 // Returns the deepest planner-usable exact match in a complete continuation image.
 [[nodiscard]] std::uint32_t continuation_reuse_depth(
     const PreparedPromptData& prompt, const std::vector<TokenId>& resident_tokens,

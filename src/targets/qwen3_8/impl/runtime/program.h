@@ -329,8 +329,8 @@ public:
         const cache::SessionCandidateDescriptor& candidate,
         const PreparedPromptData& prompt) const noexcept;
     [[nodiscard]] std::uint32_t
-    preflight_continuation(const cache::ContinuationImage& image,
-                           const PreparedPromptData& prompt) const noexcept;
+    preflight_continuation(const cache::ContinuationImage& image, const PreparedPromptData& prompt,
+                           std::uint32_t* divergence_tokens = nullptr) const noexcept;
     [[nodiscard]] std::set<std::string> continuation_segment_inventory(
         bool boundary_valid, bool mtp_backend, bool dflash_backend) const;
     [[nodiscard]] std::shared_ptr<DecodedContinuation>

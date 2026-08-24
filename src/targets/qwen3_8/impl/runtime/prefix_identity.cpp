@@ -206,6 +206,16 @@ bool prefix_matches(const PreparedPromptData& prompt, const std::vector<TokenId>
            resident_identity.matches(prompt, count);
 }
 
+std::uint32_t prefix_divergence_tokens(const PreparedPromptData& prompt,
+                                        const std::vector<TokenId>& resident_tokens) {
+    const std::size_t limit = std::min(prompt.token_ids.size(), resident_tokens.size());
+    const auto mismatch =
+        std::mismatch(prompt.token_ids.begin(),
+                      prompt.token_ids.begin() + static_cast<std::ptrdiff_t>(limit),
+                      resident_tokens.begin());
+    return static_cast<std::uint32_t>(mismatch.first - prompt.token_ids.begin());
+}
+
 std::uint32_t continuation_reuse_depth(
     const PreparedPromptData& prompt, const std::vector<TokenId>& resident_tokens,
     const ResidentPrefixIdentity& resident_identity, std::uint32_t frontier,
