@@ -8,6 +8,24 @@
 // sm_89 runs a retuned schedule: eight paired producer warps (Bc column halves, one
 // named-barrier max exchange per tile), byte-permute V dequant, fp16-accumulated PV
 // tiles merged into fp32, and the full 128-register budget. See the ColSplit constant.
+//
+// EXPERIMENTAL sm86-retune-port branch: also enabled for sm_86 (RTX 3090) below, gated
+// through NINFER_GQA_PREFILL_I8_RETUNED rather than widening the raw __CUDA_ARCH__ checks
+// in place, so this is a single, greppable, revertible switch. GA102 (sm_86) shares AD102's
+// 65,536-register file and 100 KiB shared memory/SM, so the register-budget and spill claims
+// this file's comments make about "Ada" are checkable by compiler behavior (cuobjdump
+// --res-usage), not blocked by any missing sm_86 hardware capability — mma_f16_f16acc (used
+// only under this gate) is an unconditionally-defined, portable Ampere+ wrapper. What is NOT
+// yet verified for sm_86: the claim that "consumer Ada runs f32-acc HMMA at half rate" vs
+// fp16-acc — this must hold on GA102 too for the fp16-accumulate-then-fold PV path to be a
+// real win rather than dead weight. Do not promote this branch to production without the
+// prefill-throughput benchmark (retuned vs. baseline, same config) showing a real gain and
+// the full existing validation suite (tool-calling, LoRA, concurrent sessions) still passing.
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ == 890 || __CUDA_ARCH__ == 860)
+#define NINFER_GQA_PREFILL_I8_RETUNED 1
+#else
+#define NINFER_GQA_PREFILL_I8_RETUNED 0
+#endif
 
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
@@ -76,7 +94,7 @@ __device__ __forceinline__ int4 gqa_prefill_i8_dequant_f16x8(const std::int8_t* 
     const int2 raw   = load_vec<int2>(codes8);
     const __half2 s2 = __halves2half2(scale, scale);
     unsigned packed[4];
-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ == 890
+#if NINFER_GQA_PREFILL_I8_RETUNED
     // Ada throttles on the conversion pipe, so build the halves with byte permutes
     // instead: bias each code to unsigned, splice it under exponent 2^10 (0x64xx is
     // 1024 + code), and subtract 1024 + 128. Integer halves are exact, so the result
@@ -389,7 +407,7 @@ __launch_bounds__(256) __global__ void gqa_attention_prefill_fill_i8_page_kernel
 // 120 registers is the spill-free point on SM120. Ada codegen spills the producer
 // score/accumulator state at 120, so give it the full file: 512 threads x 128 = 64K
 // registers, and occupancy is capped at one CTA by shared memory either way.
-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ == 890
+#if NINFER_GQA_PREFILL_I8_RETUNED
 #define NINFER_GQA_PREFILL_I8_MAXNREG 128
 #else
 #define NINFER_GQA_PREFILL_I8_MAXNREG 120
@@ -415,7 +433,7 @@ __global__ __maxnreg__(NINFER_GQA_PREFILL_I8_MAXNREG) void gqa_attention_prefill
 // Ada runs one CTA per SM; four producer warps (one per scheduler) cannot hide mma
 // latency and leave twelve workers stalled at the phase barrier. Split each 16-row
 // score tile across a warp pair (column halves of Bc) there. SM120 keeps 4/12.
-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ == 890
+#if NINFER_GQA_PREFILL_I8_RETUNED
     constexpr int ColSplit = 2;
 #else
     constexpr int ColSplit = 1;
@@ -631,7 +649,7 @@ __global__ __maxnreg__(NINFER_GQA_PREFILL_I8_MAXNREG) void gqa_attention_prefill
 
 // Full unroll interleaves all four groups' A-fragments and overflows the Ada register
 // file into local memory; two groups in flight keep the ntl chains independent spill-free.
-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ == 890
+#if NINFER_GQA_PREFILL_I8_RETUNED
 #pragma unroll 2
 #else
 #pragma unroll
@@ -833,7 +851,7 @@ __global__ __maxnreg__(NINFER_GQA_PREFILL_I8_MAXNREG) void gqa_attention_prefill
             acc[n][3] *= alpha1;
         }
 
-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ == 890
+#if NINFER_GQA_PREFILL_I8_RETUNED
         // Consumer Ada runs f32-acc HMMA at half rate. Accumulate the 64-key tile in
         // packed fp16 at full rate and fold it into the fp32 running accumulator once
         // per tile; the per-tile sums are magnitude-bounded by the softmax weights.
@@ -856,7 +874,7 @@ __global__ __maxnreg__(NINFER_GQA_PREFILL_I8_MAXNREG) void gqa_attention_prefill
                 const int vcol = global_n * 8;
                 ldmatrix_x2_t(vf[0], vf[1],
                               smem_addr(&v_f16[vrow * D + gqa_prefill_swz(vrow, vcol)]));
-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ == 890
+#if NINFER_GQA_PREFILL_I8_RETUNED
                 mma_f16_f16acc(tacc[n][0], tacc[n][1], pf[0], pf[1], pf[2], pf[3], vf[0], vf[1]);
 #else
                 mma_f16(acc[n][0], acc[n][1], acc[n][2], acc[n][3], pf[0], pf[1], pf[2], pf[3],
@@ -864,7 +882,7 @@ __global__ __maxnreg__(NINFER_GQA_PREFILL_I8_MAXNREG) void gqa_attention_prefill
 #endif
             }
         }
-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ == 890
+#if NINFER_GQA_PREFILL_I8_RETUNED
 #pragma unroll
         for (int n = 0; n < PVNtPerWarp; ++n) {
             const __half2 lo = *reinterpret_cast<const __half2*>(&tacc[n][0]);
