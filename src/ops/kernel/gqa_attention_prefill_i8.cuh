@@ -9,18 +9,21 @@
 // named-barrier max exchange per tile), byte-permute V dequant, fp16-accumulated PV
 // tiles merged into fp32, and the full 128-register budget. See the ColSplit constant.
 //
-// EXPERIMENTAL sm86-retune-port branch: also enabled for sm_86 (RTX 3090) below, gated
-// through NINFER_GQA_PREFILL_I8_RETUNED rather than widening the raw __CUDA_ARCH__ checks
-// in place, so this is a single, greppable, revertible switch. GA102 (sm_86) shares AD102's
-// 65,536-register file and 100 KiB shared memory/SM, so the register-budget and spill claims
-// this file's comments make about "Ada" are checkable by compiler behavior (cuobjdump
-// --res-usage), not blocked by any missing sm_86 hardware capability — mma_f16_f16acc (used
-// only under this gate) is an unconditionally-defined, portable Ampere+ wrapper. What is NOT
-// yet verified for sm_86: the claim that "consumer Ada runs f32-acc HMMA at half rate" vs
-// fp16-acc — this must hold on GA102 too for the fp16-accumulate-then-fold PV path to be a
-// real win rather than dead weight. Do not promote this branch to production without the
-// prefill-throughput benchmark (retuned vs. baseline, same config) showing a real gain and
-// the full existing validation suite (tool-calling, LoRA, concurrent sessions) still passing.
+// Also enabled for sm_86 (RTX 3090) below, gated through NINFER_GQA_PREFILL_I8_RETUNED
+// rather than widening the raw __CUDA_ARCH__ checks in place, so this is a single,
+// greppable, revertible switch. GA102 (sm_86) shares AD102's 65,536-register file and
+// 100 KiB shared memory/SM, and this file's "Ada"-attributed register-budget/spill claims
+// hold on sm_86 too, confirmed by cuobjdump --res-usage on the compiled binary
+// (REG:120 spills 72-104 B/thread; REG:128 spills 24 B/thread) — not blocked by any
+// missing sm_86 hardware capability (mma_f16_f16acc, used only under this gate, is an
+// unconditionally-defined, portable Ampere+ wrapper). The "consumer Ada runs f32-acc HMMA
+// at half rate vs fp16-acc" claim this schedule is built around also holds on GA102
+// (142 TFLOPS fp16-accumulate vs. 71 TFLOPS fp32-accumulate, the same ~2x ratio).
+// Benchmarked (retuned vs. baseline, matched rk4v4-e8/temperature-0 config, single
+// request): +1.6% at 1,942 tokens, +3.8% at 19,249, +6.6% at 64,119, +9.0% at 147,449 —
+// gain grows with depth, no decode regression. Full existing validation suite (tool
+// calling, LoRA, concurrent sessions) re-passed on the retuned build. Validated and
+// promoted to production 2026-08-27; see git log for the benchmark commit.
 #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ == 890 || __CUDA_ARCH__ == 860)
 #define NINFER_GQA_PREFILL_I8_RETUNED 1
 #else
