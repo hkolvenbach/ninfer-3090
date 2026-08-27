@@ -47,6 +47,18 @@ precision (more bits for keys) matters for quality, which this codec doesn't do 
 has been qualitative, not a rigorous perplexity comparison. Blackwell-only NVFP4/W4A4 execution
 is unavailable on Ampere; the engine uses the same groupwise-int path as the 3090 base.
 
+**Concurrency note for "large main thread + small workers" usage**: the base engine prefills one
+request at a time regardless of `--max-concurrency` (see the "Prefill still serializes across
+lanes" caveat above, confirmed unchanged on this port), so a small worker queued behind a large
+main-thread prefill pays that prefill's full duration as added latency, and with the default 30s
+`--pending-timeout-ms` can get evicted from the admission queue before its turn ever arrives
+(`error inference request expired while waiting for admission` / `HTTP 503`) regardless of free
+KV pool space. Verified: a 64,775-token main session plus three 1,963-token worker sessions
+launched together failed 3/4 at the 30s default and succeeded 4/4 at `--pending-timeout-ms
+400000`, the production value. This fixes queue *survival*, not queue *latency* — true chunk-level
+prefill interleaving across lanes would need a scheduler change and isn't implemented here or
+upstream.
+
 **Rollback**: the pre-retune, `--kv-capacity auto`-era image is tagged
 `ninfer-tensorninja:sm86-baseline-known-good` on the deployment host — an immediate, verified
 revert path if the retune or the 260K config ever needs to be backed out.
