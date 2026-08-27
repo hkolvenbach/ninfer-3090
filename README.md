@@ -5,12 +5,26 @@ This is a personal fork that ports [tensorninja/ninfer-4090](https://github.com/
 which derives from [Neroued/ninfer](https://github.com/Neroued/ninfer)) back to `sm_86`/RTX 3090,
 to pick up features tensorninja added that upstream's own `release/v0.6.0-rtx3090` 3090 build
 does not have: a dedicated Qwen3.8 target, the `rk4v4-e8`/`rk2v4-e8` E8-lattice KV-cache codecs,
-and runtime LoRA banking. Two real 3090-specific porting bugs were found and fixed (see commit
-history): a hardcoded `sm_89`-only compute-capability gate, and a GDN gating-projection kernel
-whose cooperative-launch occupancy budgets were sized for the 4090's 128 SMs and silently
-overflowed the 3090's 82. Also added `/props` and `/lora-adapters` endpoints (absent upstream on
-every branch, including the official 3090 release) plus two missing live-throughput Prometheus
-gauges, so third-party llama.cpp-compatible dashboards work against this server unmodified.
+and runtime LoRA banking. Real 3090-specific porting work, all measured/verified rather than
+assumed (see commit history and `it-infra/systems/yulie/STATE.md` for full evidence):
+
+- A hardcoded `sm_89`-only compute-capability gate in the Qwen3.8 target — widened to accept 86.
+- A GDN gating-projection kernel whose cooperative-launch occupancy budgets were sized for the
+  4090's 128 SMs and silently overflowed the 3090's 82 (`cudaErrorCooperativeLaunchTooLarge` on
+  realistic tool-calling prompts) — re-derived from this file's own already-measured per-SM
+  occupancy figures.
+- `/props` and `/lora-adapters` endpoints (absent upstream on every branch, including the
+  official 3090 release) plus two missing live-throughput Prometheus gauges, so third-party
+  llama.cpp-compatible dashboards work against this server unmodified.
+- The prefill kernel's `sm_89`-only retuned schedule (8 paired producer warps, byte-permute V
+  dequant, fp16-accumulated PV tiles, full 128-register budget) — widened to `sm_86` after
+  confirming, not assuming, the hardware claims it depends on hold on GA102 too (identical
+  register file/shared memory, and the same fp32-vs-fp16-accumulate HMMA throughput split:
+  142 vs. 71 TFLOPS, matching Ada's ~2x ratio). Measured +1.6% to +9.0% prefill throughput,
+  growing with context depth, no decode regression.
+- CUDA base image matched to `ninfer-3090`'s own proven `13.1.2` (not tensorninja's `13.2.0`,
+  tuned for their RTX 5090 dev environment) and the `-cudnn` variant dropped — this engine never
+  calls cuDNN (verified: no reference anywhere in the source tree).
 
 The engine itself: a specialized C++20/CUDA inference engine written from scratch — no PyTorch,
 no TensorRT, no llama.cpp. It loads the official groupwise `.ninfer` artifact and serves OpenAI-
@@ -19,14 +33,23 @@ Graphs, MTP speculative decoding, reasoning-effort control, and ReplaySSM state 
 the model's Gated DeltaNet layers.
 
 Validated on an RTX 3090 (Yulie, see `it-infra/systems/yulie/STATE.md` for the full record):
-real tool-calling round trips through `pi` and `opencode`, a 123,765-token single-request prompt,
-3 genuinely concurrent sessions at 180,224 max-context with `rk4v4-e8` (227,712-token shared
-pool), and LoRA adapters via `--lora`. Open caveat: `rk4v4-e8` uses symmetric 4-bit key/value
-precision; independent research on the same technique
+real tool-calling round trips through `pi` and `opencode` (including the exact 18-tool-schema
+payload shape that crashed the pre-port build), a 123,765-token single-request prompt, 4
+genuinely concurrent sessions at the production config (260,000 max-context with `rk4v4-e8`,
+260,032-token pool — 99.2% of the model's own 262,144-token native ceiling, `--kv-capacity`
+explicit rather than `auto`, which hardcodes a 1 GiB headroom that isn't adjustable and doesn't
+grow past what `--max-context` implies once VRAM-bound), and LoRA adapters via `--lora`
+(zero-delta adapter reproduces base output exactly; a random adapter measurably changes output;
+unknown model id cleanly 404s). Open caveat: `rk4v4-e8` uses symmetric 4-bit key/value precision;
+independent research on the same technique
 ([vllm-project/vllm#39241](https://github.com/vllm-project/vllm/issues/39241)) found asymmetric
 precision (more bits for keys) matters for quality, which this codec doesn't do — validation here
 has been qualitative, not a rigorous perplexity comparison. Blackwell-only NVFP4/W4A4 execution
 is unavailable on Ampere; the engine uses the same groupwise-int path as the 3090 base.
+
+**Rollback**: the pre-retune, `--kv-capacity auto`-era image is tagged
+`ninfer-tensorninja:sm86-baseline-known-good` on the deployment host — an immediate, verified
+revert path if the retune or the 260K config ever needs to be backed out.
 
 The engine serves its own [dashboard](docs/dashboard.md) on the API port — no second process, no
 exporter, no time-series database.
