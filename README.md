@@ -1,15 +1,32 @@
-# NInfer-4090
+# NInfer-3090 (personal SM86 port of tensorninja/ninfer-4090)
 
-NInfer-4090 runs **Qwen3.8-27B** on one 24 GB NVIDIA GeForce RTX 4090. It is an `sm_89` port of
-[NInfer-3090](https://github.com/Don-Chad/ninfer-3090), which derives from
-[Neroued/ninfer](https://github.com/Neroued/ninfer), a specialized C++20/CUDA inference engine
-written from scratch — no PyTorch, no TensorRT, no llama.cpp. The engine loads the official
-groupwise `.ninfer` artifact and serves OpenAI- and Anthropic-compatible APIs from a single
-process, with paged KV, compatible-prefix reuse, CUDA Graphs, MTP speculative decoding,
-reasoning-effort control, and ReplaySSM state transactions for the model's Gated DeltaNet layers.
+This is a personal fork that ports [tensorninja/ninfer-4090](https://github.com/tensorninja/ninfer-4090)
+(itself an `sm_89`/RTX 4090 fork of [sergiuszm/ninfer-4090](https://github.com/sergiuszm/ninfer-4090),
+which derives from [Neroued/ninfer](https://github.com/Neroued/ninfer)) back to `sm_86`/RTX 3090,
+to pick up features tensorninja added that upstream's own `release/v0.6.0-rtx3090` 3090 build
+does not have: a dedicated Qwen3.8 target, the `rk4v4-e8`/`rk2v4-e8` E8-lattice KV-cache codecs,
+and runtime LoRA banking. Two real 3090-specific porting bugs were found and fixed (see commit
+history): a hardcoded `sm_89`-only compute-capability gate, and a GDN gating-projection kernel
+whose cooperative-launch occupancy budgets were sized for the 4090's 128 SMs and silently
+overflowed the 3090's 82. Also added `/props` and `/lora-adapters` endpoints (absent upstream on
+every branch, including the official 3090 release) plus two missing live-throughput Prometheus
+gauges, so third-party llama.cpp-compatible dashboards work against this server unmodified.
 
-This fork targets `sm_89` and Linux. Blackwell-only NVFP4/W4A4 execution is unavailable; the
-engine uses the same groupwise-int path as the 3090 base.
+The engine itself: a specialized C++20/CUDA inference engine written from scratch — no PyTorch,
+no TensorRT, no llama.cpp. It loads the official groupwise `.ninfer` artifact and serves OpenAI-
+and Anthropic-compatible APIs from a single process, with paged KV, compatible-prefix reuse, CUDA
+Graphs, MTP speculative decoding, reasoning-effort control, and ReplaySSM state transactions for
+the model's Gated DeltaNet layers.
+
+Validated on an RTX 3090 (Yulie, see `it-infra/systems/yulie/STATE.md` for the full record):
+real tool-calling round trips through `pi` and `opencode`, a 123,765-token single-request prompt,
+3 genuinely concurrent sessions at 180,224 max-context with `rk4v4-e8` (227,712-token shared
+pool), and LoRA adapters via `--lora`. Open caveat: `rk4v4-e8` uses symmetric 4-bit key/value
+precision; independent research on the same technique
+([vllm-project/vllm#39241](https://github.com/vllm-project/vllm/issues/39241)) found asymmetric
+precision (more bits for keys) matters for quality, which this codec doesn't do — validation here
+has been qualitative, not a rigorous perplexity comparison. Blackwell-only NVFP4/W4A4 execution
+is unavailable on Ampere; the engine uses the same groupwise-int path as the 3090 base.
 
 The engine serves its own [dashboard](docs/dashboard.md) on the API port — no second process, no
 exporter, no time-series database.
