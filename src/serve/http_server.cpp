@@ -421,6 +421,13 @@ void HttpServer::run_stats_reporter() {
         const Clock::time_point now        = Clock::now();
         const ThroughputReport report      = make_throughput_report(
             previous, current, std::chrono::duration<double>(now - previous_time).count());
+        // Every tick, not just active ones: an idle interval has zero new tokens over a nonzero
+        // interval, i.e. the gauges correctly read 0 rather than holding a stale rate forever.
+        if (report.interval_seconds > 0.0) {
+            metrics_.update_throughput(
+                static_cast<double>(report.computed_prefill_tokens) / report.interval_seconds,
+                static_cast<double>(report.committed_decode_tokens) / report.interval_seconds);
+        }
         if (throughput_report_has_activity(report)) {
             log_throughput(report);
             previous      = current;
@@ -604,6 +611,14 @@ void HttpServer::register_routes() {
     // {"filename": NAME}. Enabled only by --slot-save-path.
     server_.Post(R"(/slots/(\d+))", [this](const httplib::Request& req, httplib::Response& res) {
         handle_slot_action(req, res);
+    });
+    // llama.cpp-shaped, matching the /metrics compatibility above: a llama.cpp dashboard has no
+    // NInfer-specific code path and otherwise cannot resolve n_ctx or model identity at all.
+    server_.Get("/props", [this](const httplib::Request& req, httplib::Response& res) {
+        handle_props(req, res);
+    });
+    server_.Get("/lora-adapters", [this](const httplib::Request& req, httplib::Response& res) {
+        handle_lora_adapters(req, res);
     });
     server_.Get("/v1/models", [this](const httplib::Request& req, httplib::Response& res) {
         handle_models(req, res);
@@ -854,6 +869,42 @@ void HttpServer::handle_events(const httplib::Request&, httplib::Response& res) 
             return sink.write(kKeepalive.data(), kKeepalive.size());
         },
         [this, subscriber](bool) { events_.unsubscribe(subscriber); });
+}
+
+void HttpServer::handle_props(const httplib::Request&, httplib::Response& res) const {
+    // Shape matches llama.cpp's tools/server /props exactly (only the fields dashboards read:
+    // model_alias, model_path, default_generation_settings.{n_ctx,params}, total_slots). The
+    // sampler values here are process-level --temperature/--top-p/... overrides when set;
+    // per-mode (thinking vs non-thinking) registry defaults are resolved per-request, not at
+    // server-start, so an unset override reports 0 rather than guessing a mode.
+    const auto& overrides = options_.sampling_overrides;
+    const nlohmann::json params{
+        {"temperature", overrides.temperature.value_or(0.0F)},
+        {"top_p", overrides.top_p.value_or(0.0F)},
+        {"top_k", overrides.top_k.value_or(0)},
+        {"min_p", overrides.min_p.value_or(0.0F)},
+    };
+    const nlohmann::json body{
+        {"model_alias", public_model_id_},
+        {"model_path", options_.artifact_path},
+        {"total_slots", options_.max_concurrency},
+        {"default_generation_settings",
+         nlohmann::json{{"n_ctx", options_.max_context}, {"params", params}}},
+    };
+    res.set_content(body.dump(), "application/json");
+}
+
+void HttpServer::handle_lora_adapters(const httplib::Request&, httplib::Response& res) const {
+    // llama.cpp's shape is a flat array of {id, path, scale}. NInfer has no persistent
+    // request-independent scale to report (an adapter is selected per request by model id, not
+    // toggled globally), so every registered adapter is listed at scale 1.0 -- "available",
+    // matching how a dashboard reads a nonzero scale as "active" -- rather than 0 ("inactive"),
+    // which would misreport a bank of adapters that every request can actually reach.
+    nlohmann::json adapters = nlohmann::json::array();
+    for (std::size_t i = 0; i < options_.lora_adapters.size(); ++i) {
+        adapters.push_back({{"id", i}, {"path", options_.lora_adapters[i].path}, {"scale", 1.0}});
+    }
+    res.set_content(adapters.dump(), "application/json");
 }
 
 void HttpServer::handle_models(const httplib::Request&, httplib::Response& res) const {

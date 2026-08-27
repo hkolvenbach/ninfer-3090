@@ -1,8 +1,8 @@
 -include Makefile.local
 
-BUILD_DIR ?= build-sm89
+BUILD_DIR ?= build-sm86
 BUILD_TYPE ?= Release
-CUDA_ARCH ?= 89
+CUDA_ARCH ?= 86
 JOBS ?= 16
 CUDA_JOBS ?= $(JOBS)
 BUILD_TESTING ?= ON

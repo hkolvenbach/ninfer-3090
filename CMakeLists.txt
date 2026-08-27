@@ -1,14 +1,14 @@
 cmake_minimum_required(VERSION 3.28)
 
-# The current implementation is compiled only for sm_89. Set and validate the
-# architecture before CUDA compiler detection so CMake never injects a generic
-# host-toolchain default or accepts an unsupported target.
+# Set and validate the architecture before CUDA compiler detection so CMake never
+# injects a generic host-toolchain default or accepts an unsupported target.
+# This fork targets sm_86 (RTX 3090) with optional sm_89 (RTX 4090) builds.
 if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
-  set(CMAKE_CUDA_ARCHITECTURES 89 CACHE STRING "CUDA architectures to build")
+  set(CMAKE_CUDA_ARCHITECTURES 86 CACHE STRING "CUDA architectures to build")
 endif()
-if(NOT CMAKE_CUDA_ARCHITECTURES STREQUAL "89")
+if(NOT CMAKE_CUDA_ARCHITECTURES STREQUAL "86" AND NOT CMAKE_CUDA_ARCHITECTURES STREQUAL "89")
   message(FATAL_ERROR
-    "NInfer supports only CMAKE_CUDA_ARCHITECTURES=89; got "
+    "NInfer supports CMAKE_CUDA_ARCHITECTURES=86 or 89; got "
     "'${CMAKE_CUDA_ARCHITECTURES}'")
 endif()
 

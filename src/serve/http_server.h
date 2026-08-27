@@ -60,6 +60,11 @@ private:
     void handle_slot_action(const httplib::Request& req, httplib::Response& res);
     void handle_telemetry(const httplib::Request& req, httplib::Response& res) const;
     void handle_events(const httplib::Request& req, httplib::Response& res);
+    // llama.cpp-server-shaped /props and /lora-adapters, so third-party llama.cpp dashboards
+    // (which already treat NInfer's /metrics as llama.cpp-shaped, see ServeMetrics) can resolve
+    // n_ctx/model identity/adapters without any NInfer-specific code on their side.
+    void handle_props(const httplib::Request& req, httplib::Response& res) const;
+    void handle_lora_adapters(const httplib::Request& req, httplib::Response& res) const;
 
     // The process-wide console logger serializes lines from request and reporter threads.
     void log_line(const std::string& line);

@@ -68,6 +68,13 @@ ServeMetrics::LastCompleted ServeMetrics::last_completed() const {
     return last_completed_;
 }
 
+void ServeMetrics::update_throughput(double prompt_tokens_per_second,
+                                     double predicted_tokens_per_second) {
+    const std::lock_guard<std::mutex> lock(mutex_);
+    prompt_tokens_per_second_    = prompt_tokens_per_second;
+    predicted_tokens_per_second_ = predicted_tokens_per_second;
+}
+
 std::string ServeMetrics::render(std::uint32_t max_concurrency,
                                  const ninfer::RuntimeStats& live) const {
     const std::lock_guard<std::mutex> lock(mutex_);
@@ -82,6 +89,8 @@ std::string ServeMetrics::render(std::uint32_t max_concurrency,
     append_counter(out, "llamacpp:tokens_predicted_seconds_total", live.decode_seconds_total);
     append_counter(out, "llamacpp:requests_processing", processing);
     append_counter(out, "llamacpp:requests_deferred", in_flight - processing);
+    append_counter(out, "llamacpp:prompt_tokens_seconds", prompt_tokens_per_second_);
+    append_counter(out, "llamacpp:predicted_tokens_seconds", predicted_tokens_per_second_);
     append_counter(out, "ninfer:requests_total", requests_total_);
     append_counter(out, "ninfer:prefix_cache_hit_tokens_total", prefix_cache_hit_tokens_total_);
     append_counter(out, "ninfer:draft_tokens_total", speculative_draft_tokens_total_);

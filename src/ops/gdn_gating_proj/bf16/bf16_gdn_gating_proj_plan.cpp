@@ -26,6 +26,38 @@ struct RouteSpec {
     Bf16GdnGatingScheduleId schedule;
 };
 
+#ifdef NINFER_SM86
+constexpr std::array<RouteSpec, 5> k27Routes{{
+    {{1, 1}, Bf16GdnGatingScheduleId::GemvPairedRows},
+    {{2, 8}, Bf16GdnGatingScheduleId::SmallTSplit10},
+    // sm_86 has 82 SMs, not sm_89's 128. Grid is ceil(T/128)*3*SplitK. Measured occupancy
+    // (cuobjdump -res-usage, see cooperative_27_grid_is_resident below): split8 admits 2
+    // CTAs/SM -> 164 device-wide, split4/2 are register-bound to 1 CTA/SM -> 82. Thresholds are
+    // the largest T that keeps each schedule's grid within its sm_86 budget: split8 legal to
+    // T<=768 (floor(164/(3*8))*128), split2 to T<=1664 (floor(82/(3*2))*128). Split4 reaches the
+    // same 768 ceiling as split8 while doing less work per launch, so it stays unreachable here
+    // too.
+    {{9, 768}, Bf16GdnGatingScheduleId::MmaCooperativeSplit8},
+    {{769, 1664}, Bf16GdnGatingScheduleId::MmaCooperativeSplit2},
+    {{1665, kAnyCols}, Bf16GdnGatingScheduleId::MmaUnsplit},
+}};
+
+constexpr std::array<RouteSpec, 5> k35Routes{{
+    // sm_86, 82 SMs. Grid is ceil(T/64)*2*SplitK. Budgets from cooperative_35_grid_is_resident
+    // below: split16 -> 328, split8/4/2 -> 246 device-wide. The sm_89 build's upstream
+    // perf-chosen bounds (128/1024/2048/4096) overflow these lower sm_86 budgets outright
+    // (e.g. split8 at T=1024 needs 256 CTAs > the 246 available), so thresholds here are instead
+    // the largest T that keeps each schedule within its sm_86 budget: split16 to T<=640
+    // (floor(328/32)*64), split8 to T<=960 (floor(246/16)*64), split4 to T<=1920
+    // (floor(246/8)*64), split2 to T<=3904 (floor(246/4)*64). These are occupancy-safe, not
+    // re-benchmarked for peak throughput on this card; revisit once Phase 2's perf pass runs.
+    {{1, 640}, Bf16GdnGatingScheduleId::MmaCooperativeSplit16},
+    {{641, 960}, Bf16GdnGatingScheduleId::MmaCooperativeSplit8},
+    {{961, 1920}, Bf16GdnGatingScheduleId::MmaCooperativeSplit4},
+    {{1921, 3904}, Bf16GdnGatingScheduleId::MmaCooperativeSplit2},
+    {{3905, kAnyCols}, Bf16GdnGatingScheduleId::MmaUnsplit},
+}};
+#else
 constexpr std::array<RouteSpec, 5> k27Routes{{
     {{1, 1}, Bf16GdnGatingScheduleId::GemvPairedRows},
     {{2, 8}, Bf16GdnGatingScheduleId::SmallTSplit10},
@@ -51,6 +83,7 @@ constexpr std::array<RouteSpec, 5> k35Routes{{
     {{2049, 4096}, Bf16GdnGatingScheduleId::MmaCooperativeSplit2},
     {{4097, kAnyCols}, Bf16GdnGatingScheduleId::MmaUnsplit},
 }};
+#endif
 
 template <std::size_t N>
 constexpr bool catalog_is_closed(const std::array<RouteSpec, N>& routes,
@@ -66,11 +99,24 @@ constexpr bool catalog_is_closed(const std::array<RouteSpec, N>& routes,
 static_assert(catalog_is_closed(k27Routes, kAnyCols));
 static_assert(catalog_is_closed(k35Routes, kAnyCols));
 
-// Device-wide resident-CTA budgets for the sm_89 build: the per-SM occupancy measured on sm_86
-// carries over unchanged (identical register counts and per-SM limits), scaled from 82 to the
-// RTX 4090's 128 SMs. These are the single source of truth: both the runtime residency
-// predicates and the compile-time catalog guard below read them, so a retuned constant cannot
-// silently disagree with the route table it is meant to bound.
+// Device-wide resident-CTA budgets. Per-SM occupancy (register/shared-memory bound) is identical
+// between sm_86 and sm_89 for these kernels, so the only thing that changes is the SM count: 82
+// on the RTX 3090 versus 128 on the RTX 4090. These are the single source of truth: both the
+// runtime residency predicates and the compile-time catalog guard below read them, so a retuned
+// constant cannot silently disagree with the route table it is meant to bound.
+#ifdef NINFER_SM86
+constexpr std::int32_t resident_ctas_27(Bf16GdnGatingScheduleId schedule) noexcept {
+    // 82 SMs. split8: 2 CTAs/SM -> 164. split4/2: 1 CTA/SM -> 82.
+    return schedule == Bf16GdnGatingScheduleId::MmaCooperativeSplit8 ? 164 : 82;
+}
+
+constexpr std::int32_t resident_ctas_35(Bf16GdnGatingScheduleId schedule) noexcept {
+    // 82 SMs. split32: 2 CTAs/SM -> 164. split16: 4 CTAs/SM -> 328. split8/4/2: 3 CTAs/SM -> 246.
+    if (schedule == Bf16GdnGatingScheduleId::MmaCooperativeSplit32) { return 164; }
+    if (schedule == Bf16GdnGatingScheduleId::MmaCooperativeSplit16) { return 328; }
+    return 246;
+}
+#else
 constexpr std::int32_t resident_ctas_27(Bf16GdnGatingScheduleId schedule) noexcept {
     return schedule == Bf16GdnGatingScheduleId::MmaCooperativeSplit8 ? 256 : 128;
 }
@@ -80,6 +126,7 @@ constexpr std::int32_t resident_ctas_35(Bf16GdnGatingScheduleId schedule) noexce
     if (schedule == Bf16GdnGatingScheduleId::MmaCooperativeSplit16) { return 512; }
     return 384;
 }
+#endif
 
 // Zero marks a schedule that is not launched cooperatively and therefore carries no residency
 // constraint at all.
@@ -118,9 +165,9 @@ constexpr bool catalog_is_resident(const std::array<RouteSpec, N>& routes, std::
 }
 
 static_assert(catalog_is_resident(k27Routes, 128, 3, resident_ctas_27),
-              "a 27B cooperative route exceeds the sm_89 resident-CTA budget at its upper bound");
+              "a 27B cooperative route exceeds this target's resident-CTA budget at its upper bound");
 static_assert(catalog_is_resident(k35Routes, 64, 2, resident_ctas_35),
-              "a 35B cooperative route exceeds the sm_89 resident-CTA budget at its upper bound");
+              "a 35B cooperative route exceeds this target's resident-CTA budget at its upper bound");
 
 bool is_27(const Bf16GdnGatingProblem& problem) noexcept {
     return problem.heads == 48 && problem.input_rows == 5120;

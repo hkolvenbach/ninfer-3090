@@ -52,6 +52,15 @@ public:
 
     [[nodiscard]] LastCompleted last_completed() const;
 
+    // llama.cpp's server exposes two more gauges alongside the four *_total counters:
+    // prompt_tokens_seconds and predicted_tokens_seconds, the current prefill/decode rate. A
+    // scraper that reads only those two (not the *_total pair, which needs its own delta-over-
+    // time bookkeeping) sees 0 forever without this. Sourced from the same periodic
+    // ThroughputReport the console/event-stream throughput line already uses, so "how fast are
+    // we going" agrees everywhere it is reported. Updated every stats tick regardless of
+    // activity, so an idle server correctly reads 0 rather than holding a stale rate.
+    void update_throughput(double prompt_tokens_per_second, double predicted_tokens_per_second);
+
     // One complete Prometheus text body, without HTTP framing. In-flight
     // requests are split into processing/deferred against `max_concurrency`,
     // matching the FIFO scheduler's work-conserving behavior.
@@ -69,6 +78,8 @@ private:
     std::uint64_t speculative_accepted_tokens_total_ = 0;
     LastCompleted last_completed_;
     std::map<std::uint64_t, int> active_;
+    double prompt_tokens_per_second_    = 0.0;
+    double predicted_tokens_per_second_ = 0.0;
 };
 
 } // namespace ninfer::serve

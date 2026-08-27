@@ -629,8 +629,8 @@ void validate_target_options(DeviceContext& device, const EngineOptions& options
         }
         break;
     }
-    if (device.sm() != 89) {
-        throw std::invalid_argument("Qwen3.8 family runtime requires compute capability 8.9");
+    if (device.sm() != 86 && device.sm() != 89) {
+        throw std::invalid_argument("Qwen3.8 family runtime requires compute capability 8.6 (RTX 3090) or 8.9 (RTX 4090)");
     }
 }
 
